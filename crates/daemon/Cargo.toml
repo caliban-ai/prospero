@@ -1,0 +1,12 @@
+[package]
+name = "prospero-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "prosperod"
+path = "src/main.rs"
+
+[dependencies]
+prospero-core.workspace = true
+prospero-api.workspace = true

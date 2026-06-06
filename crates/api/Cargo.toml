@@ -1,0 +1,7 @@
+[package]
+name = "prospero-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prospero-core.workspace = true

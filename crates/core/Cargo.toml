@@ -1,0 +1,6 @@
+[package]
+name = "prospero-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

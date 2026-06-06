@@ -1,0 +1,11 @@
+[package]
+name = "prospero-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "prospero"
+path = "src/main.rs"
+
+[dependencies]
+prospero-core.workspace = true
