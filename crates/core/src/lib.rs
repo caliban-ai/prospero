@@ -6,13 +6,18 @@
 //! self-contained client — the wire format is the only coupling to caliban.
 
 pub mod caliband;
+pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod model;
+pub mod registry;
+pub mod store;
 
 pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
+pub use registry::{RegisteredRepo, Registry};
+pub use store::{JsonlStore, Store};
 
 /// Crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
