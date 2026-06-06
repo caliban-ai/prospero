@@ -10,3 +10,9 @@ path = "src/main.rs"
 [dependencies]
 prospero-core.workspace = true
 prospero-api.workspace = true
+tokio.workspace = true
+axum.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
