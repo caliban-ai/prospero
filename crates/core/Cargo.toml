@@ -3,4 +3,22 @@ name = "prospero-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Test/integration harness reused by other crates' tests (FakeCaliband).
+testkit = ["dep:tempfile"]
+
 [dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
+serde_json.workspace = true
