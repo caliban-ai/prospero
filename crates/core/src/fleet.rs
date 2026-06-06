@@ -383,15 +383,14 @@ impl FleetManager {
                 session_dir: rec.session_dir.clone(),
             };
             match prior.get(&rec.id) {
-                None => {
-                    // New to the snapshot. Suppress "discovered" for agents we
-                    // just spawned (already attached + emitted AgentSpawned).
-                    if !attached_now.contains(&rec.id) {
-                        self.inner
-                            .emitter
-                            .emit(repo, &rec.id, EventKind::AgentDiscovered);
-                    }
+                // New to the snapshot. Suppress "discovered" for agents we just
+                // spawned (already attached + emitted AgentSpawned).
+                None if !attached_now.contains(&rec.id) => {
+                    self.inner
+                        .emitter
+                        .emit(repo, &rec.id, EventKind::AgentDiscovered);
                 }
+                None => {}
                 Some(&old) if old != rec.status => {
                     self.inner.emitter.emit(
                         repo,

@@ -14,3 +14,10 @@ ureq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+prospero-core = { workspace = true, features = ["testkit"] }
+prospero-api.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tempfile.workspace = true

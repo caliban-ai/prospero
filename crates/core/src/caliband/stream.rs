@@ -8,19 +8,11 @@
 use crate::event::{EventKind, OutputStream};
 
 /// Options controlling normalization.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct NormalizeOptions {
     /// Include `thinking` deltas as `Output { stream: Thinking }`.
     /// Defaults to `false` (privacy/volume).
     pub include_thinking: bool,
-}
-
-impl Default for NormalizeOptions {
-    fn default() -> Self {
-        Self {
-            include_thinking: false,
-        }
-    }
 }
 
 /// Outcome of normalizing one frame.

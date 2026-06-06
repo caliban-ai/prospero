@@ -220,6 +220,45 @@ async fn events_endpoint_returns_history_after_poll() {
 }
 
 #[tokio::test]
+async fn sse_stream_closes_after_agent_finished() {
+    let mut h = setup().await;
+    let dir = h.fake.control_socket().parent().unwrap().to_path_buf();
+    let rec = test_record("agent001", &dir, AgentStatus::Running, true);
+    h.fake
+        .add_agent(
+            rec,
+            vec![
+                serde_json::json!({"type":"system","subtype":"init","model":"m","tools":[],"session_id":"s"}),
+                serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.0,"turns":1}),
+            ],
+        )
+        .await;
+    h.manager.poll_repo_once("repo").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Collecting the whole body must terminate (stream closes on AgentFinished).
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/agent001/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let collected = tokio::time::timeout(Duration::from_secs(5), resp.into_body().collect())
+        .await
+        .expect("SSE stream should close, not hang")
+        .unwrap()
+        .to_bytes();
+    let text = String::from_utf8_lossy(&collected);
+    assert!(text.contains("agent_finished"), "stream body: {text}");
+}
+
+#[tokio::test]
 async fn serves_dashboard_index() {
     let h = setup().await;
     let resp = h

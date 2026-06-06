@@ -56,17 +56,12 @@ impl FakeCaliband {
         let st = state.clone();
         let dir2 = dir.clone();
         let accept_task = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let st = st.clone();
-                        let dir = dir2.clone();
-                        tokio::spawn(async move {
-                            let _ = handle_control_conn(stream, st, dir).await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let st = st.clone();
+                let dir = dir2.clone();
+                tokio::spawn(async move {
+                    let _ = handle_control_conn(stream, st, dir).await;
+                });
             }
         });
 
@@ -272,21 +267,16 @@ async fn spawn_stream_listener(
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path).expect("bind per-agent stream socket");
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, _)) => {
-                    for frame in &script {
-                        let mut line = serde_json::to_vec(frame).unwrap();
-                        line.push(b'\n');
-                        if stream.write_all(&line).await.is_err() {
-                            break;
-                        }
-                    }
-                    let _ = stream.flush().await;
-                    // Drop closes the stream, signalling end-of-stream.
+        while let Ok((mut stream, _)) = listener.accept().await {
+            for frame in &script {
+                let mut line = serde_json::to_vec(frame).unwrap();
+                line.push(b'\n');
+                if stream.write_all(&line).await.is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
+            let _ = stream.flush().await;
+            // Drop closes the stream, signalling end-of-stream.
         }
     })
 }

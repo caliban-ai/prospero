@@ -84,10 +84,10 @@ fn map_err(err: ureq::Error) -> anyhow::Error {
     match err {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(msg) = v.get("error").and_then(|m| m.as_str()) {
-                    return anyhow!("server returned {code}: {msg}");
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(msg) = v.get("error").and_then(|m| m.as_str())
+            {
+                return anyhow!("server returned {code}: {msg}");
             }
             anyhow!("server returned {code}: {body}")
         }
