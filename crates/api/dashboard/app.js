@@ -24,7 +24,10 @@ async function api(method, path, body) {
   }
   const res = await fetch(path, opts);
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch (_) {}
+  }
   if (!res.ok) {
     throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
   }
