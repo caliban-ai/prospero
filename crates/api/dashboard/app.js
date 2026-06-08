@@ -157,6 +157,10 @@ function openLaunchModal(repoName) {
 
 // --- Row actions ------------------------------------------------------------
 
+// UI partition: which agents are "alive" (offer kill) vs finished (offer
+// respawn/remove). Intentionally broader than the backend's stream-oriented
+// AgentStatus::is_active (Spawning|Running) — `idle` is awaiting input but
+// still killable; the remove path is kill → terminal → remove.
 const ACTIVE_STATUSES = new Set(["spawning", "running", "idle"]);
 function isActive(status) { return ACTIVE_STATUSES.has(status); }
 
@@ -256,14 +260,15 @@ function renderAgent(agent) {
 
   const acts = document.createElement("div");
   acts.className = "acts";
+  const aid = encodeURIComponent(agent.id);
   if (isActive(agent.status)) {
     acts.appendChild(actionBtn("kill", "danger", (b) =>
-      rowAction("POST", `/api/agents/${agent.id}/kill`, `Kill agent ${agent.name}?`, b)));
+      rowAction("POST", `/api/agents/${aid}/kill`, `Kill agent ${agent.name}?`, b)));
   } else {
     acts.appendChild(actionBtn("respawn", "", (b) =>
-      rowAction("POST", `/api/agents/${agent.id}/respawn`, null, b)));
+      rowAction("POST", `/api/agents/${aid}/respawn`, null, b)));
     acts.appendChild(actionBtn("remove", "danger", (b) =>
-      rowAction("DELETE", `/api/agents/${agent.id}`, `Remove agent ${agent.name}?`, b)));
+      rowAction("DELETE", `/api/agents/${aid}`, `Remove agent ${agent.name}?`, b)));
   }
   right.appendChild(acts);
 
