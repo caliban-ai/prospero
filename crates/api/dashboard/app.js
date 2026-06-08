@@ -101,7 +101,7 @@ function openLaunchModal(repoName) {
   const form = document.createElement("div");
   form.innerHTML =
     `<div class="form-title">launch agent</div>` +
-    `<label class="fl">repo<input class="in" id="la-repo" value="${repoName}"></label>` +
+    `<label class="fl">repo<input class="in" id="la-repo" value="${escapeHtml(repoName)}"></label>` +
     `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
     `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
     `<div class="adv-toggle" id="la-adv-toggle">▸ advanced</div>` +
