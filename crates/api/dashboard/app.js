@@ -155,6 +155,35 @@ function openLaunchModal(repoName) {
   };
 }
 
+// --- Row actions ------------------------------------------------------------
+
+const ACTIVE_STATUSES = new Set(["spawning", "running", "idle"]);
+function isActive(status) { return ACTIVE_STATUSES.has(status); }
+
+// Build a small inline action button. `onClick` receives the button element so
+// the handler can disable it while the request is in flight.
+function actionBtn(text, cls, onClick) {
+  const b = document.createElement("button");
+  b.className = "act-btn" + (cls ? " " + cls : "");
+  b.textContent = text;
+  b.onclick = (e) => { e.stopPropagation(); onClick(b); };
+  return b;
+}
+
+// Fire a mutating request. `confirmMsg` (when set) gates via window.confirm.
+// Disables `btn` while in flight; surfaces failures in the banner; refreshes on success.
+async function rowAction(method, path, confirmMsg, btn) {
+  if (confirmMsg && !window.confirm(confirmMsg)) return;
+  if (btn) btn.disabled = true;
+  try {
+    await api(method, path);
+    refreshFleet();
+  } catch (e) {
+    showBanner(String(e.message || e));
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function refreshFleet() {
   try {
     const res = await fetch("/api/fleet");
@@ -212,10 +241,34 @@ function renderFleet(fleet) {
 function renderAgent(agent) {
   const row = document.createElement("div");
   row.className = "agent" + (agent.id === selectedAgent ? " selected" : "");
+
   const wt = agent.isolated ? `<span class="wt">⌥ worktree</span>` : `<span class="wt">shared</span>`;
-  row.innerHTML =
-    `<span><span class="name">${agent.name}</span> ${wt}<br><span class="id">${agent.id}</span></span>` +
-    `<span class="badge ${agent.status}">${agent.status}</span>`;
+  const info = document.createElement("span");
+  info.innerHTML =
+    `<span class="name">${escapeHtml(agent.name)}</span> ${wt}<br><span class="id">${escapeHtml(agent.id)}</span>`;
+
+  const right = document.createElement("span");
+  right.className = "agent-right";
+  const badge = document.createElement("span");
+  badge.className = `badge ${agent.status}`;
+  badge.textContent = agent.status;
+  right.appendChild(badge);
+
+  const acts = document.createElement("div");
+  acts.className = "acts";
+  if (isActive(agent.status)) {
+    acts.appendChild(actionBtn("kill", "danger", (b) =>
+      rowAction("POST", `/api/agents/${agent.id}/kill`, `Kill agent ${agent.name}?`, b)));
+  } else {
+    acts.appendChild(actionBtn("respawn", "", (b) =>
+      rowAction("POST", `/api/agents/${agent.id}/respawn`, null, b)));
+    acts.appendChild(actionBtn("remove", "danger", (b) =>
+      rowAction("DELETE", `/api/agents/${agent.id}`, `Remove agent ${agent.name}?`, b)));
+  }
+  right.appendChild(acts);
+
+  row.appendChild(info);
+  row.appendChild(right);
   row.onclick = () => selectAgent(agent.id);
   return row;
 }
