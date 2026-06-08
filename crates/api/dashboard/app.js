@@ -101,7 +101,7 @@ function openLaunchModal(repoName) {
   const form = document.createElement("div");
   form.innerHTML =
     `<div class="form-title">launch agent</div>` +
-    `<label class="fl">repo<input class="in" id="la-repo" value="${escapeHtml(repoName)}"></label>` +
+    `<label class="fl">repo<input class="in" id="la-repo"></label>` +
     `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
     `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
     `<div class="adv-toggle" id="la-adv-toggle">▸ advanced</div>` +
@@ -116,6 +116,9 @@ function openLaunchModal(repoName) {
       `<button class="ctl-btn primary" id="la-submit">spawn</button>` +
     `</div>`;
   openModal(form);
+  // Set via DOM, not the HTML template — escapeHtml does not cover the `"`
+  // that would break out of a value="…" attribute.
+  form.querySelector("#la-repo").value = repoName;
 
   const adv = form.querySelector("#la-adv");
   const advToggle = form.querySelector("#la-adv-toggle");
