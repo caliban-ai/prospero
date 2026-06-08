@@ -211,10 +211,16 @@ function renderFleet(fleet) {
     const healthy = repo.health.state === "healthy";
     const healthTxt = healthy ? "healthy" : `unreachable: ${repo.health.reason || ""}`;
 
-    const name = document.createElement("div");
+    const head = document.createElement("div");
+    head.className = "repo-head";
+    const name = document.createElement("span");
     name.className = "name";
     name.textContent = repo.name;
-    box.appendChild(name);
+    head.appendChild(name);
+    head.appendChild(actionBtn("remove", "danger", (b) =>
+      rowAction("DELETE", `/api/repos/${encodeURIComponent(repo.name)}`,
+                `Remove repo ${repo.name}?`, b)));
+    box.appendChild(head);
 
     const health = document.createElement("div");
     health.className = `health ${healthy ? "healthy" : "unreachable"}`;
