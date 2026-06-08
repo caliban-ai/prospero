@@ -3,12 +3,60 @@
 // live-streams a selected agent's events over SSE.
 
 const fleetEl = document.getElementById("fleet");
+const fleetListEl = document.getElementById("fleet-list");
 const streamEl = document.getElementById("stream");
 const hostEl = document.getElementById("host");
 const connEl = document.getElementById("conn");
+const modalRoot = document.getElementById("modal-root");
 
 let selectedAgent = null;
 let evtSource = null;
+
+// --- API + UX helpers -------------------------------------------------------
+
+// JSON API call. Returns parsed JSON (or null for empty bodies).
+// Throws Error(message) carrying the server's `error` string on non-2xx.
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) {
+    throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
+  }
+  return data;
+}
+
+// Transient, click-to-dismiss error banner above the fleet list.
+function showBanner(msg) {
+  const bar = document.getElementById("banner");
+  bar.textContent = msg;
+  bar.classList.remove("hidden");
+  bar.onclick = () => bar.classList.add("hidden");
+}
+
+// Modal infrastructure — one node at a time inside #modal-root.
+function openModal(node) {
+  modalRoot.innerHTML = "";
+  const scrim = document.createElement("div");
+  scrim.className = "scrim";
+  scrim.onclick = (e) => { if (e.target === scrim) closeModal(); };
+  const box = document.createElement("div");
+  box.className = "modal";
+  box.appendChild(node);
+  scrim.appendChild(box);
+  modalRoot.appendChild(scrim);
+  modalRoot.classList.remove("hidden");
+}
+
+function closeModal() {
+  modalRoot.classList.add("hidden");
+  modalRoot.innerHTML = "";
+}
 
 async function refreshFleet() {
   try {
@@ -17,16 +65,16 @@ async function refreshFleet() {
     hostEl.textContent = fleet.host;
     renderFleet(fleet);
   } catch (e) {
-    fleetEl.innerHTML = `<div class="health unreachable">fleet unreachable: ${e}</div>`;
+    fleetListEl.innerHTML = `<div class="health unreachable">fleet unreachable: ${e}</div>`;
   }
 }
 
 function renderFleet(fleet) {
   if (!fleet.repos.length) {
-    fleetEl.innerHTML = `<div class="muted">no repos registered</div>`;
+    fleetListEl.innerHTML = `<div class="muted">no repos registered</div>`;
     return;
   }
-  fleetEl.innerHTML = "";
+  fleetListEl.innerHTML = "";
   for (const repo of fleet.repos) {
     const box = document.createElement("div");
     box.className = "repo";
@@ -44,7 +92,7 @@ function renderFleet(fleet) {
     for (const agent of repo.agents) {
       box.appendChild(renderAgent(agent));
     }
-    fleetEl.appendChild(box);
+    fleetListEl.appendChild(box);
   }
 }
 
