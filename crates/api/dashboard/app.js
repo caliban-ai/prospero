@@ -61,6 +61,40 @@ function closeModal() {
   modalRoot.innerHTML = "";
 }
 
+// --- Add-repo modal ---------------------------------------------------------
+
+function openAddRepoModal() {
+  const form = document.createElement("div");
+  form.innerHTML =
+    `<div class="form-title">add repo</div>` +
+    `<label class="fl">name<input class="in" id="ar-name" placeholder="my-repo"></label>` +
+    `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/repo"></label>` +
+    `<div class="form-err" id="ar-err"></div>` +
+    `<div class="form-actions">` +
+      `<button class="ctl-btn" id="ar-cancel">cancel</button>` +
+      `<button class="ctl-btn primary" id="ar-submit">add</button>` +
+    `</div>`;
+  openModal(form);
+  form.querySelector("#ar-cancel").onclick = closeModal;
+  const submit = form.querySelector("#ar-submit");
+  submit.onclick = async () => {
+    const name = form.querySelector("#ar-name").value.trim();
+    const root = form.querySelector("#ar-root").value.trim();
+    const err = form.querySelector("#ar-err");
+    err.textContent = "";
+    if (!name || !root) { err.textContent = "name and path are required"; return; }
+    submit.disabled = true;
+    try {
+      await api("POST", "/api/repos", { name, root });
+      closeModal();
+      refreshFleet();
+    } catch (e) {
+      err.textContent = String(e.message || e);
+      submit.disabled = false;
+    }
+  };
+}
+
 async function refreshFleet() {
   try {
     const res = await fetch("/api/fleet");
@@ -159,5 +193,6 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 }
 
+document.getElementById("add-repo-btn").onclick = openAddRepoModal;
 refreshFleet();
 setInterval(refreshFleet, 3000);
