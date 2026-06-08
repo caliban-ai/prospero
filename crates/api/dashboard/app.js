@@ -11,6 +11,7 @@ const modalRoot = document.getElementById("modal-root");
 
 let selectedAgent = null;
 let evtSource = null;
+let healthyRepos = []; // names of reachable repos, for the launch picker
 
 // --- API + UX helpers -------------------------------------------------------
 
@@ -101,7 +102,7 @@ function openLaunchModal(repoName) {
   const form = document.createElement("div");
   form.innerHTML =
     `<div class="form-title">launch agent</div>` +
-    `<label class="fl">repo<input class="in" id="la-repo"></label>` +
+    `<label class="fl">repo<select class="in" id="la-repo"></select></label>` +
     `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
     `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
     `<div class="adv-toggle" id="la-adv-toggle">▸ advanced</div>` +
@@ -116,9 +117,17 @@ function openLaunchModal(repoName) {
       `<button class="ctl-btn primary" id="la-submit">spawn</button>` +
     `</div>`;
   openModal(form);
-  // Set via DOM, not the HTML template — escapeHtml does not cover the `"`
-  // that would break out of a value="…" attribute.
-  form.querySelector("#la-repo").value = repoName;
+  // Populate the repo picker from the reachable repos, defaulting to the one
+  // whose launch button was clicked. Options are built via the DOM so repo
+  // names are never interpolated into markup.
+  const repoSel = form.querySelector("#la-repo");
+  for (const r of healthyRepos) {
+    const opt = document.createElement("option");
+    opt.value = r;
+    opt.textContent = r;
+    if (r === repoName) opt.selected = true;
+    repoSel.appendChild(opt);
+  }
 
   const adv = form.querySelector("#la-adv");
   const advToggle = form.querySelector("#la-adv-toggle");
@@ -203,6 +212,9 @@ async function refreshFleet() {
 }
 
 function renderFleet(fleet) {
+  healthyRepos = fleet.repos
+    .filter((r) => r.health.state === "healthy")
+    .map((r) => r.name);
   if (!fleet.repos.length) {
     fleetListEl.innerHTML = `<div class="muted">no repos registered</div>`;
     return;
