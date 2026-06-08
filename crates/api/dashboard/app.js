@@ -95,6 +95,66 @@ function openAddRepoModal() {
   };
 }
 
+// --- Launch-agent modal -----------------------------------------------------
+
+function openLaunchModal(repoName) {
+  const form = document.createElement("div");
+  form.innerHTML =
+    `<div class="form-title">launch agent</div>` +
+    `<label class="fl">repo<input class="in" id="la-repo" value="${repoName}"></label>` +
+    `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
+    `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
+    `<div class="adv-toggle" id="la-adv-toggle">▸ advanced</div>` +
+    `<div class="hidden" id="la-adv">` +
+      `<label class="fl">label<input class="in" id="la-label"></label>` +
+      `<label class="fl">model<input class="in" id="la-model"></label>` +
+      `<label class="fl">tools<input class="in" id="la-tools" placeholder="comma,separated"></label>` +
+    `</div>` +
+    `<div class="form-err" id="la-err"></div>` +
+    `<div class="form-actions">` +
+      `<button class="ctl-btn" id="la-cancel">cancel</button>` +
+      `<button class="ctl-btn primary" id="la-submit">spawn</button>` +
+    `</div>`;
+  openModal(form);
+
+  const adv = form.querySelector("#la-adv");
+  const advToggle = form.querySelector("#la-adv-toggle");
+  advToggle.onclick = () => {
+    adv.classList.toggle("hidden");
+    advToggle.textContent = adv.classList.contains("hidden") ? "▸ advanced" : "▾ advanced";
+  };
+
+  form.querySelector("#la-cancel").onclick = closeModal;
+  const submit = form.querySelector("#la-submit");
+  submit.onclick = async () => {
+    const repo = form.querySelector("#la-repo").value.trim();
+    const prompt = form.querySelector("#la-task").value.trim();
+    const err = form.querySelector("#la-err");
+    err.textContent = "";
+    if (!repo || !prompt) { err.textContent = "repo and task are required"; return; }
+
+    const body = { prompt };
+    if (!form.querySelector("#la-wt").checked) body.isolation = "shared";
+    const label = form.querySelector("#la-label").value.trim();
+    const model = form.querySelector("#la-model").value.trim();
+    const tools = form.querySelector("#la-tools").value.trim();
+    if (label) body.label = label;
+    if (model) body.model = model;
+    if (tools) body.tool_allowlist = tools.split(",").map((s) => s.trim()).filter(Boolean);
+
+    submit.disabled = true;
+    try {
+      const res = await api("POST", `/api/repos/${encodeURIComponent(repo)}/agents`, body);
+      closeModal();
+      if (res && res.agent_id) selectAgent(res.agent_id);
+      else refreshFleet();
+    } catch (e) {
+      err.textContent = String(e.message || e);
+      submit.disabled = false;
+    }
+  };
+}
+
 async function refreshFleet() {
   try {
     const res = await fetch("/api/fleet");
@@ -117,9 +177,25 @@ function renderFleet(fleet) {
     box.className = "repo";
     const healthy = repo.health.state === "healthy";
     const healthTxt = healthy ? "healthy" : `unreachable: ${repo.health.reason || ""}`;
-    box.innerHTML =
-      `<div class="name">${repo.name}</div>` +
-      `<div class="health ${healthy ? "healthy" : "unreachable"}">${healthTxt}</div>`;
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = repo.name;
+    box.appendChild(name);
+
+    const health = document.createElement("div");
+    health.className = `health ${healthy ? "healthy" : "unreachable"}`;
+    health.textContent = healthTxt;
+    box.appendChild(health);
+
+    if (healthy) {
+      const launch = document.createElement("button");
+      launch.className = "ctl-btn launch";
+      launch.textContent = "＋ launch agent";
+      launch.onclick = () => openLaunchModal(repo.name);
+      box.appendChild(launch);
+    }
+
     if (!repo.agents.length) {
       const none = document.createElement("div");
       none.className = "muted";
