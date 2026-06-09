@@ -41,6 +41,18 @@ struct Args {
     /// Path/name of the caliban daemon binary used for autostart.
     #[arg(long, default_value = "caliband")]
     caliband_bin: String,
+
+    /// Default env var applied under every repo's resolved config (repeatable).
+    #[arg(long = "default-env", value_parser = parse_key_val)]
+    default_env: Vec<(String, String)>,
+}
+
+/// Parse a `KEY=VALUE` pair (value may contain further `=`).
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected KEY=VALUE, got '{s}'")),
+    }
 }
 
 /// Default data dir: `$XDG_DATA_HOME/prospero` or `$HOME/.local/share/prospero`.
@@ -75,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         caliband_bin: args.caliband_bin.clone(),
         ..EnsureConfig::default()
     };
+    config.default_env = args.default_env.iter().cloned().collect();
 
     let store = Arc::new(JsonlStore::open(&data_dir).with_context(|| "opening event store")?);
     let manager = FleetManager::new(config, store).with_context(|| "building fleet manager")?;
@@ -122,5 +135,21 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_val;
+
+    #[test]
+    fn parses_key_value() {
+        assert_eq!(parse_key_val("A=b").unwrap(), ("A".to_string(), "b".to_string()));
+        // Values may contain '='.
+        assert_eq!(
+            parse_key_val("URL=http://h:1?x=1").unwrap(),
+            ("URL".to_string(), "http://h:1?x=1".to_string())
+        );
+        assert!(parse_key_val("noequals").is_err());
     }
 }
