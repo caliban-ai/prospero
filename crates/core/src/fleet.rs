@@ -526,6 +526,8 @@ impl FleetManager {
         if let Some(root) = root {
             let socket_res = crate::discovery::resolve_socket(&root, &self.inner.config.discovery_env);
             if let Ok(socket) = socket_res {
+                // Reuse startup_timeout as the upper bound for the daemon to
+                // release its socket after Shutdown (a symmetric drain bound).
                 let deadline = tokio::time::Instant::now() + self.inner.config.ensure.startup_timeout;
                 while tokio::net::UnixStream::connect(&socket).await.is_ok() {
                     if tokio::time::Instant::now() >= deadline {
@@ -616,8 +618,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
 
-        let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
-        let _ = &mut fake;
+        let fake = FakeCaliband::start_at(&socket).await.unwrap();
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let mgr = FleetManager::new(config, store).unwrap();
         mgr.add_repo("p", &root).await.unwrap();
