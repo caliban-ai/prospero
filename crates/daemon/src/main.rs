@@ -151,5 +151,6 @@ mod tests {
             ("URL".to_string(), "http://h:1?x=1".to_string())
         );
         assert!(parse_key_val("noequals").is_err());
+        assert!(parse_key_val("=val").is_err()); // empty key rejected
     }
 }
