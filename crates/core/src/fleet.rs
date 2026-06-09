@@ -501,6 +501,56 @@ impl FleetManager {
         });
     }
 
+    /// Names of repos with a cached control client (test/observability helper).
+    pub async fn cached_client_names(&self) -> Vec<String> {
+        self.inner.clients.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Gracefully shut down a repo's caliband daemon and drop its cached client
+    /// so the next access re-runs discovery (respawning with the current env).
+    pub async fn restart_caliband(&self, repo: &str) -> Result<()> {
+        let client = self.inner.clients.lock().unwrap().get(repo).cloned();
+        if let Some(client) = client {
+            let res = client.shutdown().await;
+            if let Err(e) = res {
+                tracing::warn!(target: "prospero_fleet", repo, error = %e,
+                    "shutdown request to caliband failed (continuing)");
+            }
+        }
+        self.inner.clients.lock().unwrap().remove(repo);
+
+        let root = {
+            let reg = self.inner.registry.read().await;
+            reg.get(repo).map(|r| r.root.clone())
+        };
+        if let Some(root) = root {
+            let socket_res = crate::discovery::resolve_socket(&root, &self.inner.config.discovery_env);
+            if let Ok(socket) = socket_res {
+                let deadline = tokio::time::Instant::now() + self.inner.config.ensure.startup_timeout;
+                while tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(target: "prospero_fleet", repo,
+                            "old caliband socket still reachable after shutdown; proceeding");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+        self.poll_repo_once(repo).await;
+        Ok(())
+    }
+
+    /// Persist a repo's provider config and restart its caliband to apply it.
+    pub async fn set_repo_config(
+        &self,
+        repo: &str,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        self.set_repo_config_registry_only(repo, config).await?;
+        self.restart_caliband(repo).await
+    }
+
     /// Run the background poll loop forever (until the task is dropped).
     pub async fn run(self) {
         let interval = self.inner.config.poll_interval;
@@ -552,6 +602,36 @@ async fn attach_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restart_caliband_shuts_down_and_clears_client() {
+        use crate::registry::RepoProviderConfig;
+        use crate::testkit::FakeCaliband;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false; // no real caliband to spawn in tests
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+        let _ = &mut fake;
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+
+        mgr.poll_repo_once("p").await; // cache a client by talking to the repo
+
+        mgr.set_repo_config("p", RepoProviderConfig::default()).await.unwrap();
+
+        assert_eq!(fake.shutdowns(), 1, "restart should send one Shutdown");
+        assert!(
+            mgr.cached_client_names().await.iter().all(|n| n != "p"),
+            "cached client for the repo should be cleared after restart"
+        );
+    }
 
     #[tokio::test]
     async fn ensure_config_for_merges_default_and_repo_config() {

@@ -28,6 +28,10 @@ struct FakeState {
     received_specs: Vec<SpawnSpec>,
     /// Monotonic id counter for spawns.
     next_id: u64,
+    /// How many `Shutdown` requests have been received.
+    shutdowns: u32,
+    /// Set to `true` after the first `Shutdown`; the accept loop exits.
+    should_stop: bool,
 }
 
 /// A running fake caliband daemon. Aborts its listener tasks on drop.
@@ -55,13 +59,16 @@ impl FakeCaliband {
 
         let st = state.clone();
         let dir2 = dir.clone();
+        let socket2 = control_socket.clone();
         let accept_task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let st = st.clone();
+                let conn_st = st.clone();
                 let dir = dir2.clone();
-                tokio::spawn(async move {
-                    let _ = handle_control_conn(stream, st, dir).await;
-                });
+                handle_control_conn(stream, conn_st, dir).await.ok();
+                if st.lock().unwrap().should_stop {
+                    let _ = std::fs::remove_file(&socket2);
+                    break;
+                }
             }
         });
 
@@ -93,6 +100,11 @@ impl FakeCaliband {
     /// All spawn specs received so far (in order).
     pub fn received_specs(&self) -> Vec<SpawnSpec> {
         self.state.lock().unwrap().received_specs.clone()
+    }
+
+    /// Number of `Shutdown` requests the fake has received.
+    pub fn shutdowns(&self) -> u32 {
+        self.state.lock().unwrap().shutdowns
     }
 
     /// Set an agent's status (to simulate lifecycle transitions across polls).
@@ -241,7 +253,11 @@ async fn handle_control_conn(
                 }),
                 None,
             ),
-            CtlRequest::Shutdown => (CtlReply::ShutdownAck, None),
+            CtlRequest::Shutdown => {
+                st.shutdowns += 1;
+                st.should_stop = true;
+                (CtlReply::ShutdownAck, None)
+            }
         }
     };
 
