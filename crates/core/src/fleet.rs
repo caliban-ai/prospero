@@ -84,6 +84,8 @@ pub struct FleetConfig {
     pub normalize: NormalizeOptions,
     /// Broadcast channel capacity (events buffered for slow subscribers).
     pub event_buffer: usize,
+    /// Global default env merged under each repo's resolved overlay.
+    pub default_env: std::collections::BTreeMap<String, String>,
 }
 
 impl FleetConfig {
@@ -97,6 +99,7 @@ impl FleetConfig {
             ensure: EnsureConfig::default(),
             normalize: NormalizeOptions::default(),
             event_buffer: 1024,
+            default_env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -246,6 +249,39 @@ impl FleetManager {
         Ok(removed)
     }
 
+    /// Build the `EnsureConfig` for a repo, resolving its env overlay from the
+    /// global default + the repo's stored provider config + prosperod's env.
+    pub async fn ensure_config_for(&self, repo: &str) -> Result<EnsureConfig> {
+        let cfg = {
+            let reg = self.inner.registry.read().await;
+            reg.get(repo)
+                .map(|r| r.config.clone())
+                .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
+        };
+        let env = crate::provider_env::resolve_env(
+            &self.inner.config.default_env,
+            &cfg,
+            &|k| std::env::var(k).ok(),
+        );
+        let mut ensure = self.inner.config.ensure.clone();
+        ensure.env = env;
+        Ok(ensure)
+    }
+
+    /// Update a repo's provider config in the registry only (no restart).
+    pub async fn set_repo_config_registry_only(
+        &self,
+        repo: &str,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        let mut reg = self.inner.registry.write().await;
+        if !reg.set_config(repo, config) {
+            return Err(CoreError::RepoNotFound(repo.to_string()));
+        }
+        reg.save(&self.inner.config.registry_path())?;
+        Ok(())
+    }
+
     /// Get-or-create the control client for a repo (running discovery once).
     async fn client_for(&self, repo: &str) -> Result<CalibandClient> {
         if let Some(c) = self.inner.clients.lock().unwrap().get(repo).cloned() {
@@ -257,12 +293,8 @@ impl FleetManager {
                 .map(|r| r.root.clone())
                 .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
         };
-        let client = ensure_caliband(
-            &root,
-            &self.inner.config.discovery_env,
-            &self.inner.config.ensure,
-        )
-        .await?;
+        let ensure = self.ensure_config_for(repo).await?;
+        let client = ensure_caliband(&root, &self.inner.config.discovery_env, &ensure).await?;
         self.inner
             .clients
             .lock()
@@ -515,4 +547,34 @@ async fn attach_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_config_for_merges_default_and_repo_config() {
+        use crate::registry::RepoProviderConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.default_env.insert("KEEP".into(), "global".into());
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+
+        mgr.add_repo("p", "/tmp/p").await.ok(); // discovery may fail; the registry write is what matters
+        let cfg = RepoProviderConfig {
+            provider: Some("ollama".into()),
+            base_url: Some("http://h:11434".into()),
+            env: [("EXTRA".to_string(), "1".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        mgr.set_repo_config_registry_only("p", cfg).await.unwrap();
+
+        let ec = mgr.ensure_config_for("p").await.unwrap();
+        assert_eq!(ec.env.get("KEEP").unwrap(), "global");
+        assert_eq!(ec.env.get("CALIBAN_PROVIDER").unwrap(), "ollama");
+        assert_eq!(ec.env.get("OLLAMA_BASE_URL").unwrap(), "http://h:11434");
+        assert_eq!(ec.env.get("EXTRA").unwrap(), "1");
+    }
 }

@@ -84,6 +84,8 @@ pub struct EnsureConfig {
     pub caliband_bin: String,
     /// How long to wait for the socket to come up after autostart.
     pub startup_timeout: Duration,
+    /// Extra environment variables layered onto the caliband process.
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for EnsureConfig {
@@ -92,6 +94,7 @@ impl Default for EnsureConfig {
             autostart: true,
             caliband_bin: "caliband".to_string(),
             startup_timeout: Duration::from_secs(10),
+            env: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -120,6 +123,7 @@ pub async fn ensure_caliband(
     tokio::process::Command::new(&cfg.caliband_bin)
         .arg("--repo-root")
         .arg(repo_root)
+        .envs(&cfg.env)
         .spawn()
         .map_err(|e| CoreError::Discovery(format!("failed to spawn {} : {e}", cfg.caliband_bin)))?;
 
