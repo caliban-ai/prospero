@@ -133,4 +133,13 @@ mod tests {
         assert_eq!(out.get("CALIBAN_PROVIDER").unwrap(), "bedrock");
         assert!(out.keys().all(|k| k == "CALIBAN_PROVIDER"));
     }
+
+    #[test]
+    fn empty_config_passes_default_env_through() {
+        let mut default_env = BTreeMap::new();
+        default_env.insert("FOO".into(), "bar".into());
+        let out = resolve_env(&default_env, &cfg(), &no_env);
+        assert_eq!(out.get("FOO").unwrap(), "bar");
+        assert_eq!(out.len(), 1);
+    }
 }
