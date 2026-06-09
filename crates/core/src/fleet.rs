@@ -205,11 +205,22 @@ impl FleetManager {
 
     /// Register a repo and persist the registry. Triggers an immediate poll.
     pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
+        self.add_repo_with_config(name, root, Default::default()).await
+    }
+
+    /// Register a repo with an initial provider config.
+    pub async fn add_repo_with_config(
+        &self,
+        name: impl Into<String>,
+        root: impl Into<PathBuf>,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
         let name = name.into();
         let root = root.into();
         {
             let mut reg = self.inner.registry.write().await;
             reg.add(name.clone(), root.clone())?;
+            reg.set_config(&name, config);
             reg.save(&self.inner.config.registry_path())?;
         }
         {
@@ -225,6 +236,11 @@ impl FleetManager {
         }
         self.poll_repo_once(&name).await;
         Ok(())
+    }
+
+    /// The stored provider config for a repo, if registered.
+    pub async fn repo_config(&self, repo: &str) -> Option<crate::registry::RepoProviderConfig> {
+        self.inner.registry.read().await.get(repo).map(|r| r.config.clone())
     }
 
     /// Unregister a repo and persist the registry.

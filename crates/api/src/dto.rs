@@ -1,6 +1,7 @@
 //! Request/response payloads for the HTTP API.
 
 use prospero_core::fleet::SpawnRequest;
+use prospero_core::registry::RepoProviderConfig;
 use serde::{Deserialize, Serialize};
 
 /// Body for `POST /api/repos`.
@@ -10,7 +11,14 @@ pub struct AddRepoBody {
     pub name: String,
     /// Repo root path.
     pub root: String,
+    /// Optional initial provider config.
+    #[serde(default)]
+    pub config: RepoProviderConfig,
 }
+
+/// Body for `PUT /api/repos/{name}/config`.
+#[derive(Debug, Deserialize)]
+pub struct SetConfigBody(pub RepoProviderConfig);
 
 /// Body for `POST /api/repos/{repo}/agents`.
 #[derive(Debug, Deserialize)]
@@ -83,4 +91,6 @@ pub struct RepoSummary {
     pub health: prospero_core::RepoHealth,
     /// Number of known agents.
     pub agent_count: usize,
+    /// Provider/environment config for this repo.
+    pub config: RepoProviderConfig,
 }

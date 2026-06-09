@@ -7,7 +7,7 @@ use prospero_core::model::{Agent, FleetSnapshot};
 
 use crate::AppState;
 use crate::dto::{
-    AddRepoBody, FromSeq, RepoSummary, RespawnedResponse, SpawnBody, SpawnedResponse,
+    AddRepoBody, FromSeq, RepoSummary, RespawnedResponse, SetConfigBody, SpawnBody, SpawnedResponse,
 };
 use crate::error::ApiError;
 
@@ -19,17 +19,18 @@ pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
 /// `GET /api/repos` — managed repos with health and agent counts.
 pub async fn get_repos(State(st): State<AppState>) -> Json<Vec<RepoSummary>> {
     let snap = st.manager.snapshot().await;
-    let repos = snap
-        .repos
-        .into_iter()
-        .map(|r| RepoSummary {
+    let mut out = Vec::with_capacity(snap.repos.len());
+    for r in snap.repos {
+        let config = st.manager.repo_config(&r.name).await.unwrap_or_default();
+        out.push(RepoSummary {
             name: r.name,
             root: r.root.display().to_string(),
             health: r.health,
             agent_count: r.agents.len(),
-        })
-        .collect();
-    Json(repos)
+            config,
+        });
+    }
+    Json(out)
 }
 
 /// `POST /api/repos` — register a repo.
@@ -37,8 +38,20 @@ pub async fn add_repo(
     State(st): State<AppState>,
     Json(body): Json<AddRepoBody>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager.add_repo(body.name, body.root).await?;
+    st.manager
+        .add_repo_with_config(body.name, body.root, body.config)
+        .await?;
     Ok(StatusCode::CREATED)
+}
+
+/// `PUT /api/repos/{name}/config` — set provider config and restart caliband.
+pub async fn set_repo_config(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<SetConfigBody>,
+) -> Result<StatusCode, ApiError> {
+    st.manager.set_repo_config(&name, body.0).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/repos/{name}` — unregister a repo.

@@ -259,6 +259,69 @@ async fn sse_stream_closes_after_agent_finished() {
 }
 
 #[tokio::test]
+async fn add_repo_with_config_persists_and_get_repos_returns_it() {
+    // A fresh harness without any pre-registered repo so we can add one with config.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+
+    let env = DiscoveryEnv {
+        caliban_daemon_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+        xdg_runtime_dir: None,
+        tmpdir: None,
+    };
+    let socket = control_socket_path(&repo_root, &env);
+    let _fake = FakeCaliband::start_at(&socket).await.unwrap();
+
+    let mut config = FleetConfig::new("test-host", data_dir.path());
+    config.discovery_env = env;
+    config.ensure = EnsureConfig {
+        autostart: false,
+        ..EnsureConfig::default()
+    };
+
+    let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let manager = FleetManager::new(config, store).unwrap();
+    let app = router(manager);
+
+    // POST /api/repos with a config object.
+    let post_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/repos")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"p","root":"/tmp/p","config":{"provider":"ollama","base_url":"http://h:11434"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::CREATED);
+
+    // GET /api/repos should include the config fields.
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let v = json_body(get_resp).await;
+    let repos = v.as_array().unwrap();
+    let p = repos.iter().find(|r| r["name"] == "p").expect("repo 'p' not found");
+    assert_eq!(p["config"]["provider"], "ollama");
+    assert_eq!(p["config"]["base_url"], "http://h:11434");
+}
+
+#[tokio::test]
 async fn serves_dashboard_index() {
     let h = setup().await;
     let resp = h

@@ -12,7 +12,7 @@ pub mod handlers;
 pub mod sse;
 
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use prospero_core::FleetManager;
 
 /// Shared application state handed to every handler.
@@ -37,6 +37,7 @@ pub fn router(manager: FleetManager) -> Router {
             get(handlers::get_repos).post(handlers::add_repo),
         )
         .route("/api/repos/{name}", delete(handlers::delete_repo))
+        .route("/api/repos/{name}/config", put(handlers::set_repo_config))
         .route(
             "/api/repos/{repo}/agents",
             get(handlers::get_repo_agents).post(handlers::spawn_agent),
