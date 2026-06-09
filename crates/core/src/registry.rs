@@ -3,11 +3,30 @@
 //! The fleet is intentional, not guessed: a blind socket scan can't map a
 //! `hash16` socket name back to a repo, so operators register repos by name.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+
+/// Per-repo provider/environment configuration applied to its caliband daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoProviderConfig {
+    /// Selected provider → `CALIBAN_PROVIDER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Provider base URL / host → `{PROVIDER}_BASE_URL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// NAME of an env var in prosperod's environment whose value is injected as
+    /// `{PROVIDER}_API_KEY` at spawn time. Never the literal secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_from_env: Option<String>,
+    /// Raw escape-hatch env overrides (highest precedence within a repo).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
 
 /// A single managed repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +35,9 @@ pub struct RegisteredRepo {
     pub name: String,
     /// Canonical repo root path.
     pub root: PathBuf,
+    /// Provider/environment config for this repo's caliband daemon.
+    #[serde(default)]
+    pub config: RepoProviderConfig,
 }
 
 /// The persisted registry of managed repos.
@@ -64,7 +86,11 @@ impl Registry {
                 "repo name '{name}' already registered with a different root"
             )));
         }
-        self.repos.push(RegisteredRepo { name, root });
+        self.repos.push(RegisteredRepo {
+            name,
+            root,
+            config: RepoProviderConfig::default(),
+        });
         Ok(())
     }
 
@@ -73,6 +99,16 @@ impl Registry {
         let before = self.repos.len();
         self.repos.retain(|r| r.name != name);
         self.repos.len() != before
+    }
+
+    /// Replace a repo's provider config. Returns whether the repo existed.
+    pub fn set_config(&mut self, name: &str, config: RepoProviderConfig) -> bool {
+        if let Some(r) = self.repos.iter_mut().find(|r| r.name == name) {
+            r.config = config;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -126,5 +162,39 @@ mod tests {
         reg.save(&path).unwrap();
         let loaded = Registry::load(&path).unwrap();
         assert_eq!(reg, loaded);
+    }
+
+    #[test]
+    fn repo_config_defaults_empty() {
+        let c = RepoProviderConfig::default();
+        assert!(c.provider.is_none() && c.base_url.is_none()
+            && c.api_key_from_env.is_none() && c.env.is_empty());
+    }
+
+    #[test]
+    fn old_registry_json_without_config_loads_with_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        std::fs::write(&path, r#"{"repos":[{"name":"p","root":"/r"}]}"#).unwrap();
+        let reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.get("p").unwrap().config, RepoProviderConfig::default());
+    }
+
+    #[test]
+    fn set_config_updates_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let mut reg = Registry::default();
+        reg.add("p", "/r").unwrap();
+        let cfg = RepoProviderConfig {
+            provider: Some("ollama".into()),
+            base_url: Some("http://host:11434".into()),
+            ..Default::default()
+        };
+        assert!(reg.set_config("p", cfg.clone()));
+        assert!(!reg.set_config("missing", cfg.clone()));
+        reg.save(&path).unwrap();
+        let loaded = Registry::load(&path).unwrap();
+        assert_eq!(loaded.get("p").unwrap().config, cfg);
     }
 }
