@@ -144,7 +144,10 @@ mod tests {
 
     #[test]
     fn parses_key_value() {
-        assert_eq!(parse_key_val("A=b").unwrap(), ("A".to_string(), "b".to_string()));
+        assert_eq!(
+            parse_key_val("A=b").unwrap(),
+            ("A".to_string(), "b".to_string())
+        );
         // Values may contain '='.
         assert_eq!(
             parse_key_val("URL=http://h:1?x=1").unwrap(),

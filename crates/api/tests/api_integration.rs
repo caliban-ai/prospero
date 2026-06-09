@@ -316,7 +316,10 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
     assert_eq!(get_resp.status(), StatusCode::OK);
     let v = json_body(get_resp).await;
     let repos = v.as_array().unwrap();
-    let p = repos.iter().find(|r| r["name"] == "p").expect("repo 'p' not found");
+    let p = repos
+        .iter()
+        .find(|r| r["name"] == "p")
+        .expect("repo 'p' not found");
     assert_eq!(p["config"]["provider"], "ollama");
     assert_eq!(p["config"]["base_url"], "http://h:11434");
 }

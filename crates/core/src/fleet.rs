@@ -205,7 +205,8 @@ impl FleetManager {
 
     /// Register a repo and persist the registry. Triggers an immediate poll.
     pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
-        self.add_repo_with_config(name, root, Default::default()).await
+        self.add_repo_with_config(name, root, Default::default())
+            .await
     }
 
     /// Register a repo with an initial provider config.
@@ -240,7 +241,12 @@ impl FleetManager {
 
     /// The stored provider config for a repo, if registered.
     pub async fn repo_config(&self, repo: &str) -> Option<crate::registry::RepoProviderConfig> {
-        self.inner.registry.read().await.get(repo).map(|r| r.config.clone())
+        self.inner
+            .registry
+            .read()
+            .await
+            .get(repo)
+            .map(|r| r.config.clone())
     }
 
     /// Unregister a repo and persist the registry.
@@ -274,11 +280,9 @@ impl FleetManager {
                 .map(|r| r.config.clone())
                 .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
         };
-        let env = crate::provider_env::resolve_env(
-            &self.inner.config.default_env,
-            &cfg,
-            &|k| std::env::var(k).ok(),
-        );
+        let env = crate::provider_env::resolve_env(&self.inner.config.default_env, &cfg, &|k| {
+            std::env::var(k).ok()
+        });
         let mut ensure = self.inner.config.ensure.clone();
         ensure.env = env;
         Ok(ensure)
@@ -540,11 +544,13 @@ impl FleetManager {
             reg.get(repo).map(|r| r.root.clone())
         };
         if let Some(root) = root {
-            let socket_res = crate::discovery::resolve_socket(&root, &self.inner.config.discovery_env);
+            let socket_res =
+                crate::discovery::resolve_socket(&root, &self.inner.config.discovery_env);
             if let Ok(socket) = socket_res {
                 // Reuse startup_timeout as the upper bound for the daemon to
                 // release its socket after Shutdown (a symmetric drain bound).
-                let deadline = tokio::time::Instant::now() + self.inner.config.ensure.startup_timeout;
+                let deadline =
+                    tokio::time::Instant::now() + self.inner.config.ensure.startup_timeout;
                 while tokio::net::UnixStream::connect(&socket).await.is_ok() {
                     if tokio::time::Instant::now() >= deadline {
                         tracing::warn!(target: "prospero_fleet", repo,
@@ -641,7 +647,9 @@ mod tests {
 
         mgr.poll_repo_once("p").await; // cache a client by talking to the repo
 
-        mgr.set_repo_config("p", RepoProviderConfig::default()).await.unwrap();
+        mgr.set_repo_config("p", RepoProviderConfig::default())
+            .await
+            .unwrap();
 
         assert_eq!(fake.shutdowns(), 1, "restart should send one Shutdown");
         assert!(
@@ -663,7 +671,9 @@ mod tests {
         let cfg = RepoProviderConfig {
             provider: Some("ollama".into()),
             base_url: Some("http://h:11434".into()),
-            env: [("EXTRA".to_string(), "1".to_string())].into_iter().collect(),
+            env: [("EXTRA".to_string(), "1".to_string())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         mgr.set_repo_config_registry_only("p", cfg).await.unwrap();

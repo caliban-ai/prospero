@@ -171,8 +171,12 @@ mod tests {
     #[test]
     fn repo_config_defaults_empty() {
         let c = RepoProviderConfig::default();
-        assert!(c.provider.is_none() && c.base_url.is_none()
-            && c.api_key_from_env.is_none() && c.env.is_empty());
+        assert!(
+            c.provider.is_none()
+                && c.base_url.is_none()
+                && c.api_key_from_env.is_none()
+                && c.env.is_empty()
+        );
     }
 
     #[test]
