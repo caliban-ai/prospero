@@ -69,29 +69,137 @@ function openAddRepoModal() {
   form.innerHTML =
     `<div class="form-title">add repo</div>` +
     `<label class="fl">name<input class="in" id="ar-name" placeholder="my-repo"></label>` +
-    `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/repo"></label>` +
-    `<div class="form-err" id="ar-err"></div>` +
-    `<div class="form-actions">` +
-      `<button class="ctl-btn" id="ar-cancel">cancel</button>` +
-      `<button class="ctl-btn primary" id="ar-submit">add</button>` +
-    `</div>`;
+    `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/repo"></label>`;
   openModal(form);
+  appendProviderFields(form, {});
+  const err = document.createElement("div");
+  err.className = "form-err";
+  err.id = "ar-err";
+  form.appendChild(err);
+  const actions = document.createElement("div");
+  actions.className = "form-actions";
+  actions.innerHTML =
+    `<button class="ctl-btn" id="ar-cancel">cancel</button>` +
+    `<button class="ctl-btn primary" id="ar-submit">add</button>`;
+  form.appendChild(actions);
   form.querySelector("#ar-cancel").onclick = closeModal;
   const submit = form.querySelector("#ar-submit");
   submit.onclick = async () => {
     const name = form.querySelector("#ar-name").value.trim();
     const root = form.querySelector("#ar-root").value.trim();
-    const err = form.querySelector("#ar-err");
     err.textContent = "";
     if (!name || !root) { err.textContent = "name and path are required"; return; }
     submit.disabled = true;
     try {
-      await api("POST", "/api/repos", { name, root });
+      await api("POST", "/api/repos", { name, root, config: readProviderConfig(form) });
       closeModal();
       refreshFleet();
     } catch (e) {
       err.textContent = String(e.message || e);
       submit.disabled = false;
+    }
+  };
+}
+
+// --- Provider-config form fields (shared by add-repo + repo-settings) --------
+
+const PROVIDERS = ["", "ollama", "anthropic", "openai", "google", "bedrock", "vertex"];
+
+// Append provider/base_url/api-key/raw-env fields to `form`, prefilled from `cfg`.
+function appendProviderFields(form, cfg) {
+  cfg = cfg || {};
+  const opts = PROVIDERS.map((p) =>
+    `<option value="${p}"${p === (cfg.provider || "") ? " selected" : ""}>${p || "(default)"}</option>`
+  ).join("");
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    `<label class="fl">provider<select class="in" id="pc-provider">${opts}</select></label>` +
+    `<label class="fl">base URL<input class="in" id="pc-baseurl" placeholder="http://host:11434"></label>` +
+    `<label class="fl">API key from env var<input class="in" id="pc-keyenv" placeholder="e.g. ANTHROPIC_API_KEY"></label>` +
+    `<div class="adv-toggle" id="pc-adv-toggle">▸ advanced env</div>` +
+    `<div class="hidden" id="pc-adv"><div id="pc-env-rows"></div>` +
+      `<span class="env-add" id="pc-env-add">+ add env var</span></div>`;
+  form.appendChild(wrap);
+  form.querySelector("#pc-baseurl").value = cfg.base_url || "";
+  form.querySelector("#pc-keyenv").value = cfg.api_key_from_env || "";
+
+  const rows = form.querySelector("#pc-env-rows");
+  const addRow = (k, v) => {
+    const row = document.createElement("div");
+    row.className = "env-row";
+    row.innerHTML = `<input class="in pc-k" placeholder="KEY"><input class="in pc-v" placeholder="VALUE"><button type="button">×</button>`;
+    row.querySelector(".pc-k").value = k || "";
+    row.querySelector(".pc-v").value = v || "";
+    row.querySelector("button").onclick = () => row.remove();
+    rows.appendChild(row);
+  };
+  for (const [k, v] of Object.entries(cfg.env || {})) addRow(k, v);
+  const adv = form.querySelector("#pc-adv");
+  const advToggle = form.querySelector("#pc-adv-toggle");
+  advToggle.onclick = () => {
+    adv.classList.toggle("hidden");
+    advToggle.textContent = adv.classList.contains("hidden") ? "▸ advanced env" : "▾ advanced env";
+  };
+  form.querySelector("#pc-env-add").onclick = () => addRow("", "");
+  if (Object.keys(cfg.env || {}).length) adv.classList.remove("hidden");
+}
+
+// Read the provider config object back out of the fields appendProviderFields added.
+function readProviderConfig(form) {
+  const cfg = {};
+  const provider = form.querySelector("#pc-provider").value.trim();
+  const baseUrl = form.querySelector("#pc-baseurl").value.trim();
+  const keyEnv = form.querySelector("#pc-keyenv").value.trim();
+  if (provider) cfg.provider = provider;
+  if (baseUrl) cfg.base_url = baseUrl;
+  if (keyEnv) cfg.api_key_from_env = keyEnv;
+  const env = {};
+  for (const row of form.querySelectorAll(".env-row")) {
+    const k = row.querySelector(".pc-k").value.trim();
+    const v = row.querySelector(".pc-v").value.trim();
+    if (k) env[k] = v;
+  }
+  if (Object.keys(env).length) cfg.env = env;
+  return cfg;
+}
+
+// --- Repo-settings modal ----------------------------------------------------
+
+async function openRepoSettings(repo) {
+  let cfg = {};
+  try {
+    const repos = await api("GET", "/api/repos");
+    const found = (repos || []).find((r) => r.name === repo.name);
+    cfg = (found && found.config) || {};
+  } catch (e) { showBanner(String(e.message || e)); return; }
+
+  const runningCount = (repo.agents || []).filter((a) => isActive(a.status)).length;
+  const form = document.createElement("div");
+  form.innerHTML = `<div class="form-title">settings — ${escapeHtml(repo.name)}</div>`;
+  openModal(form);
+  appendProviderFields(form, cfg);
+  const err = document.createElement("div");
+  err.className = "form-err";
+  form.appendChild(err);
+  const actions = document.createElement("div");
+  actions.className = "form-actions";
+  actions.innerHTML = `<button class="ctl-btn" id="rs-cancel">cancel</button><button class="ctl-btn primary" id="rs-save">save</button>`;
+  form.appendChild(actions);
+  form.querySelector("#rs-cancel").onclick = closeModal;
+  const save = form.querySelector("#rs-save");
+  save.onclick = async () => {
+    if (runningCount > 0 &&
+        !window.confirm(`Restart caliban for ${repo.name}? This stops ${runningCount} running agent(s).`)) {
+      return;
+    }
+    save.disabled = true;
+    try {
+      await api("PUT", `/api/repos/${encodeURIComponent(repo.name)}/config`, readProviderConfig(form));
+      closeModal();
+      refreshFleet();
+    } catch (e) {
+      err.textContent = String(e.message || e);
+      save.disabled = false;
     }
   };
 }
@@ -232,9 +340,17 @@ function renderFleet(fleet) {
     name.className = "name";
     name.textContent = repo.name;
     head.appendChild(name);
-    head.appendChild(actionBtn("remove", "danger", (b) =>
+    const acts = document.createElement("div");
+    acts.className = "repo-head-actions";
+    const gear = document.createElement("button");
+    gear.className = "gear";
+    gear.textContent = "⚙";
+    gear.onclick = () => openRepoSettings(repo);
+    acts.appendChild(gear);
+    acts.appendChild(actionBtn("remove", "danger", (b) =>
       rowAction("DELETE", `/api/repos/${encodeURIComponent(repo.name)}`,
                 `Remove repo ${repo.name}?`, b)));
+    head.appendChild(acts);
     box.appendChild(head);
 
     const health = document.createElement("div");
