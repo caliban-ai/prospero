@@ -24,6 +24,10 @@ pub struct RepoProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_from_env: Option<String>,
     /// Raw escape-hatch env overrides (highest precedence within a repo).
+    ///
+    /// Unlike `api_key_from_env` (a reference), values here are stored verbatim
+    /// in `registry.json` and returned by the repos API — do not put secrets
+    /// here; use `api_key_from_env` for credentials.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
