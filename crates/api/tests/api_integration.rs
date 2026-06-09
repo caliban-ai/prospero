@@ -325,6 +325,70 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
 }
 
 #[tokio::test]
+async fn put_config_updates_and_returns_204() {
+    // `setup()` registers "repo" with a FakeCaliband listening. PUT triggers a
+    // restart (Shutdown → drain → re-ensure); with autostart=false the repo
+    // simply degrades, but the config is persisted and the handler returns 204.
+    let h = setup().await;
+    let put_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/repos/repo/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"provider":"ollama","base_url":"http://h:11434"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status(), StatusCode::NO_CONTENT);
+
+    let get_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(get_resp).await;
+    let repo = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "repo")
+        .expect("repo not found");
+    assert_eq!(repo["config"]["provider"], "ollama");
+    assert_eq!(repo["config"]["base_url"], "http://h:11434");
+}
+
+#[tokio::test]
+async fn put_config_unknown_repo_returns_404() {
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/repos/nope/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"provider":"ollama"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn serves_dashboard_index() {
     let h = setup().await;
     let resp = h
