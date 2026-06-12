@@ -159,7 +159,8 @@ impl CalibandClient {
                 path: socket_path.display().to_string(),
                 source,
             })?;
-        let _ = stream.flush().await;
+        // No flush: tokio's UnixStream wraps the raw fd with no userspace
+        // buffer, so write_all has already handed the bytes to the kernel.
         Ok(())
     }
 }

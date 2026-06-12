@@ -272,6 +272,20 @@ mod tests {
     }
 
     #[test]
+    fn attach_inbound_round_trips() {
+        // Symmetric drift guard: the tagged shape must survive a serialize →
+        // deserialize round-trip for both variants.
+        for frame in [
+            AttachInbound::UserMessage { text: "hi".into() },
+            AttachInbound::EndInput,
+        ] {
+            let s = serde_json::to_string(&frame).unwrap();
+            let back: AttachInbound = serde_json::from_str(&s).unwrap();
+            assert_eq!(frame, back);
+        }
+    }
+
+    #[test]
     fn ctl_reply_error_round_trips() {
         let reply = CtlReply::Error {
             error: SupervisorError::NotFound { id: "x".into() },
