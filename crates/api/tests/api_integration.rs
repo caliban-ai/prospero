@@ -404,42 +404,66 @@ async fn agent_input_and_end_input_and_404() {
     h.manager.poll_repo_once("repo").await;
 
     // Happy path: POST /input → 202
-    let resp = h.router.clone().oneshot(
-        Request::builder()
-            .method("POST")
-            .uri("/api/agents/ag1/input")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"text":"also check the tests"}"#))
-            .unwrap(),
-    ).await.unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/ag1/input")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"also check the tests"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     // Happy path: POST /end-input (no body) → 202
-    let resp = h.router.clone().oneshot(
-        Request::builder()
-            .method("POST")
-            .uri("/api/agents/ag1/end-input")
-            .body(Body::empty())
-            .unwrap(),
-    ).await.unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/ag1/end-input")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     // Unknown id → 404
-    let resp = h.router.clone().oneshot(
-        Request::builder()
-            .method("POST").uri("/api/agents/nope/input")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"text":"x"}"#)).unwrap(),
-    ).await.unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/nope/input")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // Non-interactive agent → 409 (InvalidState).
-    let resp = h.router.clone().oneshot(
-        Request::builder()
-            .method("POST").uri("/api/agents/ag2/input")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"text":"x"}"#)).unwrap(),
-    ).await.unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/ag2/input")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 

@@ -239,7 +239,10 @@ mod tests {
         // so upstream protocol drift on `interactive` fails loudly here.
         let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
         let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
-        assert!(spec.interactive, "interactive must round-trip from caliban's wire form");
+        assert!(
+            spec.interactive,
+            "interactive must round-trip from caliban's wire form"
+        );
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["interactive"], serde_json::json!(true));
         // Bidirectional pin: our serialized form must match caliban's exact wire
@@ -261,7 +264,10 @@ mod tests {
 
     #[test]
     fn attach_inbound_user_message_serializes() {
-        let j = serde_json::to_string(&AttachInbound::UserMessage { text: "hi there".into() }).unwrap();
+        let j = serde_json::to_string(&AttachInbound::UserMessage {
+            text: "hi there".into(),
+        })
+        .unwrap();
         assert_eq!(j, r#"{"type":"UserMessage","text":"hi there"}"#);
     }
 

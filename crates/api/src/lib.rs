@@ -52,6 +52,9 @@ pub fn router(manager: FleetManager) -> Router {
         .route("/api/agents/{id}/kill", post(handlers::kill_agent))
         .route("/api/agents/{id}/respawn", post(handlers::respawn_agent))
         .route("/api/agents/{id}/input", post(handlers::agent_input))
-        .route("/api/agents/{id}/end-input", post(handlers::agent_end_input))
+        .route(
+            "/api/agents/{id}/end-input",
+            post(handlers::agent_end_input),
+        )
         .with_state(state)
 }

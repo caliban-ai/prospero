@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::caliband::wire::{AgentRecord, AttachInbound, CtlReply, CtlRequest, DaemonStatus, SpawnSpec};
+use crate::caliband::wire::{
+    AgentRecord, AttachInbound, CtlReply, CtlRequest, DaemonStatus, SpawnSpec,
+};
 use crate::caliband::{read_frame, write_frame};
 use crate::error::{CoreError, Result};
 
@@ -190,6 +192,9 @@ mod tests {
         CalibandClient::send_inbound(&sock, &AttachInbound::UserMessage { text: "go".into() })
             .await
             .unwrap();
-        assert_eq!(server.await.unwrap().trim_end(), r#"{"type":"UserMessage","text":"go"}"#);
+        assert_eq!(
+            server.await.unwrap().trim_end(),
+            r#"{"type":"UserMessage","text":"go"}"#
+        );
     }
 }

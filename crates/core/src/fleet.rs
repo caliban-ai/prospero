@@ -356,7 +356,11 @@ impl FleetManager {
             let (repo, agent) = snap
                 .find_agent(agent_id)
                 .ok_or_else(|| CoreError::AgentNotFound(agent_id.to_string()))?;
-            (repo.to_string(), agent.interactive, agent.status.is_terminal())
+            (
+                repo.to_string(),
+                agent.interactive,
+                agent.status.is_terminal(),
+            )
         };
         if terminal {
             return Err(CoreError::InvalidState {
@@ -702,7 +706,7 @@ mod tests {
     async fn send_agent_input_rejects_terminal_unknown_and_non_interactive() {
         use crate::caliband::wire::AttachInbound;
         use crate::model::AgentStatus;
-        use crate::testkit::{test_record, FakeCaliband};
+        use crate::testkit::{FakeCaliband, test_record};
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = FleetConfig::new("local", dir.path());
@@ -726,12 +730,25 @@ mod tests {
         mgr.add_repo("repo", &root).await.unwrap();
         mgr.poll_repo_once("repo").await;
 
-        let r1 = mgr.send_agent_input("ag-done", AttachInbound::EndInput).await;
-        assert!(matches!(r1, Err(CoreError::InvalidState { .. })), "terminal must reject");
-        let r2 = mgr.send_agent_input("ag-idle", AttachInbound::EndInput).await;
-        assert!(matches!(r2, Err(CoreError::InvalidState { .. })), "non-interactive must reject");
+        let r1 = mgr
+            .send_agent_input("ag-done", AttachInbound::EndInput)
+            .await;
+        assert!(
+            matches!(r1, Err(CoreError::InvalidState { .. })),
+            "terminal must reject"
+        );
+        let r2 = mgr
+            .send_agent_input("ag-idle", AttachInbound::EndInput)
+            .await;
+        assert!(
+            matches!(r2, Err(CoreError::InvalidState { .. })),
+            "non-interactive must reject"
+        );
         let r3 = mgr.send_agent_input("nope", AttachInbound::EndInput).await;
-        assert!(matches!(r3, Err(CoreError::AgentNotFound(_))), "unknown id must 404");
+        assert!(
+            matches!(r3, Err(CoreError::AgentNotFound(_))),
+            "unknown id must 404"
+        );
     }
 
     #[tokio::test]
