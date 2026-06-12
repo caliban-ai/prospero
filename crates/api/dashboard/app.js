@@ -329,6 +329,17 @@ function renderFleet(fleet) {
     fleetListEl.innerHTML = `<div class="muted">no repos registered</div>`;
     return;
   }
+  // Preserve in-progress agent-input typing across this poll rebuild.
+  const savedInputs = {};
+  let focusedAgentId = null;
+  let focusedCaret = null;
+  for (const el of fleetListEl.querySelectorAll(".agent-input .in")) {
+    if (el.value) savedInputs[el.dataset.agentId] = el.value;
+    if (el === document.activeElement) {
+      focusedAgentId = el.dataset.agentId;
+      focusedCaret = el.selectionStart;
+    }
+  }
   fleetListEl.innerHTML = "";
   for (const repo of fleet.repos) {
     const box = document.createElement("div");
@@ -379,6 +390,15 @@ function renderFleet(fleet) {
     }
     fleetListEl.appendChild(box);
   }
+  // Restore any preserved input value + focus/caret onto the rebuilt rows.
+  for (const el of fleetListEl.querySelectorAll(".agent-input .in")) {
+    const id = el.dataset.agentId;
+    if (savedInputs[id] !== undefined) el.value = savedInputs[id];
+    if (id === focusedAgentId) {
+      el.focus();
+      if (focusedCaret != null) el.setSelectionRange(focusedCaret, focusedCaret);
+    }
+  }
 }
 
 function renderAgent(agent) {
@@ -420,6 +440,7 @@ function renderAgent(agent) {
     const input = document.createElement("input");
     input.className = "in";
     input.placeholder = "send a message…";
+    input.dataset.agentId = agent.id; // so the poll rebuild can restore typing
     const send = document.createElement("button");
     send.textContent = "send";
     const end = document.createElement("button");
