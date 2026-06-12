@@ -40,6 +40,10 @@ enum Command {
     Respawn(AgentRef),
     /// Remove an agent from caliban's registry.
     Rm(AgentRef),
+    /// Send a user message to an interactive agent (resumes the run).
+    Send(SendArgs),
+    /// Signal end-of-input to an interactive agent (it finishes after).
+    EndInput(AgentRef),
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,6 +97,14 @@ struct FollowArgs {
 struct AgentRef {
     /// Agent id.
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct SendArgs {
+    /// Agent id.
+    id: String,
+    /// Message text to inject.
+    text: String,
 }
 
 fn main() -> Result<()> {
@@ -176,6 +188,20 @@ fn main() -> Result<()> {
         Command::Rm(a) => {
             client.delete(&format!("/api/agents/{}", a.id))?;
             println!("removed {}", a.id);
+        }
+        Command::Send(a) => {
+            client.post_json(
+                &format!("/api/agents/{}/input", a.id),
+                serde_json::json!({ "text": a.text }),
+            )?;
+            println!("sent message to {}", a.id);
+        }
+        Command::EndInput(a) => {
+            client.post_json(
+                &format!("/api/agents/{}/end-input", a.id),
+                serde_json::Value::Null,
+            )?;
+            println!("end-input sent to {}", a.id);
         }
     }
     Ok(())
@@ -330,6 +356,27 @@ mod tests {
                 assert_eq!(a.from, 0);
             }
             other => panic!("expected follow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_parses_id_and_text() {
+        let cli = Cli::parse_from(["prospero", "send", "ag1", "do the thing"]);
+        match cli.command {
+            Command::Send(a) => {
+                assert_eq!(a.id, "ag1");
+                assert_eq!(a.text, "do the thing");
+            }
+            other => panic!("expected send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn end_input_parses_id() {
+        let cli = Cli::parse_from(["prospero", "end-input", "ag1"]);
+        match cli.command {
+            Command::EndInput(a) => assert_eq!(a.id, "ag1"),
+            other => panic!("expected end-input, got {other:?}"),
         }
     }
 }
