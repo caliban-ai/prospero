@@ -66,6 +66,11 @@ pub struct SpawnSpec {
     /// Whether to inherit parent hooks.
     #[serde(default = "true_default")]
     pub inherit_hooks: bool,
+    /// When true, the worker runs in interactive mode: at each end-of-run
+    /// boundary it awaits inbound operator messages over the per-agent socket
+    /// instead of finishing. Mirrors caliban `SpawnSpec.interactive`.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 fn true_default() -> bool {
@@ -211,6 +216,25 @@ mod tests {
         assert!(s.inherit_hooks);
         assert!(!s.isolation_worktree);
         assert!(s.model.is_none());
+    }
+
+    #[test]
+    fn spawn_spec_is_wire_compatible_with_caliban_interactive() {
+        // Golden JSON in caliban's serialized SpawnSpec form (proto.rs). Pinned
+        // so upstream protocol drift on `interactive` fails loudly here.
+        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
+        let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
+        assert!(spec.interactive, "interactive must round-trip from caliban's wire form");
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["interactive"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn spawn_spec_without_interactive_defaults_false() {
+        // Back-compat: a pre-interactive spec (field absent) still deserializes.
+        let old = r#"{"initial_prompt":"hi"}"#;
+        let spec: SpawnSpec = serde_json::from_str(old).unwrap();
+        assert!(!spec.interactive);
     }
 
     #[test]

@@ -63,6 +63,7 @@ impl SpawnRequest {
             tool_allowlist: self.tool_allowlist,
             isolation_worktree: self.isolation_worktree,
             inherit_hooks: true,
+            interactive: false,
         }
     }
 }

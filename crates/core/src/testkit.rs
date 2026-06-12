@@ -314,6 +314,7 @@ pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) ->
             tool_allowlist: None,
             isolation_worktree: isolated,
             inherit_hooks: true,
+            interactive: false,
         },
     }
 }
