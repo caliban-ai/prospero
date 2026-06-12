@@ -414,6 +414,49 @@ function renderAgent(agent) {
   row.appendChild(info);
   row.appendChild(right);
   row.onclick = () => selectAgent(agent.id);
+  if (agent.interactive && agent.status === "idle") {
+    const box = document.createElement("div");
+    box.className = "agent-input";
+    const input = document.createElement("input");
+    input.className = "in";
+    input.placeholder = "send a message…";
+    const send = document.createElement("button");
+    send.textContent = "send";
+    const end = document.createElement("button");
+    end.className = "end";
+    end.textContent = "end input";
+    const doSend = async () => {
+      const text = input.value.trim();
+      if (!text) return;
+      send.disabled = true;
+      try {
+        await api("POST", `/api/agents/${encodeURIComponent(agent.id)}/input`, { text });
+        input.value = "";
+        selectAgent(agent.id); // (re)open the stream to watch the resumed turn
+      } catch (e) {
+        showBanner(String(e.message || e));
+        send.disabled = false;
+      }
+    };
+    send.onclick = (e) => { e.stopPropagation(); doSend(); };
+    input.onclick = (e) => e.stopPropagation();
+    input.onkeydown = (e) => { if (e.key === "Enter") { e.stopPropagation(); doSend(); } };
+    end.onclick = async (e) => {
+      e.stopPropagation();
+      end.disabled = true;
+      try {
+        await api("POST", `/api/agents/${encodeURIComponent(agent.id)}/end-input`);
+        refreshFleet();
+      } catch (err) {
+        showBanner(String(err.message || err));
+        end.disabled = false;
+      }
+    };
+    box.appendChild(input);
+    box.appendChild(send);
+    box.appendChild(end);
+    row.appendChild(box);
+  }
   return row;
 }
 
