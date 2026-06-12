@@ -18,6 +18,7 @@ pub mod store;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
+pub use caliband::wire::AttachInbound;
 pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};

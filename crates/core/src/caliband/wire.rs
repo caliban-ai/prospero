@@ -77,6 +77,21 @@ fn true_default() -> bool {
     true
 }
 
+/// Inbound control frames written to an interactive agent's per-agent socket.
+/// Mirrors caliban `AttachInbound` (`caliban/src/attach.rs`); the outbound
+/// stream stays caliban stream-json, so the two never share a direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AttachInbound {
+    /// Inject a user message and resume the run.
+    UserMessage {
+        /// Message text.
+        text: String,
+    },
+    /// Signal end-of-input: the agent finishes after this.
+    EndInput,
+}
+
 /// Control-plane requests sent to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -242,6 +257,18 @@ mod tests {
         let old = r#"{"initial_prompt":"hi"}"#;
         let spec: SpawnSpec = serde_json::from_str(old).unwrap();
         assert!(!spec.interactive);
+    }
+
+    #[test]
+    fn attach_inbound_user_message_serializes() {
+        let j = serde_json::to_string(&AttachInbound::UserMessage { text: "hi there".into() }).unwrap();
+        assert_eq!(j, r#"{"type":"UserMessage","text":"hi there"}"#);
+    }
+
+    #[test]
+    fn attach_inbound_end_input_serializes() {
+        let j = serde_json::to_string(&AttachInbound::EndInput).unwrap();
+        assert_eq!(j, r#"{"type":"EndInput"}"#);
     }
 
     #[test]
