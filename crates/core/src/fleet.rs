@@ -16,7 +16,7 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
-use crate::caliband::wire::{AgentRecord, SpawnSpec};
+use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
@@ -343,6 +343,36 @@ impl FleetManager {
         self.client_for(&repo).await?.kill(agent_id).await
     }
 
+    /// Send an inbound control frame to an interactive agent. Rejects if the
+    /// agent is unknown (`AgentNotFound`), terminal, or was not spawned
+    /// interactive (`InvalidState`).
+    pub async fn send_agent_input(&self, agent_id: &str, input: AttachInbound) -> Result<()> {
+        let (repo, interactive, terminal) = {
+            let snap = self.inner.snapshot.read().await;
+            let (repo, agent) = snap
+                .find_agent(agent_id)
+                .ok_or_else(|| CoreError::AgentNotFound(agent_id.to_string()))?;
+            (repo.to_string(), agent.interactive, agent.status.is_terminal())
+        };
+        if terminal {
+            return Err(CoreError::InvalidState {
+                op: "send_input".into(),
+                id: agent_id.to_string(),
+                status: "terminal".into(),
+            });
+        }
+        if !interactive {
+            return Err(CoreError::InvalidState {
+                op: "send_input".into(),
+                id: agent_id.to_string(),
+                status: "not interactive".into(),
+            });
+        }
+        let client = self.client_for(&repo).await?;
+        let socket = client.attach(agent_id).await?;
+        CalibandClient::send_inbound(&socket, &input).await
+    }
+
     /// Respawn an agent; returns the new id.
     pub async fn respawn_agent(&self, agent_id: &str) -> Result<String> {
         let repo = self.repo_of(agent_id).await?;
@@ -437,6 +467,7 @@ impl FleetManager {
                 status: rec.status,
                 started_at: rec.started_at.clone(),
                 isolated: rec.spec.isolation_worktree,
+                interactive: rec.spec.interactive,
                 session_dir: rec.session_dir.clone(),
             };
             match prior.get(&rec.id) {
@@ -661,6 +692,42 @@ mod tests {
             mgr.cached_client_names().await.iter().all(|n| n != "p"),
             "cached client for the repo should be cleared after restart"
         );
+    }
+
+    #[tokio::test]
+    async fn send_agent_input_rejects_terminal_unknown_and_non_interactive() {
+        use crate::caliband::wire::AttachInbound;
+        use crate::model::AgentStatus;
+        use crate::testkit::{test_record, FakeCaliband};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+        // Terminal agent (Done), even though interactive → reject as terminal.
+        let mut done = test_record("ag-done", dir.path(), AgentStatus::Done, false);
+        done.spec.interactive = true;
+        fake.add_agent(done, vec![]).await;
+        // Idle but NOT interactive → reject.
+        let idle = test_record("ag-idle", dir.path(), AgentStatus::Idle, false);
+        fake.add_agent(idle, vec![]).await;
+
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+        mgr.add_repo("repo", &root).await.unwrap();
+        mgr.poll_repo_once("repo").await;
+
+        let r1 = mgr.send_agent_input("ag-done", AttachInbound::EndInput).await;
+        assert!(matches!(r1, Err(CoreError::InvalidState { .. })), "terminal must reject");
+        let r2 = mgr.send_agent_input("ag-idle", AttachInbound::EndInput).await;
+        assert!(matches!(r2, Err(CoreError::InvalidState { .. })), "non-interactive must reject");
+        let r3 = mgr.send_agent_input("nope", AttachInbound::EndInput).await;
+        assert!(matches!(r3, Err(CoreError::AgentNotFound(_))), "unknown id must 404");
     }
 
     #[tokio::test]

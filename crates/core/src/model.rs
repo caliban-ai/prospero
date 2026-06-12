@@ -71,6 +71,8 @@ pub struct Agent {
     pub started_at: String,
     /// True if the agent runs in an isolated git worktree.
     pub isolated: bool,
+    /// True if the agent was spawned in interactive mode (accepts operator input).
+    pub interactive: bool,
     /// Path to the agent's session directory on disk.
     pub session_dir: PathBuf,
 }
@@ -162,6 +164,7 @@ mod tests {
                     status: AgentStatus::Running,
                     started_at: "t".into(),
                     isolated: true,
+                    interactive: false,
                     session_dir: "/s".into(),
                 }],
             }],
