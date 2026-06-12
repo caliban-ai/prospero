@@ -227,6 +227,13 @@ mod tests {
         assert!(spec.interactive, "interactive must round-trip from caliban's wire form");
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["interactive"], serde_json::json!(true));
+        // Bidirectional pin: our serialized form must match caliban's exact wire
+        // shape (field set + order), so adding/dropping a field drifts loudly.
+        assert_eq!(
+            serde_json::to_string(&spec).unwrap(),
+            golden,
+            "re-serialised SpawnSpec must match caliban's golden wire form"
+        );
     }
 
     #[test]
