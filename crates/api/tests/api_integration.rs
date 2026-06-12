@@ -398,6 +398,9 @@ async fn agent_input_and_end_input_and_404() {
     let mut rec = test_record("ag1", h._runtime.path(), AgentStatus::Idle, false);
     rec.spec.interactive = true;
     h.fake.add_agent(rec, vec![]).await;
+    // A non-interactive idle agent — input must be rejected (409).
+    let ag2 = test_record("ag2", h._runtime.path(), AgentStatus::Idle, false);
+    h.fake.add_agent(ag2, vec![]).await;
     h.manager.poll_repo_once("repo").await;
 
     // Happy path: POST /input → 202
@@ -429,6 +432,15 @@ async fn agent_input_and_end_input_and_404() {
             .body(Body::from(r#"{"text":"x"}"#)).unwrap(),
     ).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Non-interactive agent → 409 (InvalidState).
+    let resp = h.router.clone().oneshot(
+        Request::builder()
+            .method("POST").uri("/api/agents/ag2/input")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"x"}"#)).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
