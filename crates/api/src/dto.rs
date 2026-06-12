@@ -37,6 +37,9 @@ pub struct SpawnBody {
     /// Optional tool allowlist.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    /// Run the agent in interactive mode (awaits operator input).
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl SpawnBody {
@@ -50,6 +53,7 @@ impl SpawnBody {
             model: self.model,
             isolation_worktree,
             tool_allowlist: self.tool_allowlist,
+            interactive: self.interactive,
         }
     }
 }
@@ -93,4 +97,17 @@ pub struct RepoSummary {
     pub agent_count: usize,
     /// Provider/environment config for this repo.
     pub config: RepoProviderConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_body_interactive_round_trips_and_defaults_false() {
+        let with: SpawnBody = serde_json::from_str(r#"{"prompt":"p","interactive":true}"#).unwrap();
+        assert!(with.into_request().interactive);
+        let without: SpawnBody = serde_json::from_str(r#"{"prompt":"p"}"#).unwrap();
+        assert!(!without.into_request().interactive);
+    }
 }

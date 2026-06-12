@@ -40,6 +40,9 @@ pub struct SpawnRequest {
     pub isolation_worktree: bool,
     /// Optional tool allowlist.
     pub tool_allowlist: Option<Vec<String>>,
+    /// Run in interactive mode (the worker awaits operator input instead of
+    /// finishing). Defaults to `false` via [`SpawnRequest::new`].
+    pub interactive: bool,
 }
 
 impl SpawnRequest {
@@ -51,6 +54,7 @@ impl SpawnRequest {
             model: None,
             isolation_worktree: true,
             tool_allowlist: None,
+            interactive: false,
         }
     }
 
@@ -63,7 +67,7 @@ impl SpawnRequest {
             tool_allowlist: self.tool_allowlist,
             isolation_worktree: self.isolation_worktree,
             inherit_hooks: true,
-            interactive: false,
+            interactive: self.interactive,
         }
     }
 }

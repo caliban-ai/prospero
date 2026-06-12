@@ -75,6 +75,9 @@ struct SpawnArgs {
     /// Run in the shared working tree instead of an isolated worktree.
     #[arg(long)]
     shared_tree: bool,
+    /// Run the agent in interactive mode (it awaits your input instead of finishing).
+    #[arg(long)]
+    interactive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +122,9 @@ fn main() -> Result<()> {
                 body["model"] = model.into();
             }
             body["isolation"] = if a.shared_tree { "shared" } else { "worktree" }.into();
+            if a.interactive {
+                body["interactive"] = true.into();
+            }
             let resp = client.post_json(&format!("/api/repos/{}/agents", a.repo), body)?;
             let id = resp.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
             let isolated = resp
@@ -284,6 +290,15 @@ mod tests {
         let cli = Cli::parse_from(["prospero", "spawn", "r", "p", "--shared-tree"]);
         match cli.command {
             Command::Spawn(a) => assert!(a.shared_tree),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_interactive_flag_parses() {
+        let cli = Cli::parse_from(["prospero", "spawn", "r", "p", "--interactive"]);
+        match cli.command {
+            Command::Spawn(a) => assert!(a.interactive),
             other => panic!("expected spawn, got {other:?}"),
         }
     }

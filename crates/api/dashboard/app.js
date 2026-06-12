@@ -213,6 +213,7 @@ function openLaunchModal(repoName) {
     `<label class="fl">repo<select class="in" id="la-repo"></select></label>` +
     `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
     `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
+    `<label class="chk"><input type="checkbox" id="la-interactive"> interactive (awaits your input)</label>` +
     `<div class="adv-toggle" id="la-adv-toggle">▸ advanced</div>` +
     `<div class="hidden" id="la-adv">` +
       `<label class="fl">label<input class="in" id="la-label"></label>` +
@@ -255,6 +256,7 @@ function openLaunchModal(repoName) {
 
     const body = { prompt };
     if (!form.querySelector("#la-wt").checked) body.isolation = "shared";
+    if (form.querySelector("#la-interactive").checked) body.interactive = true;
     const label = form.querySelector("#la-label").value.trim();
     const model = form.querySelector("#la-model").value.trim();
     const tools = form.querySelector("#la-tools").value.trim();
