@@ -77,6 +77,13 @@ pub struct FromSeq {
     pub from: u64,
 }
 
+/// Body for `POST /api/agents/{id}/input`.
+#[derive(Debug, Deserialize)]
+pub struct AgentInputBody {
+    /// Message text to inject into the interactive agent.
+    pub text: String,
+}
+
 /// Response for `POST /api/agents/{id}/respawn`.
 #[derive(Debug, Serialize)]
 pub struct RespawnedResponse {

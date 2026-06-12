@@ -3,11 +3,13 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use prospero_core::AttachInbound;
 use prospero_core::model::{Agent, FleetSnapshot};
 
 use crate::AppState;
 use crate::dto::{
-    AddRepoBody, FromSeq, RepoSummary, RespawnedResponse, SetConfigBody, SpawnBody, SpawnedResponse,
+    AddRepoBody, AgentInputBody, FromSeq, RepoSummary, RespawnedResponse, SetConfigBody, SpawnBody,
+    SpawnedResponse,
 };
 use crate::error::ApiError;
 
@@ -134,6 +136,29 @@ pub async fn respawn_agent(
 ) -> Result<Json<RespawnedResponse>, ApiError> {
     let agent_id = st.manager.respawn_agent(&id).await?;
     Ok(Json(RespawnedResponse { agent_id }))
+}
+
+/// `POST /api/agents/{id}/input` — inject a user message into an interactive agent.
+pub async fn agent_input(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AgentInputBody>,
+) -> Result<StatusCode, ApiError> {
+    st.manager
+        .send_agent_input(&id, AttachInbound::UserMessage { text: body.text })
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `POST /api/agents/{id}/end-input` — signal end-of-input to an interactive agent.
+pub async fn agent_end_input(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    st.manager
+        .send_agent_input(&id, AttachInbound::EndInput)
+        .await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// `DELETE /api/agents/{id}` — remove from caliban's registry.
