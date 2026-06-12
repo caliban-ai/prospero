@@ -346,6 +346,10 @@ impl FleetManager {
     /// Send an inbound control frame to an interactive agent. Rejects if the
     /// agent is unknown (`AgentNotFound`), terminal, or was not spawned
     /// interactive (`InvalidState`).
+    ///
+    /// The state gate reads the last poll snapshot (up to one poll interval
+    /// stale); caliband remains authoritative, so a just-terminated agent may
+    /// pass the gate and fail at `attach`/`send_inbound` instead.
     pub async fn send_agent_input(&self, agent_id: &str, input: AttachInbound) -> Result<()> {
         let (repo, interactive, terminal) = {
             let snap = self.inner.snapshot.read().await;
