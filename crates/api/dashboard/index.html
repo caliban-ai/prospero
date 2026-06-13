@@ -27,7 +27,22 @@
       #fleet-head { display: flex; justify-content: space-between; align-items: center;
                     position: sticky; top: 0; z-index: 3; background: #0f1115;
                     padding: 12px 0 8px; }
-      #stream { overflow-y: auto; padding: 12px; white-space: pre-wrap; }
+      #stream { overflow-y: auto; padding: 0; }
+      #stream-log { padding: 12px; white-space: pre-wrap; }
+      #stream-head { display: flex; align-items: center; gap: var(--sp-3);
+                     position: sticky; top: 0; z-index: 2; background: #0f1115;
+                     padding: 8px 12px; border-bottom: 1px solid #1c2029; }
+      .sh-name { color: #8ab4f8; font-weight: 600; }
+      .sh-meta { color: #6b7280; font-size: 11px; }
+      .sh-conn { margin-left: auto; font-size: 10px; }
+      .sh-conn.live { color: #6bd968; }
+      .sh-conn.closed { color: #ef5350; }
+      .sh-back { display: none; font: 11px ui-monospace, monospace; padding: 2px 8px;
+                 border-radius: 6px; border: 1px solid #2d3340; background: #1b1f27; color: #9aa0aa; cursor: pointer; }
+      .empty { display: flex; flex-direction: column; align-items: center; justify-content: center;
+               min-height: 50vh; gap: 6px; color: #6b7280; }
+      .empty-title { color: #9aa0aa; font-size: 13px; }
+      .empty-hint { font-size: 11px; }
       .repo { margin-bottom: 16px; }
       .repo-head .name { color: #c792ea; font-weight: 600; }
       .repo > .health { font-size: 11px; }
@@ -109,7 +124,6 @@
     <header>
       <h1>Prospero</h1>
       <span class="sub">fleet control plane · <span id="host">…</span></span>
-      <span class="sub" id="conn"></span>
     </header>
     <main>
       <section id="fleet">
@@ -120,7 +134,10 @@
         <div id="banner" class="banner hidden"></div>
         <div id="fleet-list"><div class="muted">loading fleet…</div></div>
       </section>
-      <section id="stream"><div class="muted">select an agent to stream its output</div></section>
+      <section id="stream">
+        <div id="stream-head" class="hidden"></div>
+        <div id="stream-log"></div>
+      </section>
     </main>
     <div id="modal-root" class="modal-root hidden"></div>
     <script src="/app.js"></script>
