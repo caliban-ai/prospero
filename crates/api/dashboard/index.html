@@ -118,6 +118,14 @@
       .agent-input button { font: 10px ui-monospace, monospace; padding: 2px 8px; border-radius: 5px;
                             border: 1px solid #2d3a5a; background: #1f2a44; color: #8ab4f8; cursor: pointer; }
       .agent-input button.end { background: #1b1f27; color: #9aa0aa; border-color: #2d3340; }
+      @media (max-width: 720px) {
+        main { grid-template-columns: 1fr; }
+        #fleet { border-right: none; }
+        #stream { display: none; }
+        body.show-stream #fleet { display: none; }
+        body.show-stream #stream { display: block; }
+        .sh-back { display: inline-block; }
+      }
     </style>
   </head>
   <body>
