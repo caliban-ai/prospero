@@ -66,10 +66,30 @@ pub struct SpawnSpec {
     /// Whether to inherit parent hooks.
     #[serde(default = "true_default")]
     pub inherit_hooks: bool,
+    /// When true, the worker runs in interactive mode: at each end-of-run
+    /// boundary it awaits inbound operator messages over the per-agent socket
+    /// instead of finishing. Mirrors caliban `SpawnSpec.interactive`.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 fn true_default() -> bool {
     true
+}
+
+/// Inbound control frames written to an interactive agent's per-agent socket.
+/// Mirrors caliban `AttachInbound` (`caliban/src/attach.rs`); the outbound
+/// stream stays caliban stream-json, so the two never share a direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AttachInbound {
+    /// Inject a user message and resume the run.
+    UserMessage {
+        /// Message text.
+        text: String,
+    },
+    /// Signal end-of-input: the agent finishes after this.
+    EndInput,
 }
 
 /// Control-plane requests sent to the daemon.
@@ -211,6 +231,64 @@ mod tests {
         assert!(s.inherit_hooks);
         assert!(!s.isolation_worktree);
         assert!(s.model.is_none());
+    }
+
+    #[test]
+    fn spawn_spec_is_wire_compatible_with_caliban_interactive() {
+        // Golden JSON in caliban's serialized SpawnSpec form (proto.rs). Pinned
+        // so upstream protocol drift on `interactive` fails loudly here.
+        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
+        let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
+        assert!(
+            spec.interactive,
+            "interactive must round-trip from caliban's wire form"
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["interactive"], serde_json::json!(true));
+        // Bidirectional pin: our serialized form must match caliban's exact wire
+        // shape (field set + order), so adding/dropping a field drifts loudly.
+        assert_eq!(
+            serde_json::to_string(&spec).unwrap(),
+            golden,
+            "re-serialised SpawnSpec must match caliban's golden wire form"
+        );
+    }
+
+    #[test]
+    fn spawn_spec_without_interactive_defaults_false() {
+        // Back-compat: a pre-interactive spec (field absent) still deserializes.
+        let old = r#"{"initial_prompt":"hi"}"#;
+        let spec: SpawnSpec = serde_json::from_str(old).unwrap();
+        assert!(!spec.interactive);
+    }
+
+    #[test]
+    fn attach_inbound_user_message_serializes() {
+        let j = serde_json::to_string(&AttachInbound::UserMessage {
+            text: "hi there".into(),
+        })
+        .unwrap();
+        assert_eq!(j, r#"{"type":"UserMessage","text":"hi there"}"#);
+    }
+
+    #[test]
+    fn attach_inbound_end_input_serializes() {
+        let j = serde_json::to_string(&AttachInbound::EndInput).unwrap();
+        assert_eq!(j, r#"{"type":"EndInput"}"#);
+    }
+
+    #[test]
+    fn attach_inbound_round_trips() {
+        // Symmetric drift guard: the tagged shape must survive a serialize →
+        // deserialize round-trip for both variants.
+        for frame in [
+            AttachInbound::UserMessage { text: "hi".into() },
+            AttachInbound::EndInput,
+        ] {
+            let s = serde_json::to_string(&frame).unwrap();
+            let back: AttachInbound = serde_json::from_str(&s).unwrap();
+            assert_eq!(frame, back);
+        }
     }
 
     #[test]

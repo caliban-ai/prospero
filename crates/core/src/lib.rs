@@ -11,17 +11,19 @@ pub mod error;
 pub mod event;
 pub mod fleet;
 pub mod model;
+pub mod provider_env;
 pub mod registry;
 pub mod store;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
+pub use caliband::wire::AttachInbound;
 pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};
 pub use model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
-pub use registry::{RegisteredRepo, Registry};
+pub use registry::{RegisteredRepo, Registry, RepoProviderConfig};
 pub use store::{JsonlStore, Store};
 
 /// Crate version, sourced from `Cargo.toml`.

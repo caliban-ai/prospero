@@ -1,6 +1,7 @@
 //! Request/response payloads for the HTTP API.
 
 use prospero_core::fleet::SpawnRequest;
+use prospero_core::registry::RepoProviderConfig;
 use serde::{Deserialize, Serialize};
 
 /// Body for `POST /api/repos`.
@@ -10,7 +11,14 @@ pub struct AddRepoBody {
     pub name: String,
     /// Repo root path.
     pub root: String,
+    /// Optional initial provider config.
+    #[serde(default)]
+    pub config: RepoProviderConfig,
 }
+
+/// Body for `PUT /api/repos/{name}/config`.
+#[derive(Debug, Deserialize)]
+pub struct SetConfigBody(pub RepoProviderConfig);
 
 /// Body for `POST /api/repos/{repo}/agents`.
 #[derive(Debug, Deserialize)]
@@ -29,6 +37,9 @@ pub struct SpawnBody {
     /// Optional tool allowlist.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    /// Run the agent in interactive mode (awaits operator input).
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl SpawnBody {
@@ -42,6 +53,7 @@ impl SpawnBody {
             model: self.model,
             isolation_worktree,
             tool_allowlist: self.tool_allowlist,
+            interactive: self.interactive,
         }
     }
 }
@@ -65,6 +77,13 @@ pub struct FromSeq {
     pub from: u64,
 }
 
+/// Body for `POST /api/agents/{id}/input`.
+#[derive(Debug, Deserialize)]
+pub struct AgentInputBody {
+    /// Message text to inject into the interactive agent.
+    pub text: String,
+}
+
 /// Response for `POST /api/agents/{id}/respawn`.
 #[derive(Debug, Serialize)]
 pub struct RespawnedResponse {
@@ -83,4 +102,19 @@ pub struct RepoSummary {
     pub health: prospero_core::RepoHealth,
     /// Number of known agents.
     pub agent_count: usize,
+    /// Provider/environment config for this repo.
+    pub config: RepoProviderConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_body_interactive_round_trips_and_defaults_false() {
+        let with: SpawnBody = serde_json::from_str(r#"{"prompt":"p","interactive":true}"#).unwrap();
+        assert!(with.into_request().interactive);
+        let without: SpawnBody = serde_json::from_str(r#"{"prompt":"p"}"#).unwrap();
+        assert!(!without.into_request().interactive);
+    }
 }

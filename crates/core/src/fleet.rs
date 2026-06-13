@@ -16,7 +16,7 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
-use crate::caliband::wire::{AgentRecord, SpawnSpec};
+use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
@@ -40,6 +40,9 @@ pub struct SpawnRequest {
     pub isolation_worktree: bool,
     /// Optional tool allowlist.
     pub tool_allowlist: Option<Vec<String>>,
+    /// Run in interactive mode (the worker awaits operator input instead of
+    /// finishing). Defaults to `false` via [`SpawnRequest::new`].
+    pub interactive: bool,
 }
 
 impl SpawnRequest {
@@ -51,6 +54,7 @@ impl SpawnRequest {
             model: None,
             isolation_worktree: true,
             tool_allowlist: None,
+            interactive: false,
         }
     }
 
@@ -63,6 +67,7 @@ impl SpawnRequest {
             tool_allowlist: self.tool_allowlist,
             isolation_worktree: self.isolation_worktree,
             inherit_hooks: true,
+            interactive: self.interactive,
         }
     }
 }
@@ -84,6 +89,8 @@ pub struct FleetConfig {
     pub normalize: NormalizeOptions,
     /// Broadcast channel capacity (events buffered for slow subscribers).
     pub event_buffer: usize,
+    /// Global default env merged under each repo's resolved overlay.
+    pub default_env: std::collections::BTreeMap<String, String>,
 }
 
 impl FleetConfig {
@@ -97,6 +104,7 @@ impl FleetConfig {
             ensure: EnsureConfig::default(),
             normalize: NormalizeOptions::default(),
             event_buffer: 1024,
+            default_env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -202,11 +210,23 @@ impl FleetManager {
 
     /// Register a repo and persist the registry. Triggers an immediate poll.
     pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
+        self.add_repo_with_config(name, root, Default::default())
+            .await
+    }
+
+    /// Register a repo with an initial provider config.
+    pub async fn add_repo_with_config(
+        &self,
+        name: impl Into<String>,
+        root: impl Into<PathBuf>,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
         let name = name.into();
         let root = root.into();
         {
             let mut reg = self.inner.registry.write().await;
             reg.add(name.clone(), root.clone())?;
+            reg.set_config(&name, config);
             reg.save(&self.inner.config.registry_path())?;
         }
         {
@@ -222,6 +242,16 @@ impl FleetManager {
         }
         self.poll_repo_once(&name).await;
         Ok(())
+    }
+
+    /// The stored provider config for a repo, if registered.
+    pub async fn repo_config(&self, repo: &str) -> Option<crate::registry::RepoProviderConfig> {
+        self.inner
+            .registry
+            .read()
+            .await
+            .get(repo)
+            .map(|r| r.config.clone())
     }
 
     /// Unregister a repo and persist the registry.
@@ -246,6 +276,37 @@ impl FleetManager {
         Ok(removed)
     }
 
+    /// Build the `EnsureConfig` for a repo, resolving its env overlay from the
+    /// global default + the repo's stored provider config + prosperod's env.
+    pub async fn ensure_config_for(&self, repo: &str) -> Result<EnsureConfig> {
+        let cfg = {
+            let reg = self.inner.registry.read().await;
+            reg.get(repo)
+                .map(|r| r.config.clone())
+                .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
+        };
+        let env = crate::provider_env::resolve_env(&self.inner.config.default_env, &cfg, &|k| {
+            std::env::var(k).ok()
+        });
+        let mut ensure = self.inner.config.ensure.clone();
+        ensure.env = env;
+        Ok(ensure)
+    }
+
+    /// Update a repo's provider config in the registry only (no restart).
+    pub async fn set_repo_config_registry_only(
+        &self,
+        repo: &str,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        let mut reg = self.inner.registry.write().await;
+        if !reg.set_config(repo, config) {
+            return Err(CoreError::RepoNotFound(repo.to_string()));
+        }
+        reg.save(&self.inner.config.registry_path())?;
+        Ok(())
+    }
+
     /// Get-or-create the control client for a repo (running discovery once).
     async fn client_for(&self, repo: &str) -> Result<CalibandClient> {
         if let Some(c) = self.inner.clients.lock().unwrap().get(repo).cloned() {
@@ -257,12 +318,8 @@ impl FleetManager {
                 .map(|r| r.root.clone())
                 .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
         };
-        let client = ensure_caliband(
-            &root,
-            &self.inner.config.discovery_env,
-            &self.inner.config.ensure,
-        )
-        .await?;
+        let ensure = self.ensure_config_for(repo).await?;
+        let client = ensure_caliband(&root, &self.inner.config.discovery_env, &ensure).await?;
         self.inner
             .clients
             .lock()
@@ -284,6 +341,44 @@ impl FleetManager {
     pub async fn kill_agent(&self, agent_id: &str) -> Result<()> {
         let repo = self.repo_of(agent_id).await?;
         self.client_for(&repo).await?.kill(agent_id).await
+    }
+
+    /// Send an inbound control frame to an interactive agent. Rejects if the
+    /// agent is unknown (`AgentNotFound`), terminal, or was not spawned
+    /// interactive (`InvalidState`).
+    ///
+    /// The state gate reads the last poll snapshot (up to one poll interval
+    /// stale); caliband remains authoritative, so a just-terminated agent may
+    /// pass the gate and fail at `attach`/`send_inbound` instead.
+    pub async fn send_agent_input(&self, agent_id: &str, input: AttachInbound) -> Result<()> {
+        let (repo, interactive, terminal) = {
+            let snap = self.inner.snapshot.read().await;
+            let (repo, agent) = snap
+                .find_agent(agent_id)
+                .ok_or_else(|| CoreError::AgentNotFound(agent_id.to_string()))?;
+            (
+                repo.to_string(),
+                agent.interactive,
+                agent.status.is_terminal(),
+            )
+        };
+        if terminal {
+            return Err(CoreError::InvalidState {
+                op: "send_input".into(),
+                id: agent_id.to_string(),
+                status: "terminal".into(),
+            });
+        }
+        if !interactive {
+            return Err(CoreError::InvalidState {
+                op: "send_input".into(),
+                id: agent_id.to_string(),
+                status: "not interactive".into(),
+            });
+        }
+        let client = self.client_for(&repo).await?;
+        let socket = client.attach(agent_id).await?;
+        CalibandClient::send_inbound(&socket, &input).await
     }
 
     /// Respawn an agent; returns the new id.
@@ -380,6 +475,7 @@ impl FleetManager {
                 status: rec.status,
                 started_at: rec.started_at.clone(),
                 isolated: rec.spec.isolation_worktree,
+                interactive: rec.spec.interactive,
                 session_dir: rec.session_dir.clone(),
             };
             match prior.get(&rec.id) {
@@ -469,6 +565,60 @@ impl FleetManager {
         });
     }
 
+    /// Names of repos with a cached control client (test/observability helper).
+    pub async fn cached_client_names(&self) -> Vec<String> {
+        self.inner.clients.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Gracefully shut down a repo's caliband daemon and drop its cached client
+    /// so the next access re-runs discovery (respawning with the current env).
+    pub async fn restart_caliband(&self, repo: &str) -> Result<()> {
+        let client = self.inner.clients.lock().unwrap().get(repo).cloned();
+        if let Some(client) = client {
+            let res = client.shutdown().await;
+            if let Err(e) = res {
+                tracing::warn!(target: "prospero_fleet", repo, error = %e,
+                    "shutdown request to caliband failed (continuing)");
+            }
+        }
+        self.inner.clients.lock().unwrap().remove(repo);
+
+        let root = {
+            let reg = self.inner.registry.read().await;
+            reg.get(repo).map(|r| r.root.clone())
+        };
+        if let Some(root) = root {
+            let socket_res =
+                crate::discovery::resolve_socket(&root, &self.inner.config.discovery_env);
+            if let Ok(socket) = socket_res {
+                // Reuse startup_timeout as the upper bound for the daemon to
+                // release its socket after Shutdown (a symmetric drain bound).
+                let deadline =
+                    tokio::time::Instant::now() + self.inner.config.ensure.startup_timeout;
+                while tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(target: "prospero_fleet", repo,
+                            "old caliband socket still reachable after shutdown; proceeding");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+        self.poll_repo_once(repo).await;
+        Ok(())
+    }
+
+    /// Persist a repo's provider config and restart its caliband to apply it.
+    pub async fn set_repo_config(
+        &self,
+        repo: &str,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        self.set_repo_config_registry_only(repo, config).await?;
+        self.restart_caliband(repo).await
+    }
+
     /// Run the background poll loop forever (until the task is dropped).
     pub async fn run(self) {
         let interval = self.inner.config.poll_interval;
@@ -515,4 +665,116 @@ async fn attach_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restart_caliband_shuts_down_and_clears_client() {
+        use crate::registry::RepoProviderConfig;
+        use crate::testkit::FakeCaliband;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false; // no real caliband to spawn in tests
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let fake = FakeCaliband::start_at(&socket).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+
+        mgr.poll_repo_once("p").await; // cache a client by talking to the repo
+
+        mgr.set_repo_config("p", RepoProviderConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(fake.shutdowns(), 1, "restart should send one Shutdown");
+        assert!(
+            mgr.cached_client_names().await.iter().all(|n| n != "p"),
+            "cached client for the repo should be cleared after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_agent_input_rejects_terminal_unknown_and_non_interactive() {
+        use crate::caliband::wire::AttachInbound;
+        use crate::model::AgentStatus;
+        use crate::testkit::{FakeCaliband, test_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+        // Terminal agent (Done), even though interactive → reject as terminal.
+        let mut done = test_record("ag-done", dir.path(), AgentStatus::Done, false);
+        done.spec.interactive = true;
+        fake.add_agent(done, vec![]).await;
+        // Idle but NOT interactive → reject.
+        let idle = test_record("ag-idle", dir.path(), AgentStatus::Idle, false);
+        fake.add_agent(idle, vec![]).await;
+
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+        mgr.add_repo("repo", &root).await.unwrap();
+        mgr.poll_repo_once("repo").await;
+
+        let r1 = mgr
+            .send_agent_input("ag-done", AttachInbound::EndInput)
+            .await;
+        assert!(
+            matches!(r1, Err(CoreError::InvalidState { .. })),
+            "terminal must reject"
+        );
+        let r2 = mgr
+            .send_agent_input("ag-idle", AttachInbound::EndInput)
+            .await;
+        assert!(
+            matches!(r2, Err(CoreError::InvalidState { .. })),
+            "non-interactive must reject"
+        );
+        let r3 = mgr.send_agent_input("nope", AttachInbound::EndInput).await;
+        assert!(
+            matches!(r3, Err(CoreError::AgentNotFound(_))),
+            "unknown id must 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_config_for_merges_default_and_repo_config() {
+        use crate::registry::RepoProviderConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.default_env.insert("KEEP".into(), "global".into());
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+
+        mgr.add_repo("p", "/tmp/p").await.ok(); // discovery may fail; the registry write is what matters
+        let cfg = RepoProviderConfig {
+            provider: Some("ollama".into()),
+            base_url: Some("http://h:11434".into()),
+            env: [("EXTRA".to_string(), "1".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        mgr.set_repo_config_registry_only("p", cfg).await.unwrap();
+
+        let ec = mgr.ensure_config_for("p").await.unwrap();
+        assert_eq!(ec.env.get("KEEP").unwrap(), "global");
+        assert_eq!(ec.env.get("CALIBAN_PROVIDER").unwrap(), "ollama");
+        assert_eq!(ec.env.get("OLLAMA_BASE_URL").unwrap(), "http://h:11434");
+        assert_eq!(ec.env.get("EXTRA").unwrap(), "1");
+    }
 }

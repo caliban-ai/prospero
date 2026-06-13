@@ -259,6 +259,215 @@ async fn sse_stream_closes_after_agent_finished() {
 }
 
 #[tokio::test]
+async fn add_repo_with_config_persists_and_get_repos_returns_it() {
+    // A fresh harness without any pre-registered repo so we can add one with config.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+
+    let env = DiscoveryEnv {
+        caliban_daemon_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+        xdg_runtime_dir: None,
+        tmpdir: None,
+    };
+    let socket = control_socket_path(&repo_root, &env);
+    let _fake = FakeCaliband::start_at(&socket).await.unwrap();
+
+    let mut config = FleetConfig::new("test-host", data_dir.path());
+    config.discovery_env = env;
+    config.ensure = EnsureConfig {
+        autostart: false,
+        ..EnsureConfig::default()
+    };
+
+    let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let manager = FleetManager::new(config, store).unwrap();
+    let app = router(manager);
+
+    // POST /api/repos with a config object.
+    let post_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/repos")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"p","root":"/tmp/p","config":{"provider":"ollama","base_url":"http://h:11434"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::CREATED);
+
+    // GET /api/repos should include the config fields.
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let v = json_body(get_resp).await;
+    let repos = v.as_array().unwrap();
+    let p = repos
+        .iter()
+        .find(|r| r["name"] == "p")
+        .expect("repo 'p' not found");
+    assert_eq!(p["config"]["provider"], "ollama");
+    assert_eq!(p["config"]["base_url"], "http://h:11434");
+}
+
+#[tokio::test]
+async fn put_config_updates_and_returns_204() {
+    // `setup()` registers "repo" with a FakeCaliband listening. PUT triggers a
+    // restart (Shutdown → drain → re-ensure); with autostart=false the repo
+    // simply degrades, but the config is persisted and the handler returns 204.
+    let h = setup().await;
+    let put_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/repos/repo/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"provider":"ollama","base_url":"http://h:11434"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status(), StatusCode::NO_CONTENT);
+
+    let get_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(get_resp).await;
+    let repo = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "repo")
+        .expect("repo not found");
+    assert_eq!(repo["config"]["provider"], "ollama");
+    assert_eq!(repo["config"]["base_url"], "http://h:11434");
+}
+
+#[tokio::test]
+async fn put_config_unknown_repo_returns_404() {
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/repos/nope/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"provider":"ollama"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn agent_input_and_end_input_and_404() {
+    use prospero_core::model::AgentStatus;
+    use prospero_core::testkit::test_record;
+
+    let mut h = setup().await; // registers "repo" with a FakeCaliband, autostart off
+    // An interactive, idle agent with a reachable per-agent socket.
+    let mut rec = test_record("ag1", h._runtime.path(), AgentStatus::Idle, false);
+    rec.spec.interactive = true;
+    h.fake.add_agent(rec, vec![]).await;
+    // A non-interactive idle agent — input must be rejected (409).
+    let ag2 = test_record("ag2", h._runtime.path(), AgentStatus::Idle, false);
+    h.fake.add_agent(ag2, vec![]).await;
+    h.manager.poll_repo_once("repo").await;
+
+    // Happy path: POST /input → 202
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/ag1/input")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"also check the tests"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Happy path: POST /end-input (no body) → 202
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/ag1/end-input")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // Unknown id → 404
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/nope/input")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Non-interactive agent → 409 (InvalidState).
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/ag2/input")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn serves_dashboard_index() {
     let h = setup().await;
     let resp = h

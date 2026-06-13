@@ -6,10 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::caliband::wire::{AgentRecord, CtlReply, CtlRequest, DaemonStatus, SpawnSpec};
+use crate::caliband::wire::{
+    AgentRecord, AttachInbound, CtlReply, CtlRequest, DaemonStatus, SpawnSpec,
+};
 use crate::caliband::{read_frame, write_frame};
 use crate::error::{CoreError, Result};
 
@@ -139,8 +141,60 @@ impl CalibandClient {
         })?;
         Ok(BufReader::new(stream))
     }
+
+    /// Write a single inbound control frame to an interactive agent's per-agent
+    /// socket (path from [`Self::attach`]). Opens a fresh write-only connection,
+    /// matching caliban's "all attach connections feed a shared inbox" model.
+    pub async fn send_inbound(socket_path: &Path, frame: &AttachInbound) -> Result<()> {
+        let mut stream = UnixStream::connect(socket_path).await.map_err(|source| {
+            CoreError::CalibandUnreachable {
+                path: socket_path.display().to_string(),
+                source,
+            }
+        })?;
+        let mut line = serde_json::to_vec(frame)?;
+        line.push(b'\n');
+        stream
+            .write_all(&line)
+            .await
+            .map_err(|source| CoreError::CalibandUnreachable {
+                path: socket_path.display().to_string(),
+                source,
+            })?;
+        // No flush: tokio's UnixStream wraps the raw fd with no userspace
+        // buffer, so write_all has already handed the bytes to the kernel.
+        Ok(())
+    }
 }
 
 fn unexpected(op: &str, reply: CtlReply) -> CoreError {
     CoreError::Protocol(format!("unexpected reply to {op}: {reply:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caliband::wire::AttachInbound;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn send_inbound_writes_one_ndjson_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("a.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).await.unwrap();
+            line
+        });
+        CalibandClient::send_inbound(&sock, &AttachInbound::UserMessage { text: "go".into() })
+            .await
+            .unwrap();
+        assert_eq!(
+            server.await.unwrap().trim_end(),
+            r#"{"type":"UserMessage","text":"go"}"#
+        );
+    }
 }
