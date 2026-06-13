@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Prospero — Fleet</title>
     <style>
-      :root { color-scheme: light dark; }
+      :root { color-scheme: light dark; --sp-1: 4px; --sp-2: 6px; --sp-3: 10px; --sp-4: 14px; }
       * { box-sizing: border-box; }
       body {
         margin: 0;
@@ -23,7 +23,10 @@
       header h1 { font-size: 16px; margin: 0; color: #8ab4f8; }
       header .sub { color: #6b7280; font-size: 12px; }
       main { display: grid; grid-template-columns: 360px 1fr; height: calc(100vh - 49px); }
-      #fleet { overflow-y: auto; border-right: 1px solid #232733; padding: 12px; }
+      #fleet { overflow-y: auto; border-right: 1px solid #232733; padding: 0 12px 12px; }
+      #fleet-head { display: flex; justify-content: space-between; align-items: center;
+                    position: sticky; top: 0; z-index: 3; background: #0f1115;
+                    padding: 12px 0 8px; }
       #stream { overflow-y: auto; padding: 12px; white-space: pre-wrap; }
       .repo { margin-bottom: 16px; }
       .repo-head .name { color: #c792ea; font-weight: 600; }
@@ -31,8 +34,8 @@
       .health.healthy { color: #6bd968; }
       .health.unreachable { color: #ef5350; }
       .agent {
-        display: flex; justify-content: space-between; gap: 8px;
-        padding: 6px 8px; margin: 4px 0; border-radius: 6px;
+        display: flex; justify-content: space-between; gap: var(--sp-2);
+        padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; border-radius: 7px;
         background: #171a21; cursor: pointer; border: 1px solid transparent;
       }
       .agent:hover { border-color: #2d3340; }
@@ -51,7 +54,6 @@
       .muted { color: #6b7280; }
       /* --- control-plane additions --- */
       .hidden { display: none; }
-      #fleet-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
       .fleet-label { color: #6b7280; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
       .banner { background: #3a2424; color: #ef9a9a; border: 1px solid #5a3030; border-radius: 6px;
                 padding: 6px 10px; margin-bottom: 10px; font-size: 12px; cursor: pointer; }
@@ -61,14 +63,16 @@
       .ctl-btn.primary { background: #1f2a44; color: #8ab4f8; border-color: #2d3a5a; }
       .ctl-btn:disabled { opacity: .5; cursor: default; }
       .ctl-btn.launch { margin: 6px 0; }
-      .repo-head { display: flex; justify-content: space-between; align-items: center; }
+      .repo-head { display: flex; justify-content: space-between; align-items: center;
+                   position: sticky; top: 44px; z-index: 2; background: #0f1115; padding: 4px 0; }
       .act-btn { font: 10px ui-monospace, monospace; padding: 1px 7px; border-radius: 5px;
                  border: 1px solid #2d3340; background: #1b1f27; color: #9aa0aa; cursor: pointer; }
       .act-btn:hover { border-color: #3a4256; }
       .act-btn.danger { color: #ef9a9a; border-color: #3a2424; }
       .act-btn:disabled { opacity: .5; cursor: default; }
       .agent-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-      .acts { display: flex; gap: 4px; }
+      .acts { display: flex; gap: var(--sp-1); opacity: .4; transition: opacity .1s; }
+      .agent:hover .acts, .agent:focus-within .acts, .agent.selected .acts { opacity: 1; }
       .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55);
                display: flex; align-items: flex-start; justify-content: center; z-index: 50; }
       .modal { margin-top: 80px; width: 340px; background: #13161c; border: 1px solid #3a4256;
@@ -86,7 +90,9 @@
       .repo-head .gear { font: 11px ui-monospace, monospace; padding: 1px 6px; border-radius: 5px;
                          border: 1px solid #2d3340; background: #1b1f27; color: #9aa0aa; cursor: pointer; }
       .repo-head .gear:hover { border-color: #3a4256; }
-      .repo-head-actions { display: flex; gap: 4px; }
+      .repo-head-actions { display: flex; gap: var(--sp-1); opacity: .5; transition: opacity .1s; }
+      .repo-head:hover .repo-head-actions, .repo-head:focus-within .repo-head-actions { opacity: 1; }
+      .meta { color: #6b7280; font-size: 10px; }
       .env-row { display: flex; gap: 6px; margin-bottom: 6px; }
       .env-row .in { margin-top: 0; }
       .env-row button { font: 11px ui-monospace, monospace; border: 1px solid #3a2424; background: #1b1f27;
@@ -108,7 +114,7 @@
     <main>
       <section id="fleet">
         <div id="fleet-head">
-          <span class="fleet-label">fleet</span>
+          <span class="fleet-label" id="fleet-count">fleet</span>
           <button id="add-repo-btn" class="ctl-btn">＋ add repo</button>
         </div>
         <div id="banner" class="banner hidden"></div>

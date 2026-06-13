@@ -321,10 +321,34 @@ async function refreshFleet() {
   }
 }
 
+// Human-ish elapsed string from an RFC-3339 timestamp (client-side, no new data).
+function elapsed(startedAt) {
+  const ms = Date.now() - new Date(startedAt).getTime();
+  if (!isFinite(ms) || ms < 0) return "";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h`;
+}
+
+// Derivable per-agent meta line (no cost/turns — not in the snapshot).
+function agentMeta(agent) {
+  const e = elapsed(agent.started_at);
+  if (!e) return "";
+  if (agent.status === "idle") return ` · idle ${e}`;
+  if (isActive(agent.status)) return ` · ${e}`;
+  return ` · ${agent.status} ${e} ago`;
+}
+
 function renderFleet(fleet) {
   healthyRepos = fleet.repos
     .filter((r) => r.health.state === "healthy")
     .map((r) => r.name);
+  const agentTotal = fleet.repos.reduce((n, r) => n + r.agents.length, 0);
+  const rc = fleet.repos.length;
+  document.getElementById("fleet-count").textContent =
+    `fleet · ${rc} repo${rc === 1 ? "" : "s"} · ${agentTotal} agent${agentTotal === 1 ? "" : "s"}`;
   if (!fleet.repos.length) {
     fleetListEl.innerHTML = `<div class="muted">no repos registered</div>`;
     return;
@@ -408,7 +432,8 @@ function renderAgent(agent) {
   const wt = agent.isolated ? `<span class="wt">⌥ worktree</span>` : `<span class="wt">shared</span>`;
   const info = document.createElement("span");
   info.innerHTML =
-    `<span class="name">${escapeHtml(agent.name)}</span> ${wt}<br><span class="id">${escapeHtml(agent.id)}</span>`;
+    `<span class="name">${escapeHtml(agent.name)}</span> ${wt}<br>` +
+    `<span class="id">${escapeHtml(agent.id)}</span><span class="meta">${escapeHtml(agentMeta(agent))}</span>`;
 
   const right = document.createElement("span");
   right.className = "agent-right";
