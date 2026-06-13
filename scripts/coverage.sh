@@ -45,10 +45,12 @@ cd "$(dirname "$0")/.."
 # so this default governs both local and CI runs. Start at/just below the
 # current measured coverage and ratchet upward over time as tests are added.
 #
-# Ratchet history (issue #13, target 85%):
+# Ratchet history (issue #13, target 85% — reached):
 #   80  initial rollout — a few points below the 83.12% baseline (2026-06-13),
 #       with the daemon event-loop entrypoint excluded from the denominator.
-COVERAGE_MIN="${COVERAGE_MIN:-80}"
+#   85  step 1 (#13) — error.rs + caliband client control-request coverage
+#       (measured 86.72%).
+COVERAGE_MIN="${COVERAGE_MIN:-85}"
 
 # The workspace test feature: prospero-core's `testkit` (the FakeCaliband
 # harness) gates the integration tests in core/api/cli. Without it those test

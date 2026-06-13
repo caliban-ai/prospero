@@ -76,7 +76,7 @@ scripts/coverage.sh                                        # line-coverage repor
 
 CI (`.github/workflows/ci.yml`) runs fmt/clippy/build/test plus a line-coverage
 gate on every PR. `scripts/coverage.sh` is the single coverage entrypoint for
-both local and CI runs (cargo-llvm-cov; floor in the script, ratchet to 85% — #13).
+both local and CI runs (cargo-llvm-cov; line-coverage floor 85% in the script).
 On a Homebrew Rust toolchain, point it at Homebrew's LLVM:
 `export LLVM_COV=/opt/homebrew/opt/llvm/bin/llvm-cov LLVM_PROFDATA=/opt/homebrew/opt/llvm/bin/llvm-profdata`.
 

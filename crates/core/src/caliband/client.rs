@@ -197,4 +197,57 @@ mod tests {
             r#"{"type":"UserMessage","text":"go"}"#
         );
     }
+
+    fn test_spec() -> SpawnSpec {
+        SpawnSpec {
+            label: None,
+            frontmatter_path: None,
+            initial_prompt: "hi".into(),
+            model: None,
+            tool_allowlist: None,
+            isolation_worktree: false,
+            inherit_hooks: true,
+            interactive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_round_trips_control_requests() {
+        use crate::testkit::FakeCaliband;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ctl.sock");
+        let mut fake = FakeCaliband::start_at(&sock).await.unwrap();
+        let client = CalibandClient::new(&sock);
+        assert_eq!(client.socket_path(), sock.as_path());
+
+        let (id, _socket) = client.spawn(test_spec()).await.unwrap();
+        assert!(client.list().await.unwrap().iter().any(|a| a.id == id));
+        let _ = client.attach(&id).await.unwrap();
+        assert!(client.status().await.unwrap().agents >= 1);
+        client.kill(&id).await.unwrap();
+
+        let (id2, _) = client.spawn(test_spec()).await.unwrap();
+        assert!(!client.respawn(&id2).await.unwrap().is_empty());
+
+        let (id3, _) = client.spawn(test_spec()).await.unwrap();
+        client.rm(&id3, true).await.unwrap();
+
+        // Error-reply path: an unknown id maps to AgentNotFound.
+        assert!(matches!(
+            client.kill("nope").await.unwrap_err(),
+            CoreError::AgentNotFound(_)
+        ));
+
+        client.shutdown().await.unwrap();
+        let _ = &mut fake;
+    }
+
+    #[tokio::test]
+    async fn connect_error_maps_to_unreachable() {
+        let client = CalibandClient::new("/nonexistent/dir/ctl.sock");
+        assert!(matches!(
+            client.list().await.unwrap_err(),
+            CoreError::CalibandUnreachable { .. }
+        ));
+    }
 }
