@@ -545,7 +545,7 @@ function paintStreamHead() {
   const c = streamCtx;
   const badge = `<span class="badge ${c.status}">${escapeHtml(c.status)}</span>`;
   const model = c.model ? `<span class="sh-meta">${escapeHtml(c.model)}</span>` : "";
-  const cost = c.cost != null
+  const cost = c.cost != null && c.turns != null
     ? `<span class="sh-meta">· $${c.cost.toFixed(4)} · ${c.turns} turns</span>` : "";
   const dot = streamIsLive()
     ? `<span class="sh-conn live">● live</span>` : `<span class="sh-conn closed">⚠ closed</span>`;
