@@ -124,7 +124,7 @@ jobs:
         if: ${{ !cancelled() && needs.check.outputs.code == 'true' }}
         run: |
           python3 scripts/coverage-report.py target/llvm-cov/coverage.json \
-            --commit "${{ github.sha }}" --floor 80 --target 85 > coverage-comment.md
+            --commit "${{ github.sha }}" --floor 85 --target 85 > coverage-comment.md
           cat coverage-comment.md >> "$GITHUB_STEP_SUMMARY"
       # Post/update a single sticky comment on PRs (skipped for forks, whose
       # GITHUB_TOKEN is read-only).

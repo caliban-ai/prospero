@@ -73,3 +73,85 @@ impl From<SupervisorError> for CoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AgentStatus;
+
+    #[test]
+    fn display_messages() {
+        let e = CoreError::CalibandUnreachable {
+            path: "/tmp/x.sock".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
+        };
+        assert!(
+            e.to_string()
+                .starts_with("caliband unreachable at /tmp/x.sock:")
+        );
+        assert_eq!(
+            CoreError::Protocol("bad".into()).to_string(),
+            "caliband protocol error: bad"
+        );
+        assert_eq!(
+            CoreError::AgentNotFound("a1".into()).to_string(),
+            "agent not found: a1"
+        );
+        assert_eq!(
+            CoreError::InvalidState {
+                op: "kill".into(),
+                id: "a1".into(),
+                status: "Done".into(),
+            }
+            .to_string(),
+            "invalid state for kill: agent a1 is Done"
+        );
+        assert_eq!(
+            CoreError::Discovery("d".into()).to_string(),
+            "discovery error: d"
+        );
+        assert_eq!(CoreError::Store("s".into()).to_string(), "store error: s");
+        assert_eq!(
+            CoreError::RepoNotFound("r".into()).to_string(),
+            "repo not registered: r"
+        );
+    }
+
+    #[test]
+    fn from_io_and_json() {
+        let io: CoreError = std::io::Error::other("boom").into();
+        assert!(matches!(io, CoreError::Io(_)));
+        assert!(io.to_string().starts_with("io error:"));
+        let json: CoreError = serde_json::from_str::<i32>("not json").unwrap_err().into();
+        assert!(matches!(json, CoreError::Json(_)));
+        assert!(json.to_string().starts_with("json error:"));
+    }
+
+    #[test]
+    fn from_supervisor_error_maps_all_arms() {
+        let nf: CoreError = SupervisorError::NotFound { id: "a1".into() }.into();
+        assert!(matches!(nf, CoreError::AgentNotFound(id) if id == "a1"));
+
+        let inv: CoreError = SupervisorError::InvalidState {
+            op: "respawn".into(),
+            id: "a2".into(),
+            status: AgentStatus::Done,
+        }
+        .into();
+        match inv {
+            CoreError::InvalidState { op, id, status } => {
+                assert_eq!(
+                    (op.as_str(), id.as_str(), status.as_str()),
+                    ("respawn", "a2", "Done")
+                );
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+
+        let internal: CoreError = SupervisorError::Internal {
+            message: "kaboom".into(),
+        }
+        .into();
+        assert!(matches!(internal, CoreError::Protocol(m) if m == "kaboom"));
+    }
+}
