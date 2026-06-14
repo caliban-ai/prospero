@@ -5,13 +5,28 @@
 const fleetEl = document.getElementById("fleet");
 const fleetListEl = document.getElementById("fleet-list");
 const streamEl = document.getElementById("stream");
+const streamHeadEl = document.getElementById("stream-head");
+const streamLogEl = document.getElementById("stream-log");
 const hostEl = document.getElementById("host");
-const connEl = document.getElementById("conn");
 const modalRoot = document.getElementById("modal-root");
 
 let selectedAgent = null;
 let evtSource = null;
 let healthyRepos = []; // names of reachable repos, for the launch picker
+let lastFleet = null; // most recent fleet snapshot, for stream-head lookups
+let streamCtx = null; // { id, name, status, model, cost, turns } for the streamed agent
+
+function findAgent(id) {
+  if (!lastFleet) return null;
+  for (const r of lastFleet.repos) {
+    for (const a of r.agents) if (a.id === id) return a;
+  }
+  return null;
+}
+
+function streamIsLive() {
+  return !!evtSource && evtSource.readyState === 1; // EventSource.OPEN
+}
 
 // --- API + UX helpers -------------------------------------------------------
 
@@ -321,10 +336,35 @@ async function refreshFleet() {
   }
 }
 
+// Human-ish elapsed string from an RFC-3339 timestamp (client-side, no new data).
+function elapsed(startedAt) {
+  const ms = Date.now() - new Date(startedAt).getTime();
+  if (!isFinite(ms) || ms < 0) return "";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h`;
+}
+
+// Derivable per-agent meta line (no cost/turns — not in the snapshot).
+function agentMeta(agent) {
+  const e = elapsed(agent.started_at);
+  if (!e) return "";
+  if (agent.status === "idle") return ` · idle ${e}`;
+  if (isActive(agent.status)) return ` · ${e}`;
+  return ` · ${agent.status} ${e} ago`;
+}
+
 function renderFleet(fleet) {
+  lastFleet = fleet;
   healthyRepos = fleet.repos
     .filter((r) => r.health.state === "healthy")
     .map((r) => r.name);
+  const agentTotal = fleet.repos.reduce((n, r) => n + r.agents.length, 0);
+  const rc = fleet.repos.length;
+  document.getElementById("fleet-count").textContent =
+    `fleet · ${rc} repo${rc === 1 ? "" : "s"} · ${agentTotal} agent${agentTotal === 1 ? "" : "s"}`;
   if (!fleet.repos.length) {
     fleetListEl.innerHTML = `<div class="muted">no repos registered</div>`;
     return;
@@ -399,6 +439,14 @@ function renderFleet(fleet) {
       if (focusedCaret != null) el.setSelectionRange(focusedCaret, focusedCaret);
     }
   }
+  if (streamCtx) {
+    const a = findAgent(streamCtx.id);
+    if (a) {
+      streamCtx.name = a.name;
+      streamCtx.status = a.status;
+      paintStreamHead();
+    }
+  }
 }
 
 function renderAgent(agent) {
@@ -408,7 +456,8 @@ function renderAgent(agent) {
   const wt = agent.isolated ? `<span class="wt">⌥ worktree</span>` : `<span class="wt">shared</span>`;
   const info = document.createElement("span");
   info.innerHTML =
-    `<span class="name">${escapeHtml(agent.name)}</span> ${wt}<br><span class="id">${escapeHtml(agent.id)}</span>`;
+    `<span class="name">${escapeHtml(agent.name)}</span> ${wt}<br>` +
+    `<span class="id">${escapeHtml(agent.id)}</span><span class="meta">${escapeHtml(agentMeta(agent))}</span>`;
 
   const right = document.createElement("span");
   right.className = "agent-right";
@@ -481,23 +530,57 @@ function renderAgent(agent) {
   return row;
 }
 
+function openEmptyStream() {
+  selectedAgent = null;
+  streamCtx = null;
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  streamHeadEl.classList.add("hidden");
+  streamLogEl.innerHTML =
+    `<div class="empty"><div class="empty-title">No agent selected</div>` +
+    `<div class="empty-hint">Pick an agent from the fleet to stream its live output.</div></div>`;
+}
+
+function paintStreamHead() {
+  if (!streamCtx) return;
+  const c = streamCtx;
+  const badge = `<span class="badge ${c.status}">${escapeHtml(c.status)}</span>`;
+  const model = c.model ? `<span class="sh-meta">${escapeHtml(c.model)}</span>` : "";
+  const cost = c.cost != null && c.turns != null
+    ? `<span class="sh-meta">· $${c.cost.toFixed(4)} · ${c.turns} turns</span>` : "";
+  const dot = streamIsLive()
+    ? `<span class="sh-conn live">● live</span>` : `<span class="sh-conn closed">⚠ closed</span>`;
+  streamHeadEl.innerHTML =
+    `<button class="sh-back" title="back to fleet">← fleet</button>` +
+    `<span class="sh-name">${escapeHtml(c.name)}</span> ${badge} ${model} ${cost} ${dot}`;
+  streamHeadEl.querySelector(".sh-back").onclick = () => document.body.classList.remove("show-stream");
+  streamHeadEl.classList.remove("hidden");
+}
+
 function selectAgent(id) {
   selectedAgent = id;
+  document.body.classList.add("show-stream"); // responsive: reveal the stream pane
+  const a = findAgent(id);
+  streamCtx = { id, name: (a && a.name) || id, status: (a && a.status) || "", model: null, cost: null, turns: null };
   refreshFleet();
-  streamEl.innerHTML = "";
+  streamLogEl.innerHTML = "";
   if (evtSource) evtSource.close();
-  connEl.textContent = `▶ streaming ${id}`;
-  evtSource = new EventSource(`/api/agents/${id}/stream`);
+  evtSource = new EventSource(`/api/agents/${encodeURIComponent(id)}/stream`);
+  evtSource.onopen = () => paintStreamHead();
   evtSource.onmessage = (e) => appendEvent(JSON.parse(e.data));
-  evtSource.onerror = () => {
-    connEl.textContent = `⚠ stream closed for ${id}`;
-  };
+  evtSource.onerror = () => paintStreamHead();
+  paintStreamHead();
 }
 
 function appendEvent(ev) {
   const line = document.createElement("div");
   line.className = "ev";
   const k = ev.kind;
+  if (streamCtx) {
+    if (k.kind === "agent_init") streamCtx.model = k.model;
+    else if (k.kind === "agent_finished") { streamCtx.cost = k.cost_usd; streamCtx.turns = k.turns; }
+    else if (k.kind === "status_changed") streamCtx.status = k.to;
+    paintStreamHead();
+  }
   let body;
   switch (k.kind) {
     case "output":
@@ -522,7 +605,7 @@ function appendEvent(ev) {
       body = `<span class="k">${k.kind}</span>`;
   }
   line.innerHTML = body;
-  streamEl.appendChild(line);
+  streamLogEl.appendChild(line);
   streamEl.scrollTop = streamEl.scrollHeight;
 }
 
@@ -531,5 +614,6 @@ function escapeHtml(s) {
 }
 
 document.getElementById("add-repo-btn").onclick = openAddRepoModal;
+openEmptyStream();
 refreshFleet();
 setInterval(refreshFleet, 3000);
