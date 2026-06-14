@@ -57,6 +57,13 @@ pub struct SpawnSpec {
     /// Optional model override.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional provider override (e.g. `"anthropic"`, `"ollama"`, `"openai"`,
+    /// `"google"`). The caliban worker parses this to select the provider
+    /// before model resolution; without it the worker uses caliban's default
+    /// (anthropic). Mirrors caliban `SpawnSpec.provider` (#93). Prospero fills
+    /// it from the repo's stored provider config at spawn time.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Optional tool allowlist.
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
@@ -231,13 +238,14 @@ mod tests {
         assert!(s.inherit_hooks);
         assert!(!s.isolation_worktree);
         assert!(s.model.is_none());
+        assert!(s.provider.is_none());
     }
 
     #[test]
     fn spawn_spec_is_wire_compatible_with_caliban_interactive() {
         // Golden JSON in caliban's serialized SpawnSpec form (proto.rs). Pinned
         // so upstream protocol drift on `interactive` fails loudly here.
-        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
+        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
         let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
         assert!(
             spec.interactive,
@@ -252,6 +260,29 @@ mod tests {
             golden,
             "re-serialised SpawnSpec must match caliban's golden wire form"
         );
+    }
+
+    #[test]
+    fn spawn_spec_provider_round_trips_with_caliban() {
+        // A provider set on our side must serialize into caliban's wire form,
+        // and caliban's serialized provider must deserialize back. Guards the
+        // #93 contract end-to-end at the wire boundary.
+        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"ollama","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false}"#;
+        let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
+        assert_eq!(spec.provider.as_deref(), Some("ollama"));
+        assert_eq!(
+            serde_json::to_string(&spec).unwrap(),
+            golden,
+            "re-serialised SpawnSpec must match caliban's golden wire form"
+        );
+    }
+
+    #[test]
+    fn spawn_spec_without_provider_defaults_none() {
+        // Back-compat: a pre-provider spec (field absent) still deserializes.
+        let old = r#"{"initial_prompt":"hi"}"#;
+        let spec: SpawnSpec = serde_json::from_str(old).unwrap();
+        assert!(spec.provider.is_none());
     }
 
     #[test]

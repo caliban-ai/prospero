@@ -311,6 +311,7 @@ pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) ->
             frontmatter_path: None,
             initial_prompt: "task".into(),
             model: None,
+            provider: None,
             tool_allowlist: None,
             isolation_worktree: isolated,
             inherit_hooks: true,
