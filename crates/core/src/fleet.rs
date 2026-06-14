@@ -64,6 +64,9 @@ impl SpawnRequest {
             frontmatter_path: None,
             initial_prompt: self.prompt,
             model: self.model,
+            // Filled in `spawn_agent` from the repo's stored provider config —
+            // the request itself carries no provider.
+            provider: None,
             tool_allowlist: self.tool_allowlist,
             isolation_worktree: self.isolation_worktree,
             inherit_hooks: true,
@@ -331,7 +334,13 @@ impl FleetManager {
     /// Launch a new agent under `repo`. Returns the new agent id.
     pub async fn spawn_agent(&self, repo: &str, req: SpawnRequest) -> Result<String> {
         let client = self.client_for(repo).await?;
-        let (id, _socket) = client.spawn(req.into_spec()).await?;
+        let mut spec = req.into_spec();
+        // Select the provider via the wire spec (#93): the caliban worker reads
+        // `SpawnSpec.provider`, not `CALIBAN_PROVIDER`, so carry the repo's
+        // configured provider through. Base URL / API key still flow via the
+        // caliband daemon env (see `provider_env::resolve_env`).
+        spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
+        let (id, _socket) = client.spawn(spec).await?;
         self.inner.emitter.emit(repo, &id, EventKind::AgentSpawned);
         self.start_attach(repo, &id, client).await;
         Ok(id)
@@ -748,6 +757,44 @@ mod tests {
         assert!(
             matches!(r3, Err(CoreError::AgentNotFound(_))),
             "unknown id must 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_passes_repo_provider_into_spawnspec() {
+        use crate::registry::RepoProviderConfig;
+        use crate::testkit::FakeCaliband;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false; // no real caliband to spawn in tests
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let fake = FakeCaliband::start_at(&socket).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+        mgr.set_repo_config_registry_only(
+            "p",
+            RepoProviderConfig {
+                provider: Some("ollama".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        mgr.spawn_agent("p", SpawnRequest::new("hi")).await.unwrap();
+
+        let specs = fake.received_specs();
+        assert_eq!(specs.len(), 1, "exactly one spawn reached caliband");
+        assert_eq!(
+            specs[0].provider.as_deref(),
+            Some("ollama"),
+            "the repo's configured provider must be carried in SpawnSpec.provider (#93)"
         );
     }
 
