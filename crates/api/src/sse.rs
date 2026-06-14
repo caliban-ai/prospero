@@ -5,6 +5,8 @@
 //! `prospero follow` behaves like `tail` of a finite run and the dashboard
 //! shows the finished run then closes cleanly (rather than hanging forever).
 
+mod tail;
+
 use std::convert::Infallible;
 
 use async_stream::stream;
