@@ -87,7 +87,10 @@ impl<H: HistorySource> Tailer<H> {
                     last_seq: self.last_delivered,
                 }];
                 let mut terminal = false;
-                for ev in self.history.history(&self.agent_id, self.last_delivered + 1) {
+                for ev in self
+                    .history
+                    .history(&self.agent_id, self.last_delivered + 1)
+                {
                     if ev.seq <= self.last_delivered {
                         continue; // defensive dedup
                     }
