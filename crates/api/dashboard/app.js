@@ -567,6 +567,18 @@ function selectAgent(id) {
   evtSource = new EventSource(`/api/agents/${encodeURIComponent(id)}/stream`);
   evtSource.onopen = () => paintStreamHead();
   evtSource.onmessage = (e) => appendEvent(JSON.parse(e.data));
+  // The backend self-heals a slow-consumer gap (replays the missed events from
+  // the durable store) and sends this `gap` signal so we can show it happened.
+  evtSource.addEventListener("gap", (e) => {
+    let info = {};
+    try { info = JSON.parse(e.data); } catch { /* ignore malformed */ }
+    const note = document.createElement("div");
+    note.className = "empty-hint";
+    note.textContent =
+      `Fell behind — recovered ${info.skipped ?? "?"} dropped event(s) from history.`;
+    streamLogEl.appendChild(note);
+    streamLogEl.scrollTop = streamLogEl.scrollHeight;
+  });
   evtSource.onerror = () => paintStreamHead();
   paintStreamHead();
 }
