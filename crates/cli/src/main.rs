@@ -82,6 +82,9 @@ struct SpawnArgs {
     /// Run the agent in interactive mode (it awaits your input instead of finishing).
     #[arg(long)]
     interactive: bool,
+    /// Restrict the agent to these tools (repeat the flag per tool). Empty = no restriction.
+    #[arg(long = "tool-allowlist", value_name = "TOOL")]
+    tool_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -136,6 +139,9 @@ fn main() -> Result<()> {
             body["isolation"] = if a.shared_tree { "shared" } else { "worktree" }.into();
             if a.interactive {
                 body["interactive"] = true.into();
+            }
+            if !a.tool_allowlist.is_empty() {
+                body["tool_allowlist"] = a.tool_allowlist.into();
             }
             let resp = client.post_json(&format!("/api/repos/{}/agents", a.repo), body)?;
             let id = resp.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -333,6 +339,36 @@ mod tests {
         let cli = Cli::parse_from(["prospero", "spawn", "r", "p", "--interactive"]);
         match cli.command {
             Command::Spawn(a) => assert!(a.interactive),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_tool_allowlist_defaults_empty() {
+        let cli = Cli::parse_from(["prospero", "spawn", "r", "p"]);
+        match cli.command {
+            Command::Spawn(a) => assert!(
+                a.tool_allowlist.is_empty(),
+                "tool_allowlist must default to empty (no restriction)"
+            ),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_tool_allowlist_repeatable_parses() {
+        let cli = Cli::parse_from([
+            "prospero",
+            "spawn",
+            "r",
+            "p",
+            "--tool-allowlist",
+            "read",
+            "--tool-allowlist",
+            "edit",
+        ]);
+        match cli.command {
+            Command::Spawn(a) => assert_eq!(a.tool_allowlist, vec!["read", "edit"]),
             other => panic!("expected spawn, got {other:?}"),
         }
     }
