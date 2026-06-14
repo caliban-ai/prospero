@@ -80,8 +80,37 @@
 - name: help wanted
   color: '008672'
   description: "Extra attention is needed."
-# area/* (prospero)
+# component marker
+- name: prospero
+  color: 'b60205'
+  description: "Prospero sub-project."
+# area/* shared cross-cutting core
+- name: area/docs
+  color: '1d76db'
+  description: "Area: docs"
+- name: area/ci-cd
+  color: '1d76db'
+  description: "Area: ci-cd"
 - name: area/test
   color: '1d76db'
   description: "Area: testing"
   aliases: ['test']
+- name: area/security
+  color: '1d76db'
+  description: "Area: security"
+- name: area/performance
+  color: '1d76db'
+  description: "Area: performance"
+# area/* (prospero subsystems)
+- name: area/api
+  color: '1d76db'
+  description: "Area: api"
+- name: area/cli
+  color: '1d76db'
+  description: "Area: cli"
+- name: area/core
+  color: '1d76db'
+  description: "Area: core"
+- name: area/daemon
+  color: '1d76db'
+  description: "Area: daemon"
