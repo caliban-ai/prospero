@@ -89,6 +89,8 @@ tested with no real caliban and no LLM calls.
 
 - Design spec: [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](docs/superpowers/specs/2026-06-05-prospero-framework-design.md)
 - Implementation plan: [`docs/superpowers/plans/2026-06-05-prospero-framework.md`](docs/superpowers/plans/2026-06-05-prospero-framework.md)
+- Architecture Decision Records: [`docs/adr/`](docs/adr/) — the *why* behind significant
+  decisions (control-plane role, caliban coupling, observability model, crate boundaries, …)
 
 ## Status
 
