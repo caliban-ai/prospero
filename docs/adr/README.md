@@ -2,7 +2,9 @@
 
 This directory holds Prospero's **Architecture Decision Records (ADRs)** — short
 documents that capture a single significant architectural decision, the context that
-forced it, and the consequences we accepted by making it.
+forced it, and the consequences we accepted by making it. ADRs use the
+[MADR-lite](https://adr.github.io/madr/) format, matching the sibling caliban and gonzalo
+repos so the records read the same across all three.
 
 An ADR is not a design doc. Design docs (under `docs/superpowers/`) explore a whole
 feature; an ADR records *one decision* and the trade-off behind it, so that months
@@ -33,32 +35,35 @@ Numbers are assigned in order; to find the next one, look at the highest existin
 
 ## Lifecycle
 
-Every ADR carries a **Status**:
+Every ADR carries a lowercase **Status**:
 
-- **Proposed** — under discussion, not yet adopted.
-- **Accepted** — the decision is in force.
-- **Deprecated** — no longer recommended, but not actively replaced.
-- **Superseded by [####](####-topic.md)** — replaced by a later ADR.
+- **proposed** — under discussion, not yet adopted.
+- **accepted** — the decision is in force.
+- **deprecated** — no longer recommended, but not actively replaced.
+- **superseded by [####](####-topic.md)** — replaced by a later ADR.
 
-ADRs are **immutable once Accepted**. To change a decision, write a *new* ADR that
+ADRs are **immutable once accepted**. To change a decision, write a *new* ADR that
 supersedes the old one, and update the old one's status to
-`Superseded by ####`. This preserves the decision history rather than rewriting it.
+`superseded by ####`. This preserves the decision history rather than rewriting it.
 
 ## How to add one
 
-1. Copy [`template.md`](template.md) to `docs/adr/####-topic.md` using the next number.
+1. Copy [`template.md`](template.md) to `docs/adr/####-topic.md` using the next number
+   (or copy an existing ADR — they all follow the same MADR-lite shape).
 2. Fill in Context, Decision, and Consequences. Keep it short — one screen is ideal.
-3. Set Status to `Proposed` (if still under discussion) or `Accepted` (if already in force).
-4. If it replaces an earlier ADR, mark that one `Superseded by ####`.
+   Structure Consequences as **Positive** / **Negative** / **Revisit if** bullets — the
+   `Revisit if` line names what would make the decision worth reopening.
+3. Set Status to `proposed` (if still under discussion) or `accepted` (if already in force).
+4. If it replaces an earlier ADR, mark that one `superseded by ####`.
 
 ## Index
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
-| [0002](0002-control-plane-over-caliband.md) | Prospero is a control plane over caliband, not a re-implementation | Accepted |
-| [0003](0003-couple-to-caliban-via-ndjson-wire-format.md) | Couple to caliban only through its NDJSON wire format | Accepted |
-| [0004](0004-hybrid-live-and-durable-observability.md) | Hybrid live + durable observability behind a `Store` trait | Accepted |
-| [0005](0005-worktree-isolation-by-default-for-spawns.md) | Worktree isolation by default for agent spawns | Accepted |
-| [0006](0006-layered-crate-boundaries.md) | Layered crate boundaries: cli/daemon → api → core | Accepted |
-| [0007](0007-fake-caliban-test-harness.md) | Test the control plane against an in-process fake caliban | Accepted |
+| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | accepted |
+| [0002](0002-control-plane-over-caliband.md) | Prospero is a control plane over caliband, not a re-implementation | accepted |
+| [0003](0003-couple-to-caliban-via-ndjson-wire-format.md) | Couple to caliban only through its NDJSON wire format | accepted |
+| [0004](0004-hybrid-live-and-durable-observability.md) | Hybrid live + durable observability behind a `Store` trait | accepted |
+| [0005](0005-worktree-isolation-by-default-for-spawns.md) | Worktree isolation by default for agent spawns | accepted |
+| [0006](0006-layered-crate-boundaries.md) | Layered crate boundaries: cli/daemon → api → core | accepted |
+| [0007](0007-fake-caliban-test-harness.md) | Test the control plane against an in-process fake caliban | accepted |

@@ -1,8 +1,7 @@
-# 0007. Test the control plane against an in-process fake caliban
+# ADR 0007 · Test the control plane against an in-process fake caliban
 
-- **Status:** Accepted
+- **Status:** accepted
 - **Date:** 2026-06-05
-- **Deciders:** Prospero maintainers
 - **Source:** [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](../superpowers/specs/2026-06-05-prospero-framework-design.md) §7
 
 ## Context
@@ -29,13 +28,15 @@ CLI-through-HTTP path — with **no real caliban, no API keys, and no LLM calls*
 
 ## Consequences
 
-- The full stack is tested fast and deterministically in CI; scripted frames make event
-  sequences, resilience cases, and `seq` recovery reproducible.
-- The fake must track the wire protocol; if caliban's protocol drifts, the fake and the
-  mirrored client must be updated together — the same explicit seam noted in
-  [0003](0003-couple-to-caliban-via-ndjson-wire-format.md).
-- Tests against a *real* caliban binary + live model remain **out of scope** for the first
-  stab (manual / CI-gated later); the fake covers the wire contract, not caliban's own
-  correctness.
-- Pure units (framing, normalizer, discovery resolution, store, reconciliation) are tested
-  directly; the fake is reserved for integration-level behavior that needs the protocol.
+- **Positive:** the full stack is tested fast and deterministically in CI; scripted frames
+  make event sequences, resilience cases, and `seq` recovery reproducible. Pure units
+  (framing, normalizer, discovery resolution, store, reconciliation) are tested directly; the
+  fake is reserved for integration-level behavior that needs the protocol.
+- **Negative:** the fake must track the wire protocol — if caliban's protocol drifts, the fake
+  and the mirrored client must be updated together (the same explicit seam noted in
+  [0003](0003-couple-to-caliban-via-ndjson-wire-format.md)). Tests against a *real* caliban
+  binary + live model remain **out of scope** for the first stab (manual / CI-gated later), so
+  the fake covers the wire contract, not caliban's own correctness.
+- **Revisit if:** the fake and the real caliban diverge in behavior the wire contract doesn't
+  capture (green tests, broken integration) — that gap would justify a real-caliban smoke test
+  in CI alongside the fake.

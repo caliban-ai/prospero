@@ -1,8 +1,7 @@
-# 0003. Couple to caliban only through its NDJSON wire format
+# ADR 0003 · Couple to caliban only through its NDJSON wire format
 
-- **Status:** Accepted
+- **Status:** accepted
 - **Date:** 2026-06-05
-- **Deciders:** Prospero maintainers
 - **Source:** [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](../superpowers/specs/2026-06-05-prospero-framework-design.md) §3, §4
 
 ## Context
@@ -26,12 +25,15 @@ caliban crate.
 
 ## Consequences
 
-- Prospero and caliban evolve independently; the only thing that must stay compatible is the
-  bytes on the wire, which is also the surface real deployments depend on.
-- The wire types are mirrored, so a protocol change in caliban requires a corresponding edit
-  in Prospero's client — an intentional, explicit seam rather than a silent transitive break.
-- Because the coupling is just a socket protocol, the entire control plane can be tested
+- **Positive:** Prospero and caliban evolve independently; the only thing that must stay
+  compatible is the bytes on the wire, which is also the surface real deployments depend on.
+  Because the coupling is just a socket protocol, the entire control plane can be tested
   against a fake that speaks the same protocol — see
-  [0007](0007-fake-caliban-test-harness.md).
-- Unknown/forward-compatible frames are tolerated by the normalizer (skip-and-log), so
-  caliban can add frame types without breaking Prospero.
+  [0007](0007-fake-caliban-test-harness.md). Unknown/forward-compatible frames are tolerated
+  by the normalizer (skip-and-log), so caliban can add frame types without breaking Prospero.
+- **Negative:** the wire types are mirrored, so a protocol change in caliban requires a
+  corresponding edit in Prospero's client — an intentional, explicit seam rather than a
+  silent transitive break, but a seam someone must remember to keep in sync.
+- **Revisit if:** the wire protocol churns fast enough that hand-mirroring the types becomes
+  a recurring source of drift — a generated client or a shared schema crate might then earn
+  its coupling cost.

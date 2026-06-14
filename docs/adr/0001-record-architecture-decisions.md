@@ -1,8 +1,7 @@
-# 0001. Record architecture decisions
+# ADR 0001 · Record architecture decisions
 
-- **Status:** Accepted
+- **Status:** accepted
 - **Date:** 2026-06-13
-- **Deciders:** Prospero maintainers
 
 ## Context
 
@@ -34,12 +33,15 @@ than an empty convention.
 
 ## Consequences
 
-- The rationale behind significant decisions has a single, version-controlled home that
-  outlives individual design docs and PRs.
-- Reviewers gain a lightweight place to record "why" during normal development; the cost
-  is one short file per significant decision.
-- The team must remember to write an ADR when a decision is architecturally significant.
-  The [`README.md`](README.md) gives the "when to write one" bar to keep this from
-  degrading into either noise or neglect.
-- ADRs are additive and immutable, so the decision log only grows; superseded records
-  stay in place with a pointer forward, preserving the full history.
+- **Positive:** the rationale behind significant decisions has a single,
+  version-controlled home that outlives individual design docs and PRs. Reviewers
+  gain a lightweight place to record "why" during normal development. ADRs are
+  additive and immutable, so the decision log only grows; superseded records stay in
+  place with a pointer forward, preserving the full history.
+- **Negative:** one short file per significant decision, and the team must remember to
+  write an ADR when a decision is architecturally significant. The [`README.md`](README.md)
+  gives the "when to write one" bar to keep this from degrading into either noise or
+  neglect.
+- **Revisit if:** the practice degrades into noise (trivial decisions getting ADRs) or
+  neglect (significant decisions going unrecorded) — a sign the "when to write one" bar
+  needs tightening or the format is too heavy to sustain.

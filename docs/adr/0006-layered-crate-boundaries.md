@@ -1,8 +1,7 @@
-# 0006. Layered crate boundaries: cli/daemon → api → core
+# ADR 0006 · Layered crate boundaries: cli/daemon → api → core
 
-- **Status:** Accepted
+- **Status:** accepted
 - **Date:** 2026-06-05
-- **Deciders:** Prospero maintainers
 - **Source:** [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](../superpowers/specs/2026-06-05-prospero-framework-design.md) §4
 
 ## Context
@@ -34,10 +33,15 @@ prospero-daemon (prosperod)┘
 
 ## Consequences
 
-- The core engine is testable with no HTTP server and no web types in scope; `api` is
-  testable in-process over a fake-backed `FleetManager`.
-- One control surface, not two: the CLI and the dashboard both go through the HTTP API, so
-  there is a single place where control/observe semantics live.
-- The acyclic, one-way dependency graph keeps responsibilities from leaking upward
-  (e.g. transport concerns can't seep into the domain model) and makes the boundaries easy
-  to reason about as the system grows.
+- **Positive:** the core engine is testable with no HTTP server and no web types in scope,
+  and `api` is testable in-process over a fake-backed `FleetManager`. One control surface, not
+  two: the CLI and the dashboard both go through the HTTP API, so there is a single place where
+  control/observe semantics live. The acyclic, one-way dependency graph keeps responsibilities
+  from leaking upward (e.g. transport concerns can't seep into the domain model) and makes the
+  boundaries easy to reason about as the system grows.
+- **Negative:** four crates plus the one-way rule impose a structure cost — types that span
+  layers must be placed deliberately, and an in-process call becomes an HTTP round-trip for the
+  CLI rather than a direct function call.
+- **Revisit if:** the crate split adds more ceremony than it prevents leakage (e.g. constant
+  re-exports across boundaries), or a client genuinely needs a control path that HTTP can't
+  serve well — either would pressure the layering.
