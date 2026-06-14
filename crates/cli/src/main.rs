@@ -256,7 +256,15 @@ fn print_fleet(fleet: &serde_json::Value) {
     }
 }
 
-fn print_event(ev: serde_json::Value) {
+fn print_event(event_name: &str, ev: serde_json::Value) {
+    // Named control events carry no `FleetEvent` payload; handle them first.
+    if event_name == "gap" {
+        println!(
+            "[gap] fell behind — recovered {} dropped event(s) from history",
+            ev["skipped"].as_u64().unwrap_or(0)
+        );
+        return;
+    }
     let kind = &ev["kind"];
     match kind["kind"].as_str().unwrap_or("") {
         "output" => print!("{}", kind["chunk"].as_str().unwrap_or("")),

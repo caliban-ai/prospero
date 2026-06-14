@@ -33,8 +33,11 @@ pub async fn agent_stream(
     let body = stream! {
         // 1) Replay persisted history, stopping if it already contains the
         //    terminal event. Track the last seq delivered as the dedup
-        //    high-water mark for the live tail.
-        let mut last_delivered = 0u64;
+        //    high-water mark for the live tail. Seed it from the client's
+        //    `from` floor so a later self-heal replay never re-sends events
+        //    below what the client asked for (seq is a global counter, so an
+        //    agent can legitimately have no events at or above `from` yet).
+        let mut last_delivered = q.from.saturating_sub(1);
         for ev in history {
             let terminal = is_terminal(&ev);
             last_delivered = ev.seq;

@@ -223,6 +223,26 @@ mod tests {
     }
 
     #[test]
+    fn lagged_replay_respects_last_delivered_floor() {
+        // Seeded high-water of 99 (e.g. a `?from=100` client with empty initial
+        // history). The store holds low-seq events for this agent plus 100/101;
+        // replay must start above the floor and never re-send the low seqs.
+        let store = FakeHistory(vec![ev(3, "a"), ev(50, "a"), ev(100, "a"), ev(101, "a")]);
+        let mut t = Tailer::new("a".into(), 99, store);
+        assert_eq!(
+            t.on_recv(Err(RecvError::Lagged(4))),
+            Step::Emit(vec![
+                Frame::Gap {
+                    skipped: 4,
+                    last_seq: 99
+                },
+                Frame::Event(ev(100, "a")),
+                Frame::Event(ev(101, "a")),
+            ])
+        );
+    }
+
+    #[test]
     fn lagged_with_nothing_newer_emits_gap_only() {
         // Persist is also behind: nothing newer than what we delivered.
         let mut t = Tailer::new("a".into(), 5, FakeHistory(vec![ev(5, "a")]));

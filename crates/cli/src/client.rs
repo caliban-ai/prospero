@@ -53,25 +53,33 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Open an SSE stream and invoke `on_event` for each `data:` payload.
-    /// Blocks until the stream closes.
+    /// Open an SSE stream and invoke `on_event(event_name, payload)` for each
+    /// `data:` payload. `event_name` is the preceding `event:` field, or `""`
+    /// for the default (unnamed) `message` event. Blocks until the stream
+    /// closes.
     pub fn stream_events(
         &self,
         path: &str,
-        mut on_event: impl FnMut(serde_json::Value),
+        mut on_event: impl FnMut(&str, serde_json::Value),
     ) -> Result<()> {
         let resp = ureq::get(&self.url(path)).call().map_err(map_err)?;
         let reader = BufReader::new(resp.into_reader());
+        let mut event_name = String::new();
         for line in reader.lines() {
             let line = line.with_context(|| "reading SSE stream")?;
-            if let Some(payload) = line.strip_prefix("data:") {
+            if let Some(name) = line.strip_prefix("event:") {
+                event_name = name.trim().to_string();
+            } else if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
                 if payload.is_empty() {
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-                    on_event(value);
+                    on_event(&event_name, value);
                 }
+            } else if line.is_empty() {
+                // Blank line ends an event; reset to the default for the next.
+                event_name.clear();
             }
         }
         Ok(())
