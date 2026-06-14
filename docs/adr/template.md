@@ -1,8 +1,8 @@
-# ####. Short title of the decision
+# ADR #### · Short title of the decision
 
-- **Status:** Proposed | Accepted | Deprecated | Superseded by [####](####-topic.md)
+- **Status:** proposed | accepted | deprecated | superseded by [####](####-topic.md)
 - **Date:** YYYY-MM-DD
-- **Deciders:** who made the call (names / roles)
+- **Source:** [`docs/superpowers/specs/...`](../superpowers/specs/...) §N  <!-- optional: link the spec/design this records -->
 
 ## Context
 
@@ -17,6 +17,8 @@ included. Link to the relevant design doc, spec, or code if one exists.
 
 ## Consequences
 
-What becomes easier and what becomes harder as a result — positive, negative, and
-neutral. Call out new constraints this imposes, follow-up work it implies, and anything
-it deliberately leaves open. This is where you record the trade-off you accepted.
+- **Positive:** what becomes easier or safer as a result — the upside you're buying.
+- **Negative:** what becomes harder, the cost or constraint you accept, follow-up work it
+  implies.
+- **Revisit if:** the condition or signal that would make this decision worth reopening —
+  what you'd watch for that says "this trade-off no longer holds."

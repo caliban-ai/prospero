@@ -1,8 +1,7 @@
-# 0005. Worktree isolation by default for agent spawns
+# ADR 0005 · Worktree isolation by default for agent spawns
 
-- **Status:** Accepted
+- **Status:** accepted
 - **Date:** 2026-06-05
-- **Deciders:** Prospero maintainers
 - **Source:** [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](../superpowers/specs/2026-06-05-prospero-framework-design.md) §1, §2, §5
 
 ## Context
@@ -27,9 +26,13 @@ behavior without each re-deciding it.
 
 ## Consequences
 
-- The common case — parallel agents on one repo — is safe by default; a user has to go out
-  of their way (`--shared-tree`) to opt into shared-tree behavior and its collision risk.
-- Each isolated agent consumes a git worktree (disk + setup cost); acceptable for the
-  parallelism it buys.
-- Enforcing the default at the API boundary, not per client, keeps the policy in one place
-  and makes "spawn defaults to a worktree" a testable invariant of the control plane.
+- **Positive:** the common case — parallel agents on one repo — is safe by default; a user
+  has to go out of their way (`--shared-tree`) to opt into shared-tree behavior and its
+  collision risk. Enforcing the default at the API boundary, not per client, keeps the policy
+  in one place and makes "spawn defaults to a worktree" a testable invariant of the control
+  plane.
+- **Negative:** each isolated agent consumes a git worktree (disk + setup cost) — acceptable
+  for the parallelism it buys, but real cost for many or short-lived agents.
+- **Revisit if:** worktree setup cost dominates for high-churn or single-agent workloads, or
+  a use case emerges where shared-tree is the safe common case — either would argue for a
+  different default or a per-repo policy.

@@ -1,8 +1,7 @@
-# 0004. Hybrid live + durable observability behind a `Store` trait
+# ADR 0004 · Hybrid live + durable observability behind a `Store` trait
 
-- **Status:** Accepted
+- **Status:** accepted
 - **Date:** 2026-06-05
-- **Deciders:** Prospero maintainers
 - **Source:** [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](../superpowers/specs/2026-06-05-prospero-framework-design.md) §1, §4, §5
 
 ## Context
@@ -33,11 +32,14 @@ and the full story persists on disk even after caliban forgets the agent.
 
 ## Consequences
 
-- Prospero fills caliban's history gap: runs are durable and replayable; `seq` survives
-  prosperod restarts.
-- Streaming cost is bounded to active/watched agents rather than the whole fleet.
-- Putting persistence behind a `Store` trait keeps the door open for a sqlite backend later
-  without touching the rest of the system; `JsonlStore` is deliberately the simple first step.
-- Durability is best-effort relative to liveness: a failed `Store.append` is logged and
-  metered but does not stop live SSE — we favor a never-down fleet view over guaranteed
-  persistence (first stab). Log retention/rotation is deferred.
+- **Positive:** Prospero fills caliban's history gap — runs are durable and replayable, and
+  `seq` survives prosperod restarts. Streaming cost is bounded to active/watched agents rather
+  than the whole fleet. Putting persistence behind a `Store` trait keeps the door open for a
+  sqlite backend later without touching the rest of the system; `JsonlStore` is deliberately
+  the simple first step.
+- **Negative:** durability is best-effort relative to liveness — a failed `Store.append` is
+  logged and metered but does not stop live SSE, so we favor a never-down fleet view over
+  guaranteed persistence (first stab). Log retention/rotation is deferred.
+- **Revisit if:** dropped-event durability becomes unacceptable (history is relied on as a
+  system of record), or `JsonlStore` outgrows append-only files — either would promote the
+  sqlite backend the `Store` trait was designed to allow.
