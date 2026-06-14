@@ -42,7 +42,7 @@ async fn cli_drives_the_full_stack() {
         tmpdir: None,
     };
     let socket = control_socket_path(&repo_root, &env);
-    let _fake = FakeCaliband::start_at(&socket).await.unwrap();
+    let fake = FakeCaliband::start_at(&socket).await.unwrap();
 
     // --- manager + background poll loop ---
     let mut config = FleetConfig::new("e2e-host", data_dir.path());
@@ -105,6 +105,32 @@ async fn cli_drives_the_full_stack() {
     assert!(
         out.contains("finished") || out.contains("init"),
         "follow should show streamed events: {out}"
+    );
+
+    // --tool-allowlist reaches caliband as the spawned spec's allowlist.
+    let (ok, out) = run_cli(
+        &base,
+        &[
+            "spawn",
+            "repo",
+            "restricted task",
+            "--tool-allowlist",
+            "read",
+            "--tool-allowlist",
+            "edit",
+        ],
+    );
+    assert!(ok, "allowlisted spawn failed: {out}");
+    let allowlisted = fake
+        .received_specs()
+        .into_iter()
+        .find(|s| s.initial_prompt == "restricted task")
+        .expect("fake caliband received the allowlisted spawn spec");
+    assert_eq!(
+        allowlisted.tool_allowlist,
+        Some(vec!["read".to_string(), "edit".to_string()]),
+        "allowlist must reach caliband; got {:?}",
+        allowlisted.tool_allowlist
     );
 }
 
