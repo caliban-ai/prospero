@@ -1,2 +1,6 @@
 /target
 .superpowers/
+/docs/guide/book
+/docs/guide/src/adr/
+/docs/guide/theme/caliban-ai.css
+/docs/guide/theme/nav.js
