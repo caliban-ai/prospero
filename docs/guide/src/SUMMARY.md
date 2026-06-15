@@ -13,5 +13,3 @@
   - [ADR 0005 · Worktree isolation by default for agent spawns](./adr/0005-worktree-isolation-by-default-for-spawns.md)
   - [ADR 0006 · Layered crate boundaries: cli/daemon → api → core](./adr/0006-layered-crate-boundaries.md)
   - [ADR 0007 · Test the control plane against an in-process fake caliban](./adr/0007-fake-caliban-test-harness.md)
-  - [Architecture Decision Records](./adr/README.md)
-  - [ADR #### · Short title of the decision](./adr/template.md)
