@@ -74,6 +74,16 @@ pub enum EventKind {
     },
     /// A poll observed the agent disappear from caliband's registry.
     AgentGone,
+    /// A durable-store append failed, so the event with `lost_seq` reached the
+    /// live bus but is **absent from durable history**. This marker is itself
+    /// persisted (best-effort) so a history reader — not just a log scraper —
+    /// sees that the live and durable views diverged here. See ADR-0004.
+    StorePersistFailed {
+        /// The `seq` of the event that could not be persisted.
+        lost_seq: u64,
+        /// Rendered append error, for diagnosis.
+        detail: String,
+    },
     /// A repo's caliband health changed.
     RepoHealth {
         /// The new health state.
