@@ -51,6 +51,11 @@ pub enum CoreError {
     #[error("repo not registered: {0}")]
     RepoNotFound(String),
 
+    /// The repo's selected provider is missing a required credential, so a
+    /// spawn would produce a doomed agent. Caught before the spawn is issued.
+    #[error("provider misconfigured: {0}")]
+    ProviderMisconfigured(String),
+
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

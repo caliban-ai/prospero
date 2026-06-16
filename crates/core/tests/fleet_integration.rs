@@ -13,6 +13,7 @@ use prospero_core::fleet::{FleetConfig, FleetManager, SpawnRequest};
 use prospero_core::model::{AgentStatus, RepoHealth};
 use prospero_core::store::JsonlStore;
 use prospero_core::testkit::{FakeCaliband, test_record};
+use prospero_core::{CoreError, RepoProviderConfig};
 
 /// Keeps the manager, fake, and all backing temp dirs alive for a test.
 struct Harness {
@@ -240,6 +241,36 @@ async fn unreachable_repo_degrades_without_failing() {
     let snap = manager.snapshot().await;
     let repo = snap.repos.iter().find(|r| r.name == "repo").unwrap();
     assert!(matches!(repo.health, RepoHealth::Unreachable { .. }));
+}
+
+#[tokio::test]
+async fn spawn_rejects_provider_with_unset_api_key() {
+    let h = setup().await;
+    h.manager
+        .set_repo_config_registry_only(
+            "repo",
+            RepoProviderConfig {
+                provider: Some("anthropic".into()),
+                ..RepoProviderConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let err = h
+        .manager
+        .spawn_agent("repo", SpawnRequest::new("doomed"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, CoreError::ProviderMisconfigured(_)),
+        "unset provider key must surface as ProviderMisconfigured, got: {err:?}"
+    );
+    assert!(
+        h.fake.received_specs().is_empty(),
+        "validation must reject before a doomed agent reaches caliban"
+    );
 }
 
 #[tokio::test]

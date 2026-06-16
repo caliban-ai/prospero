@@ -71,6 +71,42 @@ pub fn resolve_env(
     out
 }
 
+/// Check that a *resolved* env satisfies the selected provider's API-key
+/// requirement, returning an actionable message when it does not.
+///
+/// This complements [`resolve_env`], which only `warn!`s on a dangling
+/// `api_key_from_env` reference and then proceeds. Validating the resolved map
+/// (rather than the raw config) means a key supplied through any layer —
+/// curated `api_key_from_env`, raw `cfg.env`, or the global `default_env` —
+/// counts, so there are no false positives. Providers without a key var
+/// (ollama, bedrock, vertex) and an unset provider always pass.
+pub fn validate_provider_env(
+    cfg: &RepoProviderConfig,
+    resolved: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    let Some(provider) = &cfg.provider else {
+        return Ok(());
+    };
+    let (_base_var, key_var) = provider_vars(provider);
+    let Some(key_var) = key_var else {
+        return Ok(());
+    };
+    if resolved.get(key_var).is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    Err(match &cfg.api_key_from_env {
+        Some(name) => format!(
+            "provider '{provider}' requires {key_var}, but api_key_from_env \
+             references '{name}', which is unset in prosperod's environment"
+        ),
+        None => format!(
+            "provider '{provider}' requires {key_var}, but no value is configured \
+             (set api_key_from_env to a variable in prosperod's environment, or \
+             supply {key_var} in the repo env)"
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +177,87 @@ mod tests {
         let out = resolve_env(&default_env, &cfg(), &no_env);
         assert_eq!(out.get("FOO").unwrap(), "bar");
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn validate_rejects_unset_api_key() {
+        let mut c = cfg();
+        c.provider = Some("anthropic".into());
+        let resolved = resolve_env(&BTreeMap::new(), &c, &no_env);
+        let err = validate_provider_env(&c, &resolved).unwrap_err();
+        assert!(err.contains("anthropic"), "message names provider: {err}");
+        assert!(
+            err.contains("ANTHROPIC_API_KEY"),
+            "message names key var: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_dangling_api_key_reference() {
+        let mut c = cfg();
+        c.provider = Some("openai".into());
+        c.api_key_from_env = Some("UNSET_VAR".into());
+        let resolved = resolve_env(&BTreeMap::new(), &c, &no_env);
+        let err = validate_provider_env(&c, &resolved).unwrap_err();
+        assert!(
+            err.contains("UNSET_VAR"),
+            "message names the dangling reference: {err}"
+        );
+        assert!(
+            err.contains("OPENAI_API_KEY"),
+            "message names key var: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_key_resolved_from_env() {
+        let mut c = cfg();
+        c.provider = Some("anthropic".into());
+        c.api_key_from_env = Some("MY_KEY".into());
+        let proc = |k: &str| (k == "MY_KEY").then(|| "secret".to_string());
+        let resolved = resolve_env(&BTreeMap::new(), &c, &proc);
+        assert!(validate_provider_env(&c, &resolved).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_key_supplied_via_default_env() {
+        let mut default_env = BTreeMap::new();
+        default_env.insert("ANTHROPIC_API_KEY".into(), "from-global".into());
+        let mut c = cfg();
+        c.provider = Some("anthropic".into());
+        let resolved = resolve_env(&default_env, &c, &no_env);
+        assert!(validate_provider_env(&c, &resolved).is_ok());
+    }
+
+    #[test]
+    fn validate_treats_empty_key_value_as_unset() {
+        let mut default_env = BTreeMap::new();
+        default_env.insert("ANTHROPIC_API_KEY".into(), String::new());
+        let mut c = cfg();
+        c.provider = Some("anthropic".into());
+        let resolved = resolve_env(&default_env, &c, &no_env);
+        assert!(validate_provider_env(&c, &resolved).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_keyless_provider() {
+        let mut c = cfg();
+        c.provider = Some("ollama".into());
+        let resolved = resolve_env(&BTreeMap::new(), &c, &no_env);
+        assert!(validate_provider_env(&c, &resolved).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_provider_only_backend() {
+        let mut c = cfg();
+        c.provider = Some("bedrock".into());
+        let resolved = resolve_env(&BTreeMap::new(), &c, &no_env);
+        assert!(validate_provider_env(&c, &resolved).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_no_provider() {
+        let resolved = resolve_env(&BTreeMap::new(), &cfg(), &no_env);
+        assert!(validate_provider_env(&cfg(), &resolved).is_ok());
     }
 }
