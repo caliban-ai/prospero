@@ -331,8 +331,27 @@ impl FleetManager {
         Ok(client)
     }
 
+    /// Validate that `repo`'s selected provider has its required credential
+    /// before a spawn is issued, so a misconfigured repo surfaces an actionable
+    /// error to the caller rather than spawning a doomed agent. Resolves the env
+    /// the same way [`Self::ensure_config_for`] does and checks the result.
+    async fn validate_provider_env(&self, repo: &str) -> Result<()> {
+        let cfg = {
+            let reg = self.inner.registry.read().await;
+            reg.get(repo)
+                .map(|r| r.config.clone())
+                .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
+        };
+        let env = crate::provider_env::resolve_env(&self.inner.config.default_env, &cfg, &|k| {
+            std::env::var(k).ok()
+        });
+        crate::provider_env::validate_provider_env(&cfg, &env)
+            .map_err(CoreError::ProviderMisconfigured)
+    }
+
     /// Launch a new agent under `repo`. Returns the new agent id.
     pub async fn spawn_agent(&self, repo: &str, req: SpawnRequest) -> Result<String> {
+        self.validate_provider_env(repo).await?;
         let client = self.client_for(repo).await?;
         let mut spec = req.into_spec();
         // Select the provider via the wire spec (#93): the caliban worker reads

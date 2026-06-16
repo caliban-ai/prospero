@@ -29,6 +29,9 @@ impl IntoResponse for ApiError {
                 (StatusCode::NOT_FOUND, "not_found")
             }
             CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state"),
+            CoreError::ProviderMisconfigured(_) => {
+                (StatusCode::BAD_REQUEST, "provider_misconfigured")
+            }
             CoreError::CalibandUnreachable { .. } | CoreError::Discovery(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "unreachable")
             }

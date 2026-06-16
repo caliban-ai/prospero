@@ -127,6 +127,45 @@ async fn spawn_defaults_to_worktree_and_returns_isolated_true() {
 }
 
 #[tokio::test]
+async fn spawn_with_unset_provider_key_returns_400() {
+    let h = setup().await;
+    h.manager
+        .set_repo_config_registry_only(
+            "repo",
+            prospero_core::RepoProviderConfig {
+                provider: Some("anthropic".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/repos/repo/agents")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"prompt":"doomed"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert_eq!(v["kind"], "provider_misconfigured");
+    assert!(
+        v["error"].as_str().unwrap().contains("ANTHROPIC_API_KEY"),
+        "actionable error names the missing var: {v}"
+    );
+    // No doomed agent reached caliban.
+    assert!(h.fake.received_specs().is_empty());
+}
+
+#[tokio::test]
 async fn spawn_shared_opt_out_returns_isolated_false() {
     let h = setup().await;
     let resp = h
