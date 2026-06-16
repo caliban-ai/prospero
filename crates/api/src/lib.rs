@@ -30,6 +30,7 @@ pub fn router(manager: FleetManager) -> Router {
         .route("/", get(dashboard::index))
         .route("/app.js", get(dashboard::app_js))
         .route("/healthz", get(handlers::healthz))
+        .route("/api/metrics", get(handlers::get_metrics))
         // Fleet + repos.
         .route("/api/fleet", get(handlers::get_fleet))
         .route(
