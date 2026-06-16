@@ -83,6 +83,41 @@ async fn healthz_ok() {
 }
 
 #[tokio::test]
+async fn get_metrics_returns_operational_counters() {
+    let h = setup().await;
+    // add_repo triggers a poll, so repos_polled should be non-zero.
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    for key in [
+        "events_appended",
+        "append_failures",
+        "unknown_frames",
+        "repos_polled",
+        "active_attaches",
+    ] {
+        assert!(
+            v.get(key).and_then(|x| x.as_u64()).is_some(),
+            "missing {key}: {v}"
+        );
+    }
+    assert!(
+        v["repos_polled"].as_u64().unwrap() >= 1,
+        "the registration poll must be counted: {v}"
+    );
+}
+
+#[tokio::test]
 async fn get_fleet_returns_registered_repo() {
     let h = setup().await;
     let resp = h

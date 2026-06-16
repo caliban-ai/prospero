@@ -236,6 +236,38 @@ async fn attach_reconnects_after_drop_without_dup_or_loss() {
 }
 
 #[tokio::test]
+async fn unknown_frame_advances_the_metrics_counter() {
+    let mut h = setup().await;
+    let dir = h.socket_dir();
+    let rec = test_record("agent001", &dir, AgentStatus::Running, false);
+    // A frame caliban has moved ahead to that prospero's wire client doesn't know.
+    h.fake
+        .add_agent(
+            rec,
+            vec![
+                serde_json::json!({"type":"future_thing","data":1}),
+                serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.0,"turns":1}),
+            ],
+        )
+        .await;
+
+    let mut rx = h.manager.subscribe();
+    h.manager.poll_repo_once("repo").await;
+    let _ = collect_kinds(&mut rx, Duration::from_secs(1)).await;
+
+    let m = h.manager.metrics();
+    assert_eq!(
+        m.unknown_frames, 1,
+        "the future_thing frame must be counted"
+    );
+    assert!(m.repos_polled >= 1, "poll must be counted: {m:?}");
+    assert!(
+        m.events_appended >= 1,
+        "appended events must be counted: {m:?}"
+    );
+}
+
+#[tokio::test]
 async fn history_is_persisted_and_replayable() {
     let mut h = setup().await;
     let dir = h.socket_dir();

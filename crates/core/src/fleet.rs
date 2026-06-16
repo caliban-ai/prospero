@@ -20,6 +20,7 @@ use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
+use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
 use crate::registry::Registry;
 use crate::store::Store;
@@ -171,6 +172,7 @@ struct Emitter {
     store: Arc<dyn Store>,
     bus: broadcast::Sender<FleetEvent>,
     seq: Arc<AtomicU64>,
+    metrics: Arc<Metrics>,
 }
 
 impl Emitter {
@@ -188,7 +190,16 @@ impl Emitter {
     fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
         let event = self.next_event(repo, agent_id, kind);
         let lost_seq = event.seq;
-        let append_err = self.store.append(&event).err();
+        let append_err = match self.store.append(&event) {
+            Ok(()) => {
+                self.metrics.record_append_ok();
+                None
+            }
+            Err(e) => {
+                self.metrics.record_append_failure();
+                Some(e)
+            }
+        };
         // Live SSE flows regardless of persistence (ADR-0004 favors a never-down
         // fleet view). Ignore send errors: no subscribers is fine.
         let _ = self.bus.send(event);
@@ -212,10 +223,14 @@ impl Emitter {
                 detail: err.to_string(),
             },
         );
-        if let Err(e) = self.store.append(&marker) {
-            // Hard-down store: the gap is now observable only via logs
-            // (documented degradation), but live consumers are still signalled.
-            tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist store-gap marker");
+        match self.store.append(&marker) {
+            Ok(()) => self.metrics.record_append_ok(),
+            Err(e) => {
+                // Hard-down store: the gap is now observable only via logs
+                // (documented degradation), but live consumers are still signalled.
+                self.metrics.record_append_failure();
+                tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist store-gap marker");
+            }
         }
         let _ = self.bus.send(marker);
     }
@@ -249,6 +264,7 @@ impl FleetManager {
             store,
             bus,
             seq: Arc::new(AtomicU64::new(high_water)),
+            metrics: Arc::new(Metrics::default()),
         };
         let snapshot = FleetSnapshot {
             host: config.host.clone(),
@@ -283,6 +299,13 @@ impl FleetManager {
     /// A clone of the current fleet snapshot.
     pub async fn snapshot(&self) -> FleetSnapshot {
         self.inner.snapshot.read().await.clone()
+    }
+
+    /// A snapshot of prosperod's operational counters (`active_attaches` is read
+    /// live from the running attach set).
+    pub fn metrics(&self) -> MetricsSnapshot {
+        let active = self.inner.attached.lock().unwrap().len() as u64;
+        self.inner.emitter.metrics.snapshot(active)
     }
 
     /// Replay an agent's history from the store, with `seq >= from_seq`.
@@ -525,6 +548,7 @@ impl FleetManager {
     /// and start attach tasks for newly-active agents. Failures degrade the
     /// repo to `Unreachable` rather than propagating.
     pub async fn poll_repo_once(&self, repo: &str) {
+        self.inner.emitter.metrics.record_repo_poll();
         let client = match self.client_for(repo).await {
             Ok(c) => c,
             Err(e) => {
@@ -853,6 +877,7 @@ async fn attach_once(
             }
             Normalized::Dropped => {}
             Normalized::Unknown => {
+                emitter.metrics.record_unknown_frame();
                 tracing::debug!(target: "prospero_fleet", %agent_id, "unknown caliban frame type");
             }
         }
@@ -1072,6 +1097,7 @@ mod tests {
             store,
             bus,
             seq: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -1135,6 +1161,24 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a healthy append must not emit a gap marker"
+        );
+    }
+
+    #[test]
+    fn append_failure_and_success_advance_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = crate::store::JsonlStore::open(dir.path()).unwrap();
+        // Fail the data event (seq 1); the gap marker (seq 2) appends fine.
+        let store = Arc::new(FlakyStore::new(inner, [1]));
+        let emitter = emitter_with(store);
+
+        emitter.emit("repo", "a1", EventKind::AgentSpawned);
+
+        let m = emitter.metrics.snapshot(0);
+        assert_eq!(m.append_failures, 1, "the failed append must be counted");
+        assert_eq!(
+            m.events_appended, 1,
+            "the successful gap-marker append must be counted"
         );
     }
 }

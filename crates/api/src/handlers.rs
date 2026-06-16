@@ -170,6 +170,11 @@ pub async fn rm_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/metrics` — prosperod's operational counters.
+pub async fn get_metrics(State(st): State<AppState>) -> Json<prospero_core::MetricsSnapshot> {
+    Json(st.manager.metrics())
+}
+
 /// `GET /healthz` — daemon liveness.
 pub async fn healthz() -> &'static str {
     "ok"
