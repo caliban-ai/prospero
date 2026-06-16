@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig, control_socket_path};
 use prospero_core::event::EventKind;
-use prospero_core::fleet::{FleetConfig, FleetManager, SpawnRequest};
+use prospero_core::fleet::{AttachBackoff, FleetConfig, FleetManager, SpawnRequest};
 use prospero_core::model::{AgentStatus, RepoHealth};
 use prospero_core::store::JsonlStore;
 use prospero_core::testkit::{FakeCaliband, test_record};
@@ -54,6 +54,12 @@ async fn setup() -> Harness {
         ..EnsureConfig::default()
     };
     config.poll_interval = Duration::from_millis(20);
+    // Tiny backoff so reconnection tests don't sleep for real.
+    config.attach_backoff = AttachBackoff {
+        base: Duration::from_millis(1),
+        max: Duration::from_millis(5),
+        max_retries: 5,
+    };
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
     let manager = FleetManager::new(config, store).unwrap();
@@ -161,6 +167,72 @@ async fn poll_discovers_preexisting_agents_and_streams_them() {
     let (repo, agent) = snap.find_agent("agent001").unwrap();
     assert_eq!(repo, "repo");
     assert!(agent.isolated);
+}
+
+#[tokio::test]
+async fn attach_reconnects_after_drop_without_dup_or_loss() {
+    let mut h = setup().await;
+    let dir = h.socket_dir();
+    let rec = test_record("agent001", &dir, AgentStatus::Running, true);
+
+    let init = serde_json::json!({"type":"system","subtype":"init","model":"m","tools":["Read"],"session_id":"s"});
+    let hello = serde_json::json!({"type":"text","delta":"hello"});
+    let result =
+        serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.5,"turns":2});
+
+    // Connection 1 drops mid-stream after init+hello (no terminal result);
+    // the reconnect replays the full stream including the result.
+    h.fake
+        .add_agent_with_scripts(
+            rec,
+            vec![
+                vec![init.clone(), hello.clone()],
+                vec![init.clone(), hello.clone(), result.clone()],
+            ],
+        )
+        .await;
+
+    let mut rx = h.manager.subscribe();
+    h.manager.poll_repo_once("repo").await;
+    let kinds = collect_kinds(&mut rx, Duration::from_secs(2)).await;
+
+    // No loss: the terminal event arrives despite the mid-stream drop.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::AgentFinished { .. }))
+            .count(),
+        1,
+        "the post-drop terminal event must not be lost: {kinds:?}"
+    );
+    // No duplicates: the replayed prefix (init, hello) is emitted exactly once.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::AgentInit { .. }))
+            .count(),
+        1,
+        "init must not be duplicated across the reconnect: {kinds:?}"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::Output { chunk, .. } if chunk == "hello"))
+            .count(),
+        1,
+        "output must not be duplicated across the reconnect: {kinds:?}"
+    );
+
+    // Durable history is likewise free of duplicates.
+    let history = h.manager.history("agent001", 0).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Output { chunk, .. } if chunk == "hello"))
+            .count(),
+        1,
+        "durable log must not double-persist replayed frames"
+    );
 }
 
 #[tokio::test]
