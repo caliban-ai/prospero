@@ -94,6 +94,54 @@ pub struct FleetConfig {
     pub event_buffer: usize,
     /// Global default env merged under each repo's resolved overlay.
     pub default_env: std::collections::BTreeMap<String, String>,
+    /// Reconnection backoff for a dropped per-agent attach stream.
+    pub attach_backoff: AttachBackoff,
+}
+
+/// Bounded exponential-backoff policy for reconnecting a dropped attach stream.
+///
+/// On a premature stream drop (EOF before the agent's terminal `result`, or a
+/// read error) the attach task waits `min(max, base * 2^attempt)` — with a
+/// per-(agent, attempt) jitter to decorrelate reconnect storms across agents —
+/// then reconnects, up to `max_retries` consecutive failures. Making progress
+/// (new frames) resets the attempt counter. When the budget is exhausted the
+/// task exits and the poll loop remains the long-term re-attach safety net.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachBackoff {
+    /// Delay before the first reconnect.
+    pub base: Duration,
+    /// Ceiling on any single backoff delay.
+    pub max: Duration,
+    /// Maximum consecutive reconnect attempts before giving up in-path.
+    pub max_retries: u32,
+}
+
+impl Default for AttachBackoff {
+    fn default() -> Self {
+        Self {
+            base: Duration::from_millis(200),
+            max: Duration::from_secs(10),
+            max_retries: 8,
+        }
+    }
+}
+
+impl AttachBackoff {
+    /// Jittered delay for a 0-based `attempt`. Exponential on `base`, capped at
+    /// `max`, then scaled by a deterministic per-(agent, attempt) factor in
+    /// `[0.5, 1.0)` so concurrent attaches don't reconnect in lockstep.
+    fn delay_for(&self, agent_id: &str, attempt: u32) -> Duration {
+        use std::hash::{Hash, Hasher};
+        let exp = self
+            .base
+            .saturating_mul(2u32.saturating_pow(attempt.min(31)));
+        let capped = exp.min(self.max);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        agent_id.hash(&mut h);
+        attempt.hash(&mut h);
+        let frac = 0.5 + 0.5 * ((h.finish() % 1000) as f64 / 1000.0);
+        Duration::from_secs_f64(capped.as_secs_f64() * frac)
+    }
 }
 
 impl FleetConfig {
@@ -108,6 +156,7 @@ impl FleetConfig {
             normalize: NormalizeOptions::default(),
             event_buffer: 1024,
             default_env: std::collections::BTreeMap::new(),
+            attach_backoff: AttachBackoff::default(),
         }
     }
 
@@ -608,10 +657,11 @@ impl FleetManager {
         let agent_id = agent_id.to_string();
         let emitter = self.inner.emitter.clone();
         let normalize = self.inner.config.normalize;
+        let backoff = self.inner.config.attach_backoff;
         let attached = self.inner.clone();
 
         tokio::spawn(async move {
-            let result = attach_loop(&client, &repo, &agent_id, &emitter, normalize).await;
+            let result = attach_loop(&client, &repo, &agent_id, &emitter, normalize, backoff).await;
             if let Err(e) = result {
                 tracing::warn!(
                     target: "prospero_fleet",
@@ -687,26 +737,106 @@ impl FleetManager {
     }
 }
 
+/// How a single attach connection ended.
+enum StreamOutcome {
+    /// The agent's terminal `result` frame was seen — the run is done; exit.
+    Finished,
+    /// EOF arrived before any terminal frame — a premature drop; reconnect.
+    Disconnected,
+}
+
+/// Attach to an agent's stream and emit its events, **reconnecting with bounded
+/// backoff on a premature drop** so transient socket failures don't lose or
+/// duplicate events.
+///
+/// `frames_seen` is a high-water mark over the raw non-empty stream lines: on
+/// reconnect caliban replays the stream from the start, so we skip the prefix
+/// we already processed and emit only new frames — no duplicates in the live
+/// bus or the durable log, and nothing emitted in the gap window is lost (the
+/// replay carries it). A clean finish (terminal `result` → `AgentFinished`)
+/// exits without retrying; a drop or read error backs off and reconnects until
+/// the budget is spent, after which the poll loop remains the re-attach net.
 async fn attach_loop(
     client: &CalibandClient,
     repo: &str,
     agent_id: &str,
     emitter: &Emitter,
     normalize: NormalizeOptions,
+    backoff: AttachBackoff,
 ) -> Result<()> {
+    let mut frames_seen: u64 = 0;
+    let mut attempt: u32 = 0;
+    loop {
+        let before = frames_seen;
+        let err =
+            match attach_once(client, repo, agent_id, emitter, normalize, &mut frames_seen).await {
+                Ok(StreamOutcome::Finished) => return Ok(()),
+                Ok(StreamOutcome::Disconnected) => None,
+                Err(e) => Some(e),
+            };
+        // Progress on this connection resets the backoff window.
+        if frames_seen > before {
+            attempt = 0;
+        }
+        if attempt >= backoff.max_retries {
+            return match err {
+                Some(e) => Err(e),
+                None => {
+                    tracing::warn!(
+                        target: "prospero_fleet", %repo, %agent_id,
+                        "attach reconnection budget exhausted; poll loop will re-attach"
+                    );
+                    Ok(())
+                }
+            };
+        }
+        let delay = backoff.delay_for(agent_id, attempt);
+        tracing::warn!(
+            target: "prospero_fleet", %repo, %agent_id, attempt,
+            delay_ms = delay.as_millis() as u64,
+            reason = if err.is_some() { "error" } else { "premature-eof" },
+            "attach stream dropped; reconnecting after backoff"
+        );
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+    }
+}
+
+/// Read one attach connection to its end, emitting only frames past
+/// `frames_seen` and advancing it. Returns how the connection ended.
+async fn attach_once(
+    client: &CalibandClient,
+    repo: &str,
+    agent_id: &str,
+    emitter: &Emitter,
+    normalize: NormalizeOptions,
+    frames_seen: &mut u64,
+) -> Result<StreamOutcome> {
     let socket = client.attach(agent_id).await?;
     let mut reader = CalibandClient::open_stream(&socket).await?;
     let mut line = String::new();
+    let mut idx: u64 = 0;
+    let mut saw_terminal = false;
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            break; // end of stream
+            return Ok(if saw_terminal {
+                StreamOutcome::Finished
+            } else {
+                StreamOutcome::Disconnected
+            });
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
             continue;
         }
+        idx += 1;
+        // Skip the prefix already processed before a reconnect (dedup).
+        if idx <= *frames_seen {
+            continue;
+        }
+        *frames_seen = idx;
         let frame: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(_) => {
@@ -715,19 +845,49 @@ async fn attach_loop(
             }
         };
         match normalize_frame(&frame, normalize) {
-            Normalized::Event(kind) => emitter.emit(repo, agent_id, kind),
+            Normalized::Event(kind) => {
+                if matches!(kind, EventKind::AgentFinished { .. }) {
+                    saw_terminal = true;
+                }
+                emitter.emit(repo, agent_id, kind);
+            }
             Normalized::Dropped => {}
             Normalized::Unknown => {
                 tracing::debug!(target: "prospero_fleet", %agent_id, "unknown caliban frame type");
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_backoff_is_exponential_capped_and_jittered() {
+        let b = AttachBackoff {
+            base: Duration::from_millis(100),
+            max: Duration::from_millis(800),
+            max_retries: 8,
+        };
+        // Each delay sits in [50%, 100%) of the exponential value, capped at max.
+        for (attempt, exp_ms) in [(0u32, 100u64), (1, 200), (2, 400), (3, 800)] {
+            let d = b.delay_for("agent-a", attempt).as_millis() as u64;
+            assert!(
+                d >= exp_ms / 2 && d <= exp_ms,
+                "attempt {attempt}: {d}ms outside [{}, {exp_ms}]",
+                exp_ms / 2
+            );
+        }
+        // Beyond the cap, delays never exceed `max`.
+        let capped = b.delay_for("agent-a", 20).as_millis() as u64;
+        assert!((400..=800).contains(&capped), "capped delay {capped}ms");
+        // Jitter is deterministic per (agent, attempt) — stable across calls.
+        assert_eq!(
+            b.delay_for("agent-a", 2).as_millis(),
+            b.delay_for("agent-a", 2).as_millis()
+        );
+    }
 
     #[tokio::test]
     async fn restart_caliband_shuts_down_and_clears_client() {

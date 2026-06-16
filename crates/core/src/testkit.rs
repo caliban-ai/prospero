@@ -97,6 +97,29 @@ impl FakeCaliband {
         self.tasks.push(task);
     }
 
+    /// Pre-register an agent whose stream serves a **different script on each
+    /// successive attach connection** (the last script repeats once exhausted).
+    /// Lets a test simulate a mid-stream drop — a first connection that ends
+    /// without a terminal `result` frame — followed by a full replay on
+    /// reconnect, to exercise reconnection + dedup.
+    pub async fn add_agent_with_scripts(
+        &mut self,
+        record: AgentRecord,
+        scripts: Vec<Vec<serde_json::Value>>,
+    ) {
+        let socket_path = record.socket_path.clone();
+        {
+            let mut st = self.state.lock().unwrap();
+            st.scripts.insert(
+                record.id.clone(),
+                scripts.last().cloned().unwrap_or_default(),
+            );
+            st.agents.insert(record.id.clone(), record);
+        }
+        let task = spawn_multi_script_stream_listener(&socket_path, scripts).await;
+        self.tasks.push(task);
+    }
+
     /// All spawn specs received so far (in order).
     pub fn received_specs(&self) -> Vec<SpawnSpec> {
         self.state.lock().unwrap().received_specs.clone()
@@ -293,6 +316,38 @@ async fn spawn_stream_listener(
             }
             let _ = stream.flush().await;
             // Drop closes the stream, signalling end-of-stream.
+        }
+    })
+}
+
+/// Bind a per-agent stream socket that serves a distinct script per connection
+/// (connection `i` gets `scripts[i]`, with the last script repeating). Each
+/// connection writes its frames then closes, so a short script simulates a
+/// premature drop and a later one a full replay.
+async fn spawn_multi_script_stream_listener(
+    socket_path: &Path,
+    scripts: Vec<Vec<serde_json::Value>>,
+) -> JoinHandle<()> {
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path).expect("bind per-agent stream socket");
+    tokio::spawn(async move {
+        let mut conn = 0usize;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let script = scripts
+                .get(conn)
+                .or_else(|| scripts.last())
+                .cloned()
+                .unwrap_or_default();
+            for frame in &script {
+                let mut line = serde_json::to_vec(frame).unwrap();
+                line.push(b'\n');
+                if stream.write_all(&line).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stream.flush().await;
+            conn += 1;
+            // Drop closes the stream, signalling end-of-stream for this attach.
         }
     })
 }
