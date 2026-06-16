@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
@@ -245,6 +245,9 @@ struct Inner {
     /// Agent ids with a running attach task.
     attached: Mutex<HashSet<String>>,
     emitter: Emitter,
+    /// Broadcast shutdown signal: `true` once a graceful drain has begun. The
+    /// poll loop and attach tasks subscribe and stop cooperatively.
+    shutdown: watch::Sender<bool>,
 }
 
 /// The fleet control plane.
@@ -287,8 +290,18 @@ impl FleetManager {
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
                 emitter,
+                shutdown: watch::channel(false).0,
             }),
         })
+    }
+
+    /// Signal a graceful shutdown: the poll loop finishes its in-flight cycle and
+    /// returns, and attach tasks stop reading between frames. Idempotent.
+    ///
+    /// Uses `send_replace` so the signal sticks even if no task has subscribed
+    /// yet (plain `send` is a no-op when there are no receivers).
+    pub fn begin_shutdown(&self) {
+        self.inner.shutdown.send_replace(true);
     }
 
     /// Subscribe to the live event bus.
@@ -703,10 +716,20 @@ impl FleetManager {
         let emitter = self.inner.emitter.clone();
         let normalize = self.inner.config.normalize;
         let backoff = self.inner.config.attach_backoff;
+        let mut shutdown = self.inner.shutdown.subscribe();
         let attached = self.inner.clone();
 
         tokio::spawn(async move {
-            let result = attach_loop(&client, &repo, &agent_id, &emitter, normalize, backoff).await;
+            let result = attach_loop(
+                &client,
+                &repo,
+                &agent_id,
+                &emitter,
+                normalize,
+                backoff,
+                &mut shutdown,
+            )
+            .await;
             if let Err(e) = result {
                 tracing::warn!(
                     target: "prospero_fleet",
@@ -772,13 +795,26 @@ impl FleetManager {
         self.restart_caliband(repo).await
     }
 
-    /// Run the background poll loop forever (until the task is dropped).
+    /// Run the background poll loop until [`Self::begin_shutdown`] is signalled.
+    ///
+    /// Each iteration runs a *complete* poll cycle (never abandoned mid-append),
+    /// then waits the interval. A shutdown signal stops scheduling new polls and
+    /// returns after the in-flight cycle finishes — so the daemon can drain
+    /// cleanly rather than being killed mid-iteration.
     pub async fn run(self) {
         let interval = self.inner.config.poll_interval;
+        let mut shutdown = self.inner.shutdown.subscribe();
+        if *shutdown.borrow_and_update() {
+            return;
+        }
         loop {
             self.poll_all_once().await;
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown.changed() => break,
+            }
         }
+        tracing::info!(target: "prospero_fleet", "poll loop drained on shutdown");
     }
 }
 
@@ -808,17 +844,31 @@ async fn attach_loop(
     emitter: &Emitter,
     normalize: NormalizeOptions,
     backoff: AttachBackoff,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut frames_seen: u64 = 0;
     let mut attempt: u32 = 0;
     loop {
         let before = frames_seen;
-        let err =
-            match attach_once(client, repo, agent_id, emitter, normalize, &mut frames_seen).await {
-                Ok(StreamOutcome::Finished) => return Ok(()),
-                Ok(StreamOutcome::Disconnected) => None,
-                Err(e) => Some(e),
-            };
+        let err = match attach_once(
+            client,
+            repo,
+            agent_id,
+            emitter,
+            normalize,
+            &mut frames_seen,
+            shutdown,
+        )
+        .await
+        {
+            Ok(StreamOutcome::Finished) => return Ok(()),
+            Ok(StreamOutcome::Disconnected) => None,
+            Err(e) => Some(e),
+        };
+        // A shutdown was signalled while attached — stop reconnecting and drain.
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         // Progress on this connection resets the backoff window.
         if frames_seen > before {
             attempt = 0;
@@ -842,13 +892,18 @@ async fn attach_loop(
             reason = if err.is_some() { "error" } else { "premature-eof" },
             "attach stream dropped; reconnecting after backoff"
         );
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => return Ok(()),
+        }
         attempt += 1;
     }
 }
 
 /// Read one attach connection to its end, emitting only frames past
-/// `frames_seen` and advancing it. Returns how the connection ended.
+/// `frames_seen` and advancing it. Returns how the connection ended. A shutdown
+/// signal stops reading between frames (after any in-flight emit/append), so no
+/// event is left half-persisted.
 async fn attach_once(
     client: &CalibandClient,
     repo: &str,
@@ -856,6 +911,7 @@ async fn attach_once(
     emitter: &Emitter,
     normalize: NormalizeOptions,
     frames_seen: &mut u64,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<StreamOutcome> {
     let socket = client.attach(agent_id).await?;
     let mut reader = CalibandClient::open_stream(&socket).await?;
@@ -864,7 +920,13 @@ async fn attach_once(
     let mut saw_terminal = false;
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = tokio::select! {
+            r = reader.read_line(&mut line) => r?,
+            _ = shutdown.changed() => {
+                // Drain: stop reading between frames; the run is being torn down.
+                return Ok(StreamOutcome::Finished);
+            }
+        };
         if n == 0 {
             return Ok(if saw_terminal {
                 StreamOutcome::Finished
@@ -1204,5 +1266,25 @@ mod tests {
             m.events_appended, 1,
             "the successful gap-marker append must be counted"
         );
+    }
+
+    #[tokio::test]
+    async fn run_drains_and_returns_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.poll_interval = Duration::from_millis(50);
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+
+        let signaller = mgr.clone();
+        let handle = tokio::spawn(mgr.run());
+        signaller.begin_shutdown();
+
+        // run() must drain the in-flight poll and return promptly on the signal,
+        // rather than looping forever.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("run() must return after begin_shutdown")
+            .expect("run task panicked");
     }
 }

@@ -93,9 +93,9 @@ async fn main() -> anyhow::Result<()> {
     let manager = FleetManager::new(config, store).with_context(|| "building fleet manager")?;
 
     // Background poll loop.
-    tokio::spawn(manager.clone().run());
+    let poll_handle = tokio::spawn(manager.clone().run());
 
-    let app = prospero_api::router(manager);
+    let app = prospero_api::router(manager.clone());
     let listener = tokio::net::TcpListener::bind(args.addr)
         .await
         .with_context(|| format!("binding {}", args.addr))?;
@@ -110,6 +110,13 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .with_context(|| "serving HTTP")?;
+
+    // HTTP has drained; now drain the background poll loop and attach tasks so we
+    // don't abandon an in-flight poll/append mid-iteration.
+    manager.begin_shutdown();
+    if let Err(e) = poll_handle.await {
+        tracing::warn!(error = %e, "poll loop did not drain cleanly");
+    }
 
     tracing::info!("prosperod shut down");
     Ok(())
