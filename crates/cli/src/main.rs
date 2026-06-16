@@ -57,11 +57,40 @@ enum RepoCmd {
     },
     /// List managed repos.
     List,
+    /// Set a repo's provider config and restart its caliband.
+    Config(RepoConfigArgs),
     /// Unregister a repo.
     Rm {
         /// Repo name.
         name: String,
     },
+}
+
+#[derive(Debug, Args)]
+struct RepoConfigArgs {
+    /// Repo name (registry key).
+    name: String,
+    /// Provider id (e.g. anthropic, openai, google, ollama). Omit to clear.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Provider base URL / host.
+    #[arg(long = "base-url", value_name = "URL")]
+    base_url: Option<String>,
+    /// NAME of an env var in prosperod's environment to inject as the provider's
+    /// API key at spawn time (never the literal secret).
+    #[arg(long = "api-key-env", value_name = "VAR")]
+    api_key_env: Option<String>,
+    /// Raw env override KEY=VALUE (repeatable; do not put secrets here).
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    env: Vec<(String, String)>,
+}
+
+/// Parse a `KEY=VALUE` pair (value may contain further `=`).
+fn parse_key_val(s: &str) -> std::result::Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected KEY=VALUE, got '{s}'")),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +152,31 @@ fn main() -> Result<()> {
         Command::Repo(RepoCmd::List) => {
             let repos = client.get_json("/api/repos")?;
             print_repos(&repos);
+        }
+        Command::Repo(RepoCmd::Config(a)) => {
+            let mut config = serde_json::Map::new();
+            if let Some(provider) = &a.provider {
+                config.insert("provider".into(), provider.clone().into());
+            }
+            if let Some(base_url) = &a.base_url {
+                config.insert("base_url".into(), base_url.clone().into());
+            }
+            if let Some(api_key_env) = &a.api_key_env {
+                config.insert("api_key_from_env".into(), api_key_env.clone().into());
+            }
+            if !a.env.is_empty() {
+                let env: serde_json::Map<String, serde_json::Value> = a
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone().into()))
+                    .collect();
+                config.insert("env".into(), serde_json::Value::Object(env));
+            }
+            client.put_json(
+                &format!("/api/repos/{}/config", a.name),
+                serde_json::Value::Object(config),
+            )?;
+            println!("updated provider config for repo '{}'", a.name);
         }
         Command::Repo(RepoCmd::Rm { name }) => {
             client.delete(&format!("/api/repos/{name}"))?;
@@ -328,6 +382,40 @@ mod tests {
             }
             other => panic!("expected spawn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repo_config_parses_all_flags() {
+        let cli = Cli::parse_from([
+            "prospero",
+            "repo",
+            "config",
+            "myrepo",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://h:11434",
+            "--api-key-env",
+            "OLLAMA_KEY",
+            "--env",
+            "FOO=bar",
+        ]);
+        match cli.command {
+            Command::Repo(RepoCmd::Config(a)) => {
+                assert_eq!(a.name, "myrepo");
+                assert_eq!(a.provider.as_deref(), Some("ollama"));
+                assert_eq!(a.base_url.as_deref(), Some("http://h:11434"));
+                assert_eq!(a.api_key_env.as_deref(), Some("OLLAMA_KEY"));
+                assert_eq!(a.env, vec![("FOO".to_string(), "bar".to_string())]);
+            }
+            other => panic!("expected repo config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_config_rejects_bad_env_pair() {
+        let res = Cli::try_parse_from(["prospero", "repo", "config", "r", "--env", "noequals"]);
+        assert!(res.is_err(), "KEY=VALUE without '=' must be rejected");
     }
 
     #[test]
