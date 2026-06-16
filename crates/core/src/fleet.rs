@@ -125,20 +125,50 @@ struct Emitter {
 }
 
 impl Emitter {
-    fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
+    fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let event = FleetEvent {
+        FleetEvent {
             seq,
             ts: chrono::Utc::now().to_rfc3339(),
             repo: repo.to_string(),
             agent_id: agent_id.to_string(),
             kind,
-        };
-        if let Err(e) = self.store.append(&event) {
-            tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist event");
         }
-        // Ignore send errors: no subscribers is fine.
+    }
+
+    fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
+        let event = self.next_event(repo, agent_id, kind);
+        let lost_seq = event.seq;
+        let append_err = self.store.append(&event).err();
+        // Live SSE flows regardless of persistence (ADR-0004 favors a never-down
+        // fleet view). Ignore send errors: no subscribers is fine.
         let _ = self.bus.send(event);
+        if let Some(e) = append_err {
+            tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist event");
+            self.emit_persist_gap(repo, agent_id, lost_seq, e);
+        }
+    }
+
+    /// Record a durable-store divergence: the event at `lost_seq` reached the
+    /// live bus but not durable history. Emits a [`EventKind::StorePersistFailed`]
+    /// marker — persisted best-effort so a history reader sees the gap, and sent
+    /// on the bus so live consumers know history is incomplete. The marker keeps
+    /// the live and durable views from silently diverging (#25, ADR-0004).
+    fn emit_persist_gap(&self, repo: &str, agent_id: &str, lost_seq: u64, err: CoreError) {
+        let marker = self.next_event(
+            repo,
+            agent_id,
+            EventKind::StorePersistFailed {
+                lost_seq,
+                detail: err.to_string(),
+            },
+        );
+        if let Err(e) = self.store.append(&marker) {
+            // Hard-down store: the gap is now observable only via logs
+            // (documented degradation), but live consumers are still signalled.
+            tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist store-gap marker");
+        }
+        let _ = self.bus.send(marker);
     }
 }
 
@@ -842,5 +872,109 @@ mod tests {
         assert_eq!(ec.env.get("CALIBAN_PROVIDER").unwrap(), "ollama");
         assert_eq!(ec.env.get("OLLAMA_BASE_URL").unwrap(), "http://h:11434");
         assert_eq!(ec.env.get("EXTRA").unwrap(), "1");
+    }
+
+    /// A `Store` that fails `append` for a configured set of seqs and otherwise
+    /// delegates to a real `JsonlStore` — lets a test inject a persist failure
+    /// for one event while letting the gap marker through.
+    struct FlakyStore {
+        inner: crate::store::JsonlStore,
+        fail_seqs: std::sync::Mutex<std::collections::HashSet<u64>>,
+    }
+
+    impl FlakyStore {
+        fn new(inner: crate::store::JsonlStore, fail: impl IntoIterator<Item = u64>) -> Self {
+            Self {
+                inner,
+                fail_seqs: std::sync::Mutex::new(fail.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Store for FlakyStore {
+        fn append(&self, event: &FleetEvent) -> Result<()> {
+            if self.fail_seqs.lock().unwrap().contains(&event.seq) {
+                return Err(CoreError::Store("injected append failure".into()));
+            }
+            self.inner.append(event)
+        }
+        fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+            self.inner.replay(agent_id, from_seq)
+        }
+        fn high_water(&self) -> Result<u64> {
+            self.inner.high_water()
+        }
+    }
+
+    fn emitter_with(store: Arc<dyn Store>) -> Emitter {
+        let (bus, _keep) = broadcast::channel(16);
+        Emitter {
+            store,
+            bus,
+            seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn append_failure_emits_persist_gap_marker_visible_to_history() {
+        use crate::event::OutputStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inner = crate::store::JsonlStore::open(dir.path()).unwrap();
+        let store = Arc::new(FlakyStore::new(inner, [1])); // fail the data event (seq 1)
+        let emitter = emitter_with(store.clone());
+        let mut rx = emitter.bus.subscribe();
+
+        emitter.emit(
+            "repo",
+            "a1",
+            EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk: "lost".into(),
+            },
+        );
+
+        // Live SSE still flows (ADR-0004): the original event reaches the bus...
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.seq, 1);
+        assert!(matches!(ev.kind, EventKind::Output { .. }));
+        // ...immediately followed by a durable-gap marker naming the lost seq.
+        let marker = rx.try_recv().unwrap();
+        assert_eq!(marker.agent_id, "a1");
+        assert!(matches!(
+            marker.kind,
+            EventKind::StorePersistFailed { lost_seq: 1, .. }
+        ));
+
+        // The marker is visible to a history reader (persisted), not just logs,
+        // and the lost event itself is absent — the gap is real but now labeled.
+        let history = store.replay("a1", 0).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::StorePersistFailed { lost_seq: 1, .. })),
+            "history reader must see the persist-gap marker"
+        );
+        assert!(
+            !history.iter().any(|e| e.seq == 1),
+            "the un-persisted event must not appear in durable history"
+        );
+    }
+
+    #[test]
+    fn healthy_append_emits_no_gap_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+        let mut rx = emitter.bus.subscribe();
+
+        emitter.emit("repo", "a1", EventKind::AgentSpawned);
+
+        let ev = rx.try_recv().unwrap();
+        assert!(matches!(ev.kind, EventKind::AgentSpawned));
+        assert!(
+            rx.try_recv().is_err(),
+            "a healthy append must not emit a gap marker"
+        );
     }
 }

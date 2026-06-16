@@ -295,6 +295,11 @@ fn print_event(event_name: &str, ev: serde_json::Value) {
             kind["from"].as_str().unwrap_or("?"),
             kind["to"].as_str().unwrap_or("?")
         ),
+        "store_persist_failed" => println!(
+            "⚠ [persist-gap] event seq {} was not durably stored: {}",
+            kind["lost_seq"].as_u64().unwrap_or(0),
+            kind["detail"].as_str().unwrap_or("")
+        ),
         other => println!("[{other}]"),
     }
 }
