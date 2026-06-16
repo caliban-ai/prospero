@@ -12,9 +12,29 @@ use prospero_api::router;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig, control_socket_path};
 use prospero_core::fleet::{FleetConfig, FleetManager};
 use prospero_core::model::AgentStatus;
-use prospero_core::store::JsonlStore;
+use prospero_core::store::{JsonlStore, Store};
 use prospero_core::testkit::{FakeCaliband, test_record};
+use prospero_core::{FleetEvent, Result};
 use tower::ServiceExt;
+
+/// A store that persists normally but reports itself non-writable, to drive the
+/// readiness endpoint's degraded (503) path.
+struct UnwritableStore(JsonlStore);
+
+impl Store for UnwritableStore {
+    fn append(&self, event: &FleetEvent) -> Result<()> {
+        self.0.append(event)
+    }
+    fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+        self.0.replay(agent_id, from_seq)
+    }
+    fn high_water(&self) -> Result<u64> {
+        self.0.high_water()
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+}
 
 struct Harness {
     router: Router,
@@ -115,6 +135,50 @@ async fn get_metrics_returns_operational_counters() {
         v["repos_polled"].as_u64().unwrap() >= 1,
         "the registration poll must be counted: {v}"
     );
+}
+
+#[tokio::test]
+async fn readyz_returns_200_when_store_writable() {
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["ready"], true);
+    assert_eq!(v["store_writable"], true);
+    assert_eq!(v["repos_total"], 1);
+}
+
+#[tokio::test]
+async fn readyz_returns_503_when_store_unwritable() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(UnwritableStore(JsonlStore::open(data_dir.path()).unwrap()));
+    let config = FleetConfig::new("test-host", data_dir.path());
+    let manager = FleetManager::new(config, store).unwrap();
+    let app = router(manager);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = json_body(resp).await;
+    assert_eq!(v["ready"], false);
+    assert_eq!(v["store_writable"], false);
 }
 
 #[tokio::test]
