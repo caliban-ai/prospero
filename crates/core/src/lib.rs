@@ -24,7 +24,7 @@ pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};
 pub use metrics::{Metrics, MetricsSnapshot};
-pub use model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
+pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Repo, RepoHealth};
 pub use registry::{RegisteredRepo, Registry, RepoProviderConfig};
 pub use store::{JsonlStore, Store};
 

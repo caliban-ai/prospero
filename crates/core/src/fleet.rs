@@ -308,6 +308,27 @@ impl FleetManager {
         self.inner.emitter.metrics.snapshot(active)
     }
 
+    /// Aggregate readiness: store-writability (the ready gate) plus a summary of
+    /// per-repo health. Used by the `/readyz` endpoint to distinguish liveness
+    /// from readiness.
+    pub async fn readiness(&self) -> crate::model::Readiness {
+        let store_writable = self.inner.emitter.store.writable();
+        let snap = self.inner.snapshot.read().await;
+        let repos_total = snap.repos.len();
+        let repos_healthy = snap
+            .repos
+            .iter()
+            .filter(|r| matches!(r.health, RepoHealth::Healthy))
+            .count();
+        crate::model::Readiness {
+            ready: store_writable,
+            store_writable,
+            repos_total,
+            repos_healthy,
+            repos_unreachable: repos_total - repos_healthy,
+        }
+    }
+
     /// Replay an agent's history from the store, with `seq >= from_seq`.
     pub fn history(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         self.inner.emitter.store.replay(agent_id, from_seq)
@@ -1088,6 +1109,9 @@ mod tests {
         }
         fn high_water(&self) -> Result<u64> {
             self.inner.high_water()
+        }
+        fn writable(&self) -> bool {
+            self.inner.writable()
         }
     }
 

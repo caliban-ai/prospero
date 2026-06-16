@@ -175,7 +175,20 @@ pub async fn get_metrics(State(st): State<AppState>) -> Json<prospero_core::Metr
     Json(st.manager.metrics())
 }
 
-/// `GET /healthz` — daemon liveness.
+/// `GET /healthz` — daemon liveness (always 200 while the process is up).
 pub async fn healthz() -> &'static str {
     "ok"
+}
+
+/// `GET /readyz` — readiness: 200 only when the store is writable, otherwise
+/// 503 so an orchestrator can gate traffic/restarts. The body carries the
+/// store-writability flag and an aggregate repo-health summary.
+pub async fn readyz(State(st): State<AppState>) -> (StatusCode, Json<prospero_core::Readiness>) {
+    let readiness = st.manager.readiness().await;
+    let code = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(readiness))
 }

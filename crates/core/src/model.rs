@@ -9,6 +9,25 @@ use serde::{Deserialize, Serialize};
 
 /// Lifecycle state of an agent. Mirrors caliban's `AgentStatus` wire enum
 /// exactly so the same value round-trips through both protocols.
+/// Aggregate readiness of prosperod, distinct from mere liveness.
+///
+/// `ready` gates traffic/restarts: it is `true` only when the durable store can
+/// accept writes. The repo-health counts are an informational summary
+/// (per-repo reachability is already surfaced in `/api/repos` and `/api/fleet`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Readiness {
+    /// Overall ready signal — currently equivalent to `store_writable`.
+    pub ready: bool,
+    /// Whether the durable event store can accept writes.
+    pub store_writable: bool,
+    /// Total managed repos.
+    pub repos_total: usize,
+    /// Repos whose caliband responded to the last poll.
+    pub repos_healthy: usize,
+    /// Repos whose caliband was unreachable at the last poll.
+    pub repos_unreachable: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {

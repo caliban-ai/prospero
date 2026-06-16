@@ -23,6 +23,11 @@ pub trait Store: Send + Sync {
     /// The highest `seq` ever persisted (0 if empty). Used to resume the
     /// sequence counter across daemon restarts.
     fn high_water(&self) -> Result<u64>;
+
+    /// Whether the backend can currently accept writes. A cheap, non-destructive
+    /// probe used by the readiness endpoint to distinguish liveness from
+    /// readiness (e.g. a full or read-only data dir).
+    fn writable(&self) -> bool;
 }
 
 /// Append-only JSON-lines store. All events go to a single `events.jsonl`;
@@ -104,6 +109,16 @@ impl Store for JsonlStore {
     fn high_water(&self) -> Result<u64> {
         Ok(self.read_all()?.iter().map(|e| e.seq).max().unwrap_or(0))
     }
+
+    fn writable(&self) -> bool {
+        // Non-destructive: opening for create+append touches no existing data,
+        // and exercises the same path `append` takes.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +174,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
         assert_eq!(store.high_water().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_reflects_store_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        // First probe creates the (empty) events file.
+        assert!(store.writable(), "a fresh store is writable");
+
+        // Make the events file read-only so an append open fails.
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let observed = store.writable();
+        // Restore perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !observed,
+            "a read-only events file must report not writable"
+        );
     }
 
     #[test]
