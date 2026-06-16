@@ -47,6 +47,14 @@ impl DaemonClient {
         Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
+    /// PUT `path` with a JSON body (response body ignored; endpoint replies 204).
+    pub fn put_json(&self, path: &str, body: serde_json::Value) -> Result<()> {
+        ureq::put(&self.url(path))
+            .send_json(body)
+            .map_err(map_err)?;
+        Ok(())
+    }
+
     /// DELETE `path`.
     pub fn delete(&self, path: &str) -> Result<()> {
         ureq::delete(&self.url(path)).call().map_err(map_err)?;

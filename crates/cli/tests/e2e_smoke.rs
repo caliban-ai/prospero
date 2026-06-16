@@ -132,6 +132,40 @@ async fn cli_drives_the_full_stack() {
         "allowlist must reach caliband; got {:?}",
         allowlisted.tool_allowlist
     );
+
+    // `repo config` sets the per-repo provider end-to-end (kept last: it restarts
+    // caliband). Verify the daemon persisted it via /api/repos.
+    let (ok, out) = run_cli(
+        &base,
+        &[
+            "repo",
+            "config",
+            "repo",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://h:11434",
+        ],
+    );
+    assert!(ok, "repo config failed: {out}");
+    assert!(
+        out.contains("updated provider config"),
+        "config output: {out}"
+    );
+
+    let repos_url = format!("{base}/api/repos");
+    let repos: serde_json::Value =
+        tokio::task::spawn_blocking(move || ureq::get(&repos_url).call().unwrap().into_json())
+            .await
+            .unwrap()
+            .unwrap();
+    let cfg = &repos.as_array().unwrap()[0]["config"];
+    assert_eq!(
+        cfg["provider"].as_str(),
+        Some("ollama"),
+        "repo config must persist the provider end-to-end: {repos}"
+    );
+    assert_eq!(cfg["base_url"].as_str(), Some("http://h:11434"));
 }
 
 async fn wait_for_health(base: &str) {
