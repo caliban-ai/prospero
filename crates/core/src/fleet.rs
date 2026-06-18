@@ -211,6 +211,10 @@ impl Emitter {
             );
             0
         });
+        // Invariant: `emit` records the seq in `seqs` (here) BEFORE it calls
+        // `store.append`, so a concurrent task that read a stale `high_water`
+        // during the append window still sees the up-to-date counter on its
+        // re-check below — keeping `seq` unique and monotonic per stream.
         let mut seqs = self.seqs.lock().await;
         // Re-check: a concurrent task may have seeded while we read high_water.
         let next = match seqs.get(stream_key) {
@@ -536,7 +540,10 @@ impl FleetManager {
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
         let (id, _socket) = client.spawn(spec).await?;
-        self.inner.emitter.emit(repo, &id, EventKind::AgentSpawned).await;
+        self.inner
+            .emitter
+            .emit(repo, &id, EventKind::AgentSpawned)
+            .await;
         self.start_attach(repo, &id, client).await;
         Ok(id)
     }
@@ -1445,5 +1452,27 @@ mod tests {
             .await
             .expect("run() must return after begin_shutdown")
             .expect("run task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_seed_of_same_stream_assigns_unique_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+        // Two tasks race the slow-path seed for the same new stream "a1".
+        let e1 = emitter.clone();
+        let e2 = emitter.clone();
+        let t1 = tokio::spawn(async move { e1.emit("r", "a1", EventKind::AgentSpawned).await });
+        let t2 = tokio::spawn(async move { e2.emit("r", "a1", EventKind::AgentGone).await });
+        t1.await.unwrap();
+        t2.await.unwrap();
+        let a1 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
+            .unwrap();
+        let seqs: Vec<u64> = a1.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs.len(), 2, "both events persisted");
+        assert_ne!(seqs[0], seqs[1], "no duplicate seq within a stream");
     }
 }

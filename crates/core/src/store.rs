@@ -120,6 +120,8 @@ impl Store for JsonlStore {
     }
 
     async fn writable(&self) -> bool {
+        // Non-destructive: opening for create+append touches no existing data,
+        // and exercises the same path `append` takes.
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -234,6 +236,9 @@ mod tests {
 
     /// The behavioral contract every `Store` must satisfy. Reused by later
     /// backends (sqlite, Postgres) so parity is enforced, not assumed.
+    ///
+    /// Takes `&dyn Store`; a second backend should call it via the same erased
+    /// reference (e.g. `store_conformance(&store as &dyn Store).await`).
     async fn store_conformance(store: &dyn Store) {
         assert_eq!(store.high_water("a").await.unwrap(), 0);
         assert!(store.replay("a", 0).await.unwrap().is_empty());
