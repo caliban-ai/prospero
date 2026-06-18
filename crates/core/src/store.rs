@@ -9,24 +9,27 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
+
 use crate::error::{CoreError, Result};
 use crate::event::FleetEvent;
 
-/// A durable, append-only event log keyed by agent.
+/// A durable, append-only event log keyed by stream.
+#[async_trait]
 pub trait Store: Send + Sync {
     /// Append one event to durable storage.
-    fn append(&self, event: &FleetEvent) -> Result<()>;
+    async fn append(&self, event: &FleetEvent) -> Result<()>;
 
     /// Replay events for one stream with `seq >= from_seq`, in `seq` order.
-    fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>>;
+    async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>>;
 
     /// The highest `seq` ever persisted for `stream_key` (0 if none). Used to
     /// resume that stream's sequence counter across daemon restarts.
-    fn high_water(&self, stream_key: &str) -> Result<u64>;
+    async fn high_water(&self, stream_key: &str) -> Result<u64>;
 
     /// Whether the backend can currently accept writes. A cheap, non-destructive
     /// probe used by the readiness endpoint.
-    fn writable(&self) -> bool;
+    async fn writable(&self) -> bool;
 }
 
 /// Append-only JSON-lines store. All events go to a single `events.jsonl`;
@@ -79,8 +82,9 @@ impl JsonlStore {
     }
 }
 
+#[async_trait]
 impl Store for JsonlStore {
-    fn append(&self, event: &FleetEvent) -> Result<()> {
+    async fn append(&self, event: &FleetEvent) -> Result<()> {
         let mut line = serde_json::to_string(event)?;
         line.push('\n');
         let _guard = self
@@ -95,7 +99,7 @@ impl Store for JsonlStore {
         Ok(())
     }
 
-    fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+    async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         let mut events: Vec<FleetEvent> = self
             .read_all()?
             .into_iter()
@@ -105,7 +109,7 @@ impl Store for JsonlStore {
         Ok(events)
     }
 
-    fn high_water(&self, stream_key: &str) -> Result<u64> {
+    async fn high_water(&self, stream_key: &str) -> Result<u64> {
         Ok(self
             .read_all()?
             .iter()
@@ -115,9 +119,7 @@ impl Store for JsonlStore {
             .unwrap_or(0))
     }
 
-    fn writable(&self) -> bool {
-        // Non-destructive: opening for create+append touches no existing data,
-        // and exercises the same path `append` takes.
+    async fn writable(&self) -> bool {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -144,55 +146,55 @@ mod tests {
         }
     }
 
-    #[test]
-    fn append_and_replay_filters_by_agent_and_seq() {
+    #[tokio::test]
+    async fn append_and_replay_filters_by_agent_and_seq() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        store.append(&ev(1, "a", "one")).unwrap();
-        store.append(&ev(2, "b", "two")).unwrap();
-        store.append(&ev(3, "a", "three")).unwrap();
+        store.append(&ev(1, "a", "one")).await.unwrap();
+        store.append(&ev(2, "b", "two")).await.unwrap();
+        store.append(&ev(3, "a", "three")).await.unwrap();
 
-        let a_events = store.replay("a", 0).unwrap();
+        let a_events = store.replay("a", 0).await.unwrap();
         assert_eq!(a_events.len(), 2);
         assert_eq!(a_events[0].seq, 1);
         assert_eq!(a_events[1].seq, 3);
 
-        let from2 = store.replay("a", 3).unwrap();
+        let from2 = store.replay("a", 3).await.unwrap();
         assert_eq!(from2.len(), 1);
         assert_eq!(from2[0].seq, 3);
     }
 
-    #[test]
-    fn high_water_recovers_max_seq_across_reopen() {
+    #[tokio::test]
+    async fn high_water_recovers_max_seq_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = JsonlStore::open(dir.path()).unwrap();
-            store.append(&ev(5, "a", "x")).unwrap();
-            store.append(&ev(9, "a", "y")).unwrap();
+            store.append(&ev(5, "a", "x")).await.unwrap();
+            store.append(&ev(9, "a", "y")).await.unwrap();
         }
         let reopened = JsonlStore::open(dir.path()).unwrap();
-        assert_eq!(reopened.high_water("a").unwrap(), 9);
+        assert_eq!(reopened.high_water("a").await.unwrap(), 9);
     }
 
-    #[test]
-    fn high_water_is_zero_when_empty() {
+    #[tokio::test]
+    async fn high_water_is_zero_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        assert_eq!(store.high_water("a").unwrap(), 0);
+        assert_eq!(store.high_water("a").await.unwrap(), 0);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn writable_reflects_store_permissions() {
+    #[tokio::test]
+    async fn writable_reflects_store_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
         // First probe creates the (empty) events file.
-        assert!(store.writable(), "a fresh store is writable");
+        assert!(store.writable().await, "a fresh store is writable");
 
         // Make the events file read-only so an append open fails.
         std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
-        let observed = store.writable();
+        let observed = store.writable().await;
         // Restore perms so the tempdir can be cleaned up.
         std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
@@ -201,25 +203,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn high_water_is_scoped_per_stream() {
+    #[tokio::test]
+    async fn high_water_is_scoped_per_stream() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        // Two independent agent streams, each with its own seq line.
-        store.append(&ev(1, "a", "one")).unwrap();
-        store.append(&ev(1, "b", "one")).unwrap();
-        store.append(&ev(2, "a", "two")).unwrap();
-
-        assert_eq!(store.high_water("a").unwrap(), 2);
-        assert_eq!(store.high_water("b").unwrap(), 1);
-        assert_eq!(store.high_water("missing").unwrap(), 0);
+        store.append(&ev(1, "a", "one")).await.unwrap();
+        store.append(&ev(1, "b", "one")).await.unwrap();
+        store.append(&ev(2, "a", "two")).await.unwrap();
+        assert_eq!(store.high_water("a").await.unwrap(), 2);
+        assert_eq!(store.high_water("b").await.unwrap(), 1);
+        assert_eq!(store.high_water("missing").await.unwrap(), 0);
     }
 
-    #[test]
-    fn corrupt_trailing_line_is_tolerated() {
+    #[tokio::test]
+    async fn corrupt_trailing_line_is_tolerated() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        store.append(&ev(1, "a", "good")).unwrap();
+        store.append(&ev(1, "a", "good")).await.unwrap();
         // Simulate a torn write.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -227,41 +227,34 @@ mod tests {
             .unwrap();
         f.write_all(b"{not valid json\n").unwrap();
         drop(f);
-        let events = store.replay("a", 0).unwrap();
+        let events = store.replay("a", 0).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(store.high_water("a").unwrap(), 1);
+        assert_eq!(store.high_water("a").await.unwrap(), 1);
     }
 
     /// The behavioral contract every `Store` must satisfy. Reused by later
     /// backends (sqlite, Postgres) so parity is enforced, not assumed.
-    fn store_conformance(store: &dyn Store) {
-        // Empty store: high-water 0, replay empty, writable.
-        assert_eq!(store.high_water("a").unwrap(), 0);
-        assert!(store.replay("a", 0).unwrap().is_empty());
-        assert!(store.writable());
-
-        // Appends are per-stream ordered and isolated.
-        store.append(&ev(1, "a", "a1")).unwrap();
-        store.append(&ev(1, "b", "b1")).unwrap();
-        store.append(&ev(2, "a", "a2")).unwrap();
-
-        assert_eq!(store.high_water("a").unwrap(), 2);
-        assert_eq!(store.high_water("b").unwrap(), 1);
-
-        let a = store.replay("a", 0).unwrap();
+    async fn store_conformance(store: &dyn Store) {
+        assert_eq!(store.high_water("a").await.unwrap(), 0);
+        assert!(store.replay("a", 0).await.unwrap().is_empty());
+        assert!(store.writable().await);
+        store.append(&ev(1, "a", "a1")).await.unwrap();
+        store.append(&ev(1, "b", "b1")).await.unwrap();
+        store.append(&ev(2, "a", "a2")).await.unwrap();
+        assert_eq!(store.high_water("a").await.unwrap(), 2);
+        assert_eq!(store.high_water("b").await.unwrap(), 1);
+        let a = store.replay("a", 0).await.unwrap();
         assert_eq!(a.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-        // from_seq is inclusive lower bound.
-        let a_from2 = store.replay("a", 2).unwrap();
+        let a_from2 = store.replay("a", 2).await.unwrap();
         assert_eq!(a_from2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
-        // Stream isolation: "b" never sees "a"'s events.
-        let b = store.replay("b", 0).unwrap();
+        let b = store.replay("b", 0).await.unwrap();
         assert_eq!(b.len(), 1);
     }
 
-    #[test]
-    fn jsonl_store_satisfies_conformance() {
+    #[tokio::test]
+    async fn jsonl_store_satisfies_conformance() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        store_conformance(&store);
+        store_conformance(&store).await;
     }
 }
