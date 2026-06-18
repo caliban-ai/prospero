@@ -352,6 +352,142 @@ async fn spawn_multi_script_stream_listener(
     })
 }
 
+/// The behavioral contract every [`crate::store::Store`] must satisfy. Backends
+/// (jsonl, sqlite, Postgres) call this with a freshly-opened, empty store to
+/// prove parity — so a new backend is correct by construction, not by hope.
+pub async fn store_conformance(store: &dyn crate::store::Store) {
+    use crate::event::{EventKind, FleetEvent, OutputStream};
+
+    fn ev(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
+        FleetEvent {
+            seq,
+            ts: "t".into(),
+            repo: "r".into(),
+            agent_id: agent.into(),
+            kind: EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk: chunk.into(),
+            },
+        }
+    }
+
+    assert_eq!(store.high_water("a").await.unwrap(), 0);
+    assert!(store.replay("a", 0).await.unwrap().is_empty());
+    assert!(store.writable().await);
+
+    store.append(&ev(1, "a", "a1")).await.unwrap();
+    store.append(&ev(1, "b", "b1")).await.unwrap();
+    store.append(&ev(2, "a", "a2")).await.unwrap();
+
+    assert_eq!(store.high_water("a").await.unwrap(), 2);
+    assert_eq!(store.high_water("b").await.unwrap(), 1);
+
+    let a = store.replay("a", 0).await.unwrap();
+    assert_eq!(a.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+    let a_from2 = store.replay("a", 2).await.unwrap();
+    assert_eq!(a_from2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+    let b = store.replay("b", 0).await.unwrap();
+    assert_eq!(b.len(), 1);
+}
+
+/// Retention contract: `prune(before_ts)` deletes events with `ts < before_ts`
+/// (RFC-3339, lexically ordered) and returns the count removed, leaving newer
+/// events intact. Backends call this to prove identical retention semantics.
+pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
+    use crate::event::{EventKind, FleetEvent};
+
+    fn ev(seq: u64, ts: &str) -> FleetEvent {
+        FleetEvent {
+            seq,
+            ts: ts.into(),
+            repo: "r".into(),
+            agent_id: "a".into(),
+            kind: EventKind::AgentSpawned,
+        }
+    }
+
+    // Match the production timestamp format (`chrono::Utc::now().to_rfc3339()`
+    // emits `+00:00`, not `Z`); lexical ordering only holds within one offset form.
+    store
+        .append(&ev(1, "2026-01-01T00:00:00+00:00"))
+        .await
+        .unwrap();
+    store
+        .append(&ev(2, "2026-03-01T00:00:00+00:00"))
+        .await
+        .unwrap();
+    store
+        .append(&ev(3, "2026-06-01T00:00:00+00:00"))
+        .await
+        .unwrap();
+
+    let removed = store.prune("2026-03-01T00:00:00+00:00").await.unwrap();
+    assert_eq!(removed, 1);
+
+    let remaining = store.replay("a", 0).await.unwrap();
+    assert_eq!(
+        remaining.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    assert_eq!(store.prune("2026-03-01T00:00:00+00:00").await.unwrap(), 0);
+}
+
+/// Contract every [`crate::config_store::ConfigStore`] must satisfy: upsert is
+/// insert-or-update by name, list returns all repos (name-ordered), delete is
+/// idempotent. Backends call this to prove identical config semantics.
+pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigStore) {
+    use crate::registry::{RegisteredRepo, RepoProviderConfig};
+
+    assert!(store.list_repos().await.unwrap().is_empty());
+
+    let r = RegisteredRepo {
+        name: "p".into(),
+        root: "/r".into(),
+        config: RepoProviderConfig {
+            provider: Some("ollama".into()),
+            ..Default::default()
+        },
+    };
+    store.upsert_repo(&r).await.unwrap();
+    let repos = store.list_repos().await.unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "p");
+    assert_eq!(repos[0].root, std::path::PathBuf::from("/r"));
+    assert_eq!(repos[0].config.provider.as_deref(), Some("ollama"));
+
+    let mut r2 = r.clone();
+    r2.config.provider = Some("anthropic".into());
+    store.upsert_repo(&r2).await.unwrap();
+    let repos = store.list_repos().await.unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].config.provider.as_deref(), Some("anthropic"));
+
+    assert!(store.delete_repo("p").await.unwrap());
+    assert!(!store.delete_repo("p").await.unwrap());
+    assert!(store.list_repos().await.unwrap().is_empty());
+
+    // `list_repos` is name-ordered: insert out of order, expect sorted output.
+    for name in ["z", "a"] {
+        store
+            .upsert_repo(&RegisteredRepo {
+                name: name.into(),
+                root: format!("/{name}").into(),
+                config: RepoProviderConfig::default(),
+            })
+            .await
+            .unwrap();
+    }
+    let names: Vec<String> = store
+        .list_repos()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(names, vec!["a".to_string(), "z".to_string()]);
+}
+
 /// Build a minimal `AgentRecord` for tests.
 pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) -> AgentRecord {
     AgentRecord {

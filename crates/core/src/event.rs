@@ -91,6 +91,20 @@ pub enum EventKind {
     },
 }
 
+/// The ordered stream a `(repo, agent_id)` pair belongs to. Agent events key on
+/// the agent id; repo-level events (no agent) on `repo:<name>`; fleet-level
+/// events (neither) on the singleton `fleet` stream. `seq` is monotonic *within*
+/// the returned key.
+pub fn stream_key_for(repo: &str, agent_id: &str) -> String {
+    if !agent_id.is_empty() {
+        agent_id.to_string()
+    } else if !repo.is_empty() {
+        format!("repo:{repo}")
+    } else {
+        "fleet".to_string()
+    }
+}
+
 /// A normalized, sequenced fleet event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetEvent {
@@ -104,6 +118,13 @@ pub struct FleetEvent {
     pub agent_id: String,
     /// The event payload.
     pub kind: EventKind,
+}
+
+impl FleetEvent {
+    /// The ordered stream this event belongs to (see [`stream_key_for`]).
+    pub fn stream_key(&self) -> String {
+        stream_key_for(&self.repo, &self.agent_id)
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +158,27 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         let back: FleetEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn stream_key_picks_agent_then_repo_then_fleet() {
+        // Agent-level: the agent id is the stream.
+        assert_eq!(stream_key_for("prospero", "a1"), "a1");
+        // Repo-level (no agent): namespaced repo stream.
+        assert_eq!(stream_key_for("prospero", ""), "repo:prospero");
+        // Fleet-level (neither): the singleton fleet stream.
+        assert_eq!(stream_key_for("", ""), "fleet");
+    }
+
+    #[test]
+    fn fleet_event_stream_key_delegates() {
+        let e = FleetEvent {
+            seq: 1,
+            ts: "t".into(),
+            repo: "prospero".into(),
+            agent_id: "".into(),
+            kind: EventKind::AgentGone,
+        };
+        assert_eq!(e.stream_key(), "repo:prospero");
     }
 }

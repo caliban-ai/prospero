@@ -7,21 +7,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{RwLock, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, watch};
 
+use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
 use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
+use crate::config_store::{ConfigStore, SqliteConfigStore};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
+use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
 use crate::store::Store;
 
@@ -81,7 +83,7 @@ impl SpawnRequest {
 pub struct FleetConfig {
     /// Host identity (single host in the first stab).
     pub host: String,
-    /// Directory for the registry file and event store.
+    /// Directory for the config store and event store (both in `events.db`).
     pub data_dir: PathBuf,
     /// How often the poll loop refreshes each repo.
     pub poll_interval: Duration,
@@ -160,24 +162,22 @@ impl FleetConfig {
             attach_backoff: AttachBackoff::default(),
         }
     }
-
-    fn registry_path(&self) -> PathBuf {
-        self.data_dir.join("registry.json")
-    }
 }
 
 /// Stamps and dispatches events; cheaply cloneable into background tasks.
 #[derive(Clone)]
 struct Emitter {
     store: Arc<dyn Store>,
-    bus: broadcast::Sender<FleetEvent>,
-    seq: Arc<AtomicU64>,
+    bus: Arc<dyn EventBus>,
+    /// Next `seq` per stream key, seeded lazily from the store's high-water.
+    seqs: Arc<AsyncMutex<HashMap<String, u64>>>,
     metrics: Arc<Metrics>,
 }
 
 impl Emitter {
-    fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+    async fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
+        let stream_key = crate::event::stream_key_for(repo, agent_id);
+        let seq = self.next_seq(&stream_key).await;
         FleetEvent {
             seq,
             ts: chrono::Utc::now().to_rfc3339(),
@@ -187,10 +187,45 @@ impl Emitter {
         }
     }
 
-    fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
-        let event = self.next_event(repo, agent_id, kind);
+    /// Allocate the next per-stream `seq`. The durable `high_water` read on a
+    /// stream's first event happens WITHOUT holding the `seqs` lock, so the lock
+    /// is never held across `.await` (no executor stall / cross-stream serialize).
+    async fn next_seq(&self, stream_key: &str) -> u64 {
+        // Fast path: counter already seeded for this stream this run.
+        {
+            let mut seqs = self.seqs.lock().await;
+            if let Some(n) = seqs.get(stream_key) {
+                let next = n + 1;
+                seqs.insert(stream_key.to_string(), next);
+                return next;
+            }
+        }
+        // Slow path: first event this run — read durable high-water unlocked.
+        let seeded = self.store.high_water(stream_key).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "prospero_fleet", stream = %stream_key, error = %e,
+                "high_water read failed seeding per-stream seq; starting at 0"
+            );
+            0
+        });
+        // Invariant: `emit` records the seq in `seqs` (here) BEFORE it calls
+        // `store.append`, so a concurrent task that read a stale `high_water`
+        // during the append window still sees the up-to-date counter on its
+        // re-check below — keeping `seq` unique and monotonic per stream.
+        let mut seqs = self.seqs.lock().await;
+        // Re-check: a concurrent task may have seeded while we read high_water.
+        let next = match seqs.get(stream_key) {
+            Some(n) => n + 1,
+            None => seeded + 1,
+        };
+        seqs.insert(stream_key.to_string(), next);
+        next
+    }
+
+    async fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
+        let event = self.next_event(repo, agent_id, kind).await;
         let lost_seq = event.seq;
-        let append_err = match self.store.append(&event) {
+        let append_err = match self.store.append(&event).await {
             Ok(()) => {
                 self.metrics.record_append_ok();
                 None
@@ -202,10 +237,10 @@ impl Emitter {
         };
         // Live SSE flows regardless of persistence (ADR-0004 favors a never-down
         // fleet view). Ignore send errors: no subscribers is fine.
-        let _ = self.bus.send(event);
+        self.bus.publish(event);
         if let Some(e) = append_err {
             tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist event");
-            self.emit_persist_gap(repo, agent_id, lost_seq, e);
+            self.emit_persist_gap(repo, agent_id, lost_seq, e).await;
         }
     }
 
@@ -214,16 +249,18 @@ impl Emitter {
     /// marker — persisted best-effort so a history reader sees the gap, and sent
     /// on the bus so live consumers know history is incomplete. The marker keeps
     /// the live and durable views from silently diverging (#25, ADR-0004).
-    fn emit_persist_gap(&self, repo: &str, agent_id: &str, lost_seq: u64, err: CoreError) {
-        let marker = self.next_event(
-            repo,
-            agent_id,
-            EventKind::StorePersistFailed {
-                lost_seq,
-                detail: err.to_string(),
-            },
-        );
-        match self.store.append(&marker) {
+    async fn emit_persist_gap(&self, repo: &str, agent_id: &str, lost_seq: u64, err: CoreError) {
+        let marker = self
+            .next_event(
+                repo,
+                agent_id,
+                EventKind::StorePersistFailed {
+                    lost_seq,
+                    detail: err.to_string(),
+                },
+            )
+            .await;
+        match self.store.append(&marker).await {
             Ok(()) => self.metrics.record_append_ok(),
             Err(e) => {
                 // Hard-down store: the gap is now observable only via logs
@@ -232,7 +269,7 @@ impl Emitter {
                 tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist store-gap marker");
             }
         }
-        let _ = self.bus.send(marker);
+        self.bus.publish(marker);
     }
 }
 
@@ -240,11 +277,13 @@ struct Inner {
     config: FleetConfig,
     snapshot: RwLock<FleetSnapshot>,
     registry: RwLock<Registry>,
+    config_store: Arc<dyn ConfigStore>,
     /// Per-repo control clients, cached after first discovery.
     clients: Mutex<HashMap<String, CalibandClient>>,
     /// Agent ids with a running attach task.
     attached: Mutex<HashSet<String>>,
     emitter: Emitter,
+    ownership: Arc<dyn Ownership>,
     /// Broadcast shutdown signal: `true` once a graceful drain has begun. The
     /// poll loop and attach tasks subscribe and stop cooperatively.
     shutdown: watch::Sender<bool>,
@@ -257,16 +296,29 @@ pub struct FleetManager {
 }
 
 impl FleetManager {
-    /// Build a manager, loading the persisted registry and seeding the event
-    /// sequence from the store's high-water mark.
-    pub fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
-        let registry = Registry::load(&config.registry_path())?;
-        let high_water = store.high_water()?;
-        let (bus, _) = broadcast::channel(config.event_buffer);
+    /// Build a manager, loading the persisted registry from a default
+    /// [`SqliteConfigStore`] in `config.data_dir` (the same dir as the event
+    /// store). For an injected config backend (e.g. Postgres), use
+    /// [`Self::with_config_store`].
+    pub async fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
+        let config_store = Arc::new(SqliteConfigStore::open(&config.data_dir).await?);
+        Self::with_config_store(config, store, config_store).await
+    }
+
+    /// Build a manager with an explicit [`ConfigStore`].
+    pub async fn with_config_store(
+        config: FleetConfig,
+        store: Arc<dyn Store>,
+        config_store: Arc<dyn ConfigStore>,
+    ) -> Result<Self> {
+        let registry = Registry {
+            repos: config_store.list_repos().await?,
+        };
+        let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
         let emitter = Emitter {
             store,
             bus,
-            seq: Arc::new(AtomicU64::new(high_water)),
+            seqs: Arc::new(AsyncMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         };
         let snapshot = FleetSnapshot {
@@ -287,9 +339,11 @@ impl FleetManager {
                 config,
                 snapshot: RwLock::new(snapshot),
                 registry: RwLock::new(registry),
+                config_store,
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
                 emitter,
+                ownership: Arc::new(SelfOwnsAll),
                 shutdown: watch::channel(false).0,
             }),
         })
@@ -325,7 +379,7 @@ impl FleetManager {
     /// per-repo health. Used by the `/readyz` endpoint to distinguish liveness
     /// from readiness.
     pub async fn readiness(&self) -> crate::model::Readiness {
-        let store_writable = self.inner.emitter.store.writable();
+        let store_writable = self.inner.emitter.store.writable().await;
         let snap = self.inner.snapshot.read().await;
         let repos_total = snap.repos.len();
         let repos_healthy = snap
@@ -342,9 +396,20 @@ impl FleetManager {
         }
     }
 
-    /// Replay an agent's history from the store, with `seq >= from_seq`.
-    pub fn history(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-        self.inner.emitter.store.replay(agent_id, from_seq)
+    /// Replay a stream's history from the store, with `seq >= from_seq`. Callers
+    /// watching a single agent pass the agent id, which is that agent's stream
+    /// key (see [`crate::event::stream_key_for`]); repo/fleet-level history uses
+    /// the `repo:<name>` / `fleet` keys.
+    pub async fn history(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+        self.inner.emitter.store.replay(stream_key, from_seq).await
+    }
+
+    /// Delete persisted events older than `max_age`. Returns the count removed.
+    /// Backs the daemon's age-based retention loop (#4).
+    pub async fn prune_older_than(&self, max_age: std::time::Duration) -> Result<u64> {
+        let max = chrono::Duration::from_std(max_age).unwrap_or_else(|_| chrono::Duration::zero());
+        let before = (chrono::Utc::now() - max).to_rfc3339();
+        self.inner.emitter.store.prune(&before).await
     }
 
     /// Register a repo and persist the registry. Triggers an immediate poll.
@@ -362,12 +427,15 @@ impl FleetManager {
     ) -> Result<()> {
         let name = name.into();
         let root = root.into();
-        {
+        let repo = {
             let mut reg = self.inner.registry.write().await;
             reg.add(name.clone(), root.clone())?;
             reg.set_config(&name, config);
-            reg.save(&self.inner.config.registry_path())?;
-        }
+            reg.get(&name)
+                .cloned()
+                .expect("repo just inserted must exist")
+        };
+        self.inner.config_store.upsert_repo(&repo).await?;
         {
             let mut snap = self.inner.snapshot.write().await;
             if !snap.repos.iter().any(|r| r.name == name) {
@@ -397,13 +465,11 @@ impl FleetManager {
     pub async fn remove_repo(&self, name: &str) -> Result<bool> {
         let removed = {
             let mut reg = self.inner.registry.write().await;
-            let removed = reg.remove(name);
-            if removed {
-                reg.save(&self.inner.config.registry_path())?;
-            }
-            removed
+            reg.remove(name)
         };
         if removed {
+            // Persist the removal first; only prune derived state once durable.
+            self.inner.config_store.delete_repo(name).await?;
             self.inner
                 .snapshot
                 .write()
@@ -438,11 +504,16 @@ impl FleetManager {
         repo: &str,
         config: crate::registry::RepoProviderConfig,
     ) -> Result<()> {
-        let mut reg = self.inner.registry.write().await;
-        if !reg.set_config(repo, config) {
-            return Err(CoreError::RepoNotFound(repo.to_string()));
-        }
-        reg.save(&self.inner.config.registry_path())?;
+        let record = {
+            let mut reg = self.inner.registry.write().await;
+            if !reg.set_config(repo, config) {
+                return Err(CoreError::RepoNotFound(repo.to_string()));
+            }
+            reg.get(repo)
+                .cloned()
+                .expect("repo exists after successful set_config")
+        };
+        self.inner.config_store.upsert_repo(&record).await?;
         Ok(())
     }
 
@@ -496,7 +567,10 @@ impl FleetManager {
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
         let (id, _socket) = client.spawn(spec).await?;
-        self.inner.emitter.emit(repo, &id, EventKind::AgentSpawned);
+        self.inner
+            .emitter
+            .emit(repo, &id, EventKind::AgentSpawned)
+            .await;
         self.start_attach(repo, &id, client).await;
         Ok(id)
     }
@@ -612,7 +686,8 @@ impl FleetManager {
                 drop(snap);
                 self.inner
                     .emitter
-                    .emit(repo, "", EventKind::RepoHealth { state: new_health });
+                    .emit(repo, "", EventKind::RepoHealth { state: new_health })
+                    .await;
             }
         }
     }
@@ -649,18 +724,22 @@ impl FleetManager {
                 None if !attached_now.contains(&rec.id) => {
                     self.inner
                         .emitter
-                        .emit(repo, &rec.id, EventKind::AgentDiscovered);
+                        .emit(repo, &rec.id, EventKind::AgentDiscovered)
+                        .await;
                 }
                 None => {}
                 Some(&old) if old != rec.status => {
-                    self.inner.emitter.emit(
-                        repo,
-                        &rec.id,
-                        EventKind::StatusChanged {
-                            from: old,
-                            to: rec.status,
-                        },
-                    );
+                    self.inner
+                        .emitter
+                        .emit(
+                            repo,
+                            &rec.id,
+                            EventKind::StatusChanged {
+                                from: old,
+                                to: rec.status,
+                            },
+                        )
+                        .await;
                 }
                 _ => {}
             }
@@ -673,7 +752,10 @@ impl FleetManager {
         // Agents that disappeared from caliban's registry.
         for (old_id, _) in prior.iter() {
             if !records.iter().any(|r| &r.id == old_id) {
-                self.inner.emitter.emit(repo, old_id, EventKind::AgentGone);
+                self.inner
+                    .emitter
+                    .emit(repo, old_id, EventKind::AgentGone)
+                    .await;
             }
         }
 
@@ -685,13 +767,16 @@ impl FleetManager {
                 r.agents = new_agents;
                 if was_unreachable {
                     drop(snap);
-                    self.inner.emitter.emit(
-                        repo,
-                        "",
-                        EventKind::RepoHealth {
-                            state: RepoHealth::Healthy,
-                        },
-                    );
+                    self.inner
+                        .emitter
+                        .emit(
+                            repo,
+                            "",
+                            EventKind::RepoHealth {
+                                state: RepoHealth::Healthy,
+                            },
+                        )
+                        .await;
                 }
             }
         }
@@ -705,9 +790,24 @@ impl FleetManager {
     /// reads the agent's stream, normalizes frames into events, and exits when
     /// the stream closes.
     async fn start_attach(&self, repo: &str, agent_id: &str, client: CalibandClient) {
+        // Only drive an agent this process owns. Standalone always acquires;
+        // clustered consults the lease (Phase 2).
+        //
+        // Phase 2 note: the returned Lease is intentionally dropped here because
+        // SelfOwnsAll needs no renewal. A real LeasedOwnership will instead need
+        // the spawned attach task to hold the Lease and renew it periodically,
+        // which means threading the Lease into the task rather than only gating on it.
+        if self.inner.ownership.try_acquire(agent_id).is_none() {
+            return;
+        }
         {
             let mut attached = self.inner.attached.lock().unwrap();
             if !attached.insert(agent_id.to_string()) {
+                // SelfOwnsAll: release is a no-op. Phase 2 note: a real
+                // LeasedOwnership must NOT blindly release here — the already-running
+                // attach task still holds this stream's lease. Make try_acquire
+                // idempotent (return the live lease) rather than releasing it.
+                self.inner.ownership.release(agent_id);
                 return; // already attached
             }
         }
@@ -738,12 +838,18 @@ impl FleetManager {
                 );
             }
             attached.attached.lock().unwrap().remove(&agent_id);
+            attached.ownership.release(&agent_id);
         });
     }
 
     /// Names of repos with a cached control client (test/observability helper).
     pub async fn cached_client_names(&self) -> Vec<String> {
         self.inner.clients.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Whether a per-agent attach task is currently registered (test/obs helper).
+    pub fn is_attached(&self, agent_id: &str) -> bool {
+        self.inner.attached.lock().unwrap().contains(agent_id)
     }
 
     /// Gracefully shut down a repo's caliband daemon and drop its cached client
@@ -956,7 +1062,7 @@ async fn attach_once(
                 if matches!(kind, EventKind::AgentFinished { .. }) {
                     saw_terminal = true;
                 }
-                emitter.emit(repo, agent_id, kind);
+                emitter.emit(repo, agent_id, kind).await;
             }
             Normalized::Dropped => {}
             Normalized::Unknown => {
@@ -1012,7 +1118,7 @@ mod tests {
 
         let fake = FakeCaliband::start_at(&socket).await.unwrap();
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("p", &root).await.unwrap();
 
         mgr.poll_repo_once("p").await; // cache a client by talking to the repo
@@ -1052,7 +1158,7 @@ mod tests {
         fake.add_agent(idle, vec![]).await;
 
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("repo", &root).await.unwrap();
         mgr.poll_repo_once("repo").await;
 
@@ -1078,6 +1184,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ownership_gates_the_attach_path() {
+        // A FleetManager built with SelfOwnsAll attaches normally: spawning an
+        // agent records it in the attached set (ownership never refuses).
+        use crate::testkit::FakeCaliband;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+        let _fake = FakeCaliband::start_at(&socket).await.unwrap();
+
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).await.unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+
+        let id = mgr.spawn_agent("p", SpawnRequest::new("hi")).await.unwrap();
+        // is_attached is set synchronously in start_attach before tokio::spawn,
+        // so the check needs no delay.
+        assert!(mgr.is_attached(&id), "owned agent must be attached");
+    }
+
+    #[tokio::test]
     async fn spawn_passes_repo_provider_into_spawnspec() {
         use crate::registry::RepoProviderConfig;
         use crate::testkit::FakeCaliband;
@@ -1092,7 +1223,7 @@ mod tests {
 
         let fake = FakeCaliband::start_at(&socket).await.unwrap();
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("p", &root).await.unwrap();
         mgr.set_repo_config_registry_only(
             "p",
@@ -1122,7 +1253,7 @@ mod tests {
         let mut config = FleetConfig::new("local", dir.path());
         config.default_env.insert("KEEP".into(), "global".into());
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
 
         mgr.add_repo("p", "/tmp/p").await.ok(); // discovery may fail; the registry write is what matters
         let cfg = RepoProviderConfig {
@@ -1159,36 +1290,99 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl Store for FlakyStore {
-        fn append(&self, event: &FleetEvent) -> Result<()> {
+        async fn append(&self, event: &FleetEvent) -> Result<()> {
             if self.fail_seqs.lock().unwrap().contains(&event.seq) {
                 return Err(CoreError::Store("injected append failure".into()));
             }
-            self.inner.append(event)
+            self.inner.append(event).await
         }
-        fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-            self.inner.replay(agent_id, from_seq)
+        async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+            self.inner.replay(stream_key, from_seq).await
         }
-        fn high_water(&self) -> Result<u64> {
-            self.inner.high_water()
+        async fn high_water(&self, stream_key: &str) -> Result<u64> {
+            self.inner.high_water(stream_key).await
         }
-        fn writable(&self) -> bool {
-            self.inner.writable()
+        async fn writable(&self) -> bool {
+            self.inner.writable().await
+        }
+        async fn prune(&self, before_ts: &str) -> Result<u64> {
+            self.inner.prune(before_ts).await
         }
     }
 
     fn emitter_with(store: Arc<dyn Store>) -> Emitter {
-        let (bus, _keep) = broadcast::channel(16);
         Emitter {
             store,
-            bus,
-            seq: Arc::new(AtomicU64::new(0)),
+            bus: Arc::new(InProcessBus::new(16)),
+            seqs: Arc::new(AsyncMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         }
     }
 
-    #[test]
-    fn append_failure_emits_persist_gap_marker_visible_to_history() {
+    fn ev(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
+        use crate::event::OutputStream;
+        FleetEvent {
+            seq,
+            ts: "t".into(),
+            repo: "r".into(),
+            agent_id: agent.into(),
+            kind: EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk: chunk.into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn seq_is_monotonic_per_stream_not_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+
+        // Interleave two agents; each stream numbers from 1 independently.
+        emitter.emit("r", "a1", EventKind::AgentSpawned).await;
+        emitter.emit("r", "a2", EventKind::AgentSpawned).await;
+        emitter.emit("r", "a1", EventKind::AgentGone).await;
+
+        let a1 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
+            .unwrap();
+        let a2 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a2"), 0)
+            .await
+            .unwrap();
+        assert_eq!(a1.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(a2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn seq_resumes_per_stream_from_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-seed the store: stream "a1" already reached seq 5.
+        {
+            let store = crate::store::JsonlStore::open(dir.path()).unwrap();
+            store.append(&ev(5, "a1", "old")).await.unwrap();
+        }
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+        emitter.emit("r", "a1", EventKind::AgentGone).await;
+
+        let a1 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
+            .unwrap();
+        // The new event continues from the stored high-water (5 → 6).
+        assert_eq!(a1.last().unwrap().seq, 6);
+    }
+
+    #[tokio::test]
+    async fn append_failure_emits_persist_gap_marker_visible_to_history() {
         use crate::event::OutputStream;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1197,14 +1391,16 @@ mod tests {
         let emitter = emitter_with(store.clone());
         let mut rx = emitter.bus.subscribe();
 
-        emitter.emit(
-            "repo",
-            "a1",
-            EventKind::Output {
-                stream: OutputStream::Stdout,
-                chunk: "lost".into(),
-            },
-        );
+        emitter
+            .emit(
+                "repo",
+                "a1",
+                EventKind::Output {
+                    stream: OutputStream::Stdout,
+                    chunk: "lost".into(),
+                },
+            )
+            .await;
 
         // Live SSE still flows (ADR-0004): the original event reaches the bus...
         let ev = rx.try_recv().unwrap();
@@ -1220,7 +1416,7 @@ mod tests {
 
         // The marker is visible to a history reader (persisted), not just logs,
         // and the lost event itself is absent — the gap is real but now labeled.
-        let history = store.replay("a1", 0).unwrap();
+        let history = store.replay("a1", 0).await.unwrap();
         assert!(
             history
                 .iter()
@@ -1233,14 +1429,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn healthy_append_emits_no_gap_marker() {
+    #[tokio::test]
+    async fn healthy_append_emits_no_gap_marker() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let emitter = emitter_with(store);
         let mut rx = emitter.bus.subscribe();
 
-        emitter.emit("repo", "a1", EventKind::AgentSpawned);
+        emitter.emit("repo", "a1", EventKind::AgentSpawned).await;
 
         let ev = rx.try_recv().unwrap();
         assert!(matches!(ev.kind, EventKind::AgentSpawned));
@@ -1250,15 +1446,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_failure_and_success_advance_metrics() {
+    #[tokio::test]
+    async fn append_failure_and_success_advance_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let inner = crate::store::JsonlStore::open(dir.path()).unwrap();
         // Fail the data event (seq 1); the gap marker (seq 2) appends fine.
         let store = Arc::new(FlakyStore::new(inner, [1]));
         let emitter = emitter_with(store);
 
-        emitter.emit("repo", "a1", EventKind::AgentSpawned);
+        emitter.emit("repo", "a1", EventKind::AgentSpawned).await;
 
         let m = emitter.metrics.snapshot(0);
         assert_eq!(m.append_failures, 1, "the failed append must be counted");
@@ -1274,7 +1470,7 @@ mod tests {
         let mut config = FleetConfig::new("local", dir.path());
         config.poll_interval = Duration::from_millis(50);
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
 
         let signaller = mgr.clone();
         let handle = tokio::spawn(mgr.run());
@@ -1286,5 +1482,63 @@ mod tests {
             .await
             .expect("run() must return after begin_shutdown")
             .expect("run task panicked");
+    }
+
+    #[tokio::test]
+    async fn prune_older_than_removes_aged_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        store
+            .append(&FleetEvent {
+                seq: 1,
+                ts: "2000-01-01T00:00:00+00:00".into(),
+                repo: "r".into(),
+                agent_id: "a".into(),
+                kind: EventKind::AgentSpawned,
+            })
+            .await
+            .unwrap();
+        store
+            .append(&FleetEvent {
+                seq: 2,
+                ts: chrono::Utc::now().to_rfc3339(),
+                repo: "r".into(),
+                agent_id: "a".into(),
+                kind: EventKind::AgentGone,
+            })
+            .await
+            .unwrap();
+
+        let config = FleetConfig::new("local", dir.path());
+        let mgr = FleetManager::new(config, store).await.unwrap();
+
+        let removed = mgr
+            .prune_older_than(std::time::Duration::from_secs(24 * 3600))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(mgr.history("a", 0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_seed_of_same_stream_assigns_unique_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+        // Two tasks race the slow-path seed for the same new stream "a1".
+        let e1 = emitter.clone();
+        let e2 = emitter.clone();
+        let t1 = tokio::spawn(async move { e1.emit("r", "a1", EventKind::AgentSpawned).await });
+        let t2 = tokio::spawn(async move { e2.emit("r", "a1", EventKind::AgentGone).await });
+        t1.await.unwrap();
+        t2.await.unwrap();
+        let a1 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
+            .unwrap();
+        let seqs: Vec<u64> = a1.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs.len(), 2, "both events persisted");
+        assert_ne!(seqs[0], seqs[1], "no duplicate seq within a stream");
     }
 }

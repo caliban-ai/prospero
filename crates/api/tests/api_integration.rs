@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -21,18 +22,22 @@ use tower::ServiceExt;
 /// readiness endpoint's degraded (503) path.
 struct UnwritableStore(JsonlStore);
 
+#[async_trait]
 impl Store for UnwritableStore {
-    fn append(&self, event: &FleetEvent) -> Result<()> {
-        self.0.append(event)
+    async fn append(&self, event: &FleetEvent) -> Result<()> {
+        self.0.append(event).await
     }
-    fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-        self.0.replay(agent_id, from_seq)
+    async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+        self.0.replay(stream_key, from_seq).await
     }
-    fn high_water(&self) -> Result<u64> {
-        self.0.high_water()
+    async fn high_water(&self, stream_key: &str) -> Result<u64> {
+        self.0.high_water(stream_key).await
     }
-    fn writable(&self) -> bool {
+    async fn writable(&self) -> bool {
         false
+    }
+    async fn prune(&self, before_ts: &str) -> Result<u64> {
+        self.0.prune(before_ts).await
     }
 }
 
@@ -68,7 +73,7 @@ async fn setup() -> Harness {
     config.poll_interval = Duration::from_millis(20);
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     manager.add_repo("repo", repo_root).await.unwrap();
 
     Harness {
@@ -163,7 +168,7 @@ async fn readyz_returns_503_when_store_unwritable() {
     let data_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(UnwritableStore(JsonlStore::open(data_dir.path()).unwrap()));
     let config = FleetConfig::new("test-host", data_dir.path());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     let app = router(manager);
 
     let resp = app
@@ -420,7 +425,7 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
     };
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     let app = router(manager);
 
     // POST /api/repos with a config object.

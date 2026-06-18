@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::Parser;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig};
 use prospero_core::fleet::{FleetConfig, FleetManager};
-use prospero_core::store::JsonlStore;
+use prospero_core::sqlite_store::SqliteStore;
 
 /// Prospero control-plane daemon.
 #[derive(Debug, Parser)]
@@ -45,6 +45,10 @@ struct Args {
     /// Default env var applied under every repo's resolved config (repeatable).
     #[arg(long = "default-env", value_parser = parse_key_val)]
     default_env: Vec<(String, String)>,
+
+    /// Delete events older than this many days on an hourly loop. 0 disables.
+    #[arg(long, default_value_t = 0)]
+    retention_days: u64,
 }
 
 /// Parse a `KEY=VALUE` pair (value may contain further `=`).
@@ -89,11 +93,37 @@ async fn main() -> anyhow::Result<()> {
     };
     config.default_env = args.default_env.iter().cloned().collect();
 
-    let store = Arc::new(JsonlStore::open(&data_dir).with_context(|| "opening event store")?);
-    let manager = FleetManager::new(config, store).with_context(|| "building fleet manager")?;
+    let store = Arc::new(
+        SqliteStore::open(&data_dir)
+            .await
+            .with_context(|| "opening event store")?,
+    );
+    let manager = FleetManager::new(config, store)
+        .await
+        .with_context(|| "building fleet manager")?;
 
     // Background poll loop.
     let poll_handle = tokio::spawn(manager.clone().run());
+
+    if args.retention_days > 0 {
+        let m = manager.clone();
+        let max_age = Duration::from_secs(args.retention_days * 24 * 3600);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match m.prune_older_than(max_age).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(target: "prosperod", pruned = n, "retention swept old events")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(target: "prosperod", error = %e, "retention prune failed")
+                    }
+                }
+            }
+        });
+    }
 
     let app = prospero_api::router(manager.clone());
     let listener = tokio::net::TcpListener::bind(args.addr)
