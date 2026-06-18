@@ -1,5 +1,5 @@
 //! Server-Sent Events: replay an agent's history from the store, then tail the
-//! live broadcast bus — joined on the monotonic `seq` with no gap or dup.
+//! live event bus — joined on the monotonic `seq` with no gap or dup.
 //!
 //! The stream closes right after the agent's terminal `AgentFinished` event, so
 //! `prospero follow` behaves like `tail` of a finite run and the dashboard
@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use prospero_core::FleetEvent;
 use prospero_core::event::EventKind;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::AppState;
 use crate::dto::FromSeq;
@@ -27,7 +27,7 @@ pub async fn agent_stream(
     Query(q): Query<FromSeq>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Subscribe BEFORE reading history so no live event is missed in the gap.
-    let mut rx = st.manager.subscribe();
+    let mut sub = st.manager.subscribe(&id);
     let history = st.manager.history(&id, q.from).await.unwrap_or_default();
 
     let body = stream! {
@@ -54,7 +54,7 @@ pub async fn agent_stream(
         //    the durable store, rather than silently skipping them.
         let mut tailer = Tailer::new(id, last_delivered, st.manager.clone());
         loop {
-            match tailer.on_recv(rx.recv().await).await {
+            match tailer.on_recv(sub.next().await).await {
                 Step::Emit(frames) => {
                     for f in frames {
                         yield Ok(frame_to_event(&f));

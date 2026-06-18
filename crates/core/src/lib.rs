@@ -25,7 +25,7 @@ pub mod store;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
-pub use bus::{EventBus, InProcessBus};
+pub use bus::{BusEvent, BusSubscription, EventBus, InProcessBus};
 pub use caliband::wire::AttachInbound;
 pub use config_store::{ConfigStore, SqliteConfigStore};
 pub use error::{CoreError, Result};

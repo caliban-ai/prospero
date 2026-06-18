@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
 use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
@@ -358,9 +358,11 @@ impl FleetManager {
         self.inner.shutdown.send_replace(true);
     }
 
-    /// Subscribe to the live event bus.
-    pub fn subscribe(&self) -> broadcast::Receiver<FleetEvent> {
-        self.inner.emitter.bus.subscribe()
+    /// Subscribe to one stream's live event tail (see [`crate::EventBus`]).
+    /// Watchers of a single agent pass the agent id (its stream key); repo/fleet
+    /// watchers pass `repo:<name>` / `fleet`.
+    pub fn subscribe(&self, stream_key: &str) -> crate::bus::BusSubscription {
+        self.inner.emitter.bus.subscribe(stream_key)
     }
 
     /// A clone of the current fleet snapshot.
@@ -1389,7 +1391,10 @@ mod tests {
         let inner = crate::store::JsonlStore::open(dir.path()).unwrap();
         let store = Arc::new(FlakyStore::new(inner, [1])); // fail the data event (seq 1)
         let emitter = emitter_with(store.clone());
-        let mut rx = emitter.bus.subscribe();
+        use tokio_stream::StreamExt;
+        let mut sub = emitter
+            .bus
+            .subscribe(&crate::event::stream_key_for("repo", "a1"));
 
         emitter
             .emit(
@@ -1403,11 +1408,17 @@ mod tests {
             .await;
 
         // Live SSE still flows (ADR-0004): the original event reaches the bus...
-        let ev = rx.try_recv().unwrap();
+        let ev = match sub.next().await {
+            Some(crate::bus::BusEvent::Event(ev)) => ev,
+            other => panic!("expected a live event, got {other:?}"),
+        };
         assert_eq!(ev.seq, 1);
         assert!(matches!(ev.kind, EventKind::Output { .. }));
         // ...immediately followed by a durable-gap marker naming the lost seq.
-        let marker = rx.try_recv().unwrap();
+        let marker = match sub.next().await {
+            Some(crate::bus::BusEvent::Event(ev)) => ev,
+            other => panic!("expected a live event, got {other:?}"),
+        };
         assert_eq!(marker.agent_id, "a1");
         assert!(matches!(
             marker.kind,
@@ -1434,14 +1445,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let emitter = emitter_with(store);
-        let mut rx = emitter.bus.subscribe();
+        use tokio_stream::StreamExt;
+        let mut sub = emitter
+            .bus
+            .subscribe(&crate::event::stream_key_for("repo", "a1"));
 
         emitter.emit("repo", "a1", EventKind::AgentSpawned).await;
 
-        let ev = rx.try_recv().unwrap();
+        let ev = match sub.next().await {
+            Some(crate::bus::BusEvent::Event(ev)) => ev,
+            other => panic!("expected a live event, got {other:?}"),
+        };
         assert!(matches!(ev.kind, EventKind::AgentSpawned));
+        // A healthy append must not emit a gap marker: nothing more arrives.
         assert!(
-            rx.try_recv().is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(100), sub.next())
+                .await
+                .is_err(),
             "a healthy append must not emit a gap marker"
         );
     }
