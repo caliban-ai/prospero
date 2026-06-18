@@ -31,6 +31,22 @@ jobs:
     outputs:
       code: ${{ steps.changes.outputs.code }}
 
+    # Postgres backend tests (PostgresStore/PostgresConfigStore) are gated on
+    # DATABASE_URL; this service makes them actually run in CI.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: prospero_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -79,6 +95,8 @@ jobs:
 
       - name: cargo test
         if: steps.changes.outputs.code == 'true'
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/prospero_test
         run: cargo test --workspace $TESTKIT
 
       - name: Docs-only change — Rust CI skipped
@@ -93,6 +111,22 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+
+    # Same Postgres service as `check`: the coverage run executes the tests under
+    # llvm-cov, so the gated Postgres tests must run here too or coverage drops.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: prospero_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout
@@ -119,6 +153,8 @@ jobs:
       # failing run (via !cancelled()).
       - name: Run coverage gate
         if: needs.check.outputs.code == 'true'
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/prospero_test
         run: scripts/coverage.sh
       - name: Render coverage report
         if: ${{ !cancelled() && needs.check.outputs.code == 'true' }}

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
 use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
@@ -305,16 +305,31 @@ impl FleetManager {
         Self::with_config_store(config, store, config_store).await
     }
 
-    /// Build a manager with an explicit [`ConfigStore`].
+    /// Build a manager with an explicit [`ConfigStore`] and the standalone
+    /// `EventBus`/`Ownership` seams.
     pub async fn with_config_store(
         config: FleetConfig,
         store: Arc<dyn Store>,
         config_store: Arc<dyn ConfigStore>,
     ) -> Result<Self> {
+        let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
+        let ownership: Arc<dyn Ownership> = Arc::new(SelfOwnsAll);
+        Self::with_seams(config, store, config_store, bus, ownership).await
+    }
+
+    /// Build a manager with every topology seam injected. Standalone passes
+    /// `InProcessBus` + `SelfOwnsAll`; clustered (Phase 2d) passes
+    /// `DistributedBus` + `LeasedOwnership`.
+    pub async fn with_seams(
+        config: FleetConfig,
+        store: Arc<dyn Store>,
+        config_store: Arc<dyn ConfigStore>,
+        bus: Arc<dyn EventBus>,
+        ownership: Arc<dyn Ownership>,
+    ) -> Result<Self> {
         let registry = Registry {
             repos: config_store.list_repos().await?,
         };
-        let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
         let emitter = Emitter {
             store,
             bus,
@@ -343,7 +358,7 @@ impl FleetManager {
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
                 emitter,
-                ownership: Arc::new(SelfOwnsAll),
+                ownership,
                 shutdown: watch::channel(false).0,
             }),
         })
@@ -358,9 +373,11 @@ impl FleetManager {
         self.inner.shutdown.send_replace(true);
     }
 
-    /// Subscribe to the live event bus.
-    pub fn subscribe(&self) -> broadcast::Receiver<FleetEvent> {
-        self.inner.emitter.bus.subscribe()
+    /// Subscribe to one stream's live event tail (see [`crate::EventBus`]).
+    /// Watchers of a single agent pass the agent id (its stream key); repo/fleet
+    /// watchers pass `repo:<name>` / `fleet`.
+    pub fn subscribe(&self, stream_key: &str) -> crate::bus::BusSubscription {
+        self.inner.emitter.bus.subscribe(stream_key)
     }
 
     /// A clone of the current fleet snapshot.
@@ -790,25 +807,24 @@ impl FleetManager {
     /// reads the agent's stream, normalizes frames into events, and exits when
     /// the stream closes.
     async fn start_attach(&self, repo: &str, agent_id: &str, client: CalibandClient) {
-        // Only drive an agent this process owns. Standalone always acquires;
-        // clustered consults the lease (Phase 2).
-        //
-        // Phase 2 note: the returned Lease is intentionally dropped here because
-        // SelfOwnsAll needs no renewal. A real LeasedOwnership will instead need
-        // the spawned attach task to hold the Lease and renew it periodically,
-        // which means threading the Lease into the task rather than only gating on it.
-        if self.inner.ownership.try_acquire(agent_id).is_none() {
+        // Already driving this agent locally? Its attach task holds (and, in
+        // clustered mode, heartbeats) the lease — leave it untouched.
+        if self.inner.attached.lock().unwrap().contains(agent_id) {
+            return;
+        }
+        // Claim the stream. Standalone always acquires; clustered consults the
+        // Postgres lease and returns `None` if another live replica owns it.
+        // `try_acquire` is idempotent for a stream THIS process already holds.
+        if self.inner.ownership.try_acquire(agent_id).await.is_none() {
             return;
         }
         {
             let mut attached = self.inner.attached.lock().unwrap();
             if !attached.insert(agent_id.to_string()) {
-                // SelfOwnsAll: release is a no-op. Phase 2 note: a real
-                // LeasedOwnership must NOT blindly release here — the already-running
-                // attach task still holds this stream's lease. Make try_acquire
-                // idempotent (return the live lease) rather than releasing it.
-                self.inner.ownership.release(agent_id);
-                return; // already attached
+                // Lost a race to another start_attach for the same agent. It now
+                // owns the (idempotently-shared) lease and will release it on
+                // exit — we must NOT release here or we would orphan its writer.
+                return;
             }
         }
         let repo = repo.to_string();
@@ -838,7 +854,8 @@ impl FleetManager {
                 );
             }
             attached.attached.lock().unwrap().remove(&agent_id);
-            attached.ownership.release(&agent_id);
+            // Release for prompt failover hand-off (clustered); no-op standalone.
+            attached.ownership.release(&agent_id).await;
         });
     }
 
@@ -1209,6 +1226,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_ownership_blocks_the_attach_path() {
+        use crate::bus::InProcessBus;
+        use crate::ownership::{Lease, Ownership};
+        use crate::testkit::FakeCaliband;
+        use async_trait::async_trait;
+
+        // Ownership that never grants a lease (simulates a peer-owned stream).
+        struct NeverOwns;
+        #[async_trait]
+        impl Ownership for NeverOwns {
+            async fn try_acquire(&self, _: &str) -> Option<Lease> {
+                None
+            }
+            async fn renew(&self, _: &Lease) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn release(&self, _: &str) {}
+            fn owns(&self, _: &str) -> bool {
+                false
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+        let _fake = FakeCaliband::start_at(&socket).await.unwrap();
+
+        let store: Arc<dyn Store> = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let config_store: Arc<dyn ConfigStore> = Arc::new(
+            crate::config_store::SqliteConfigStore::open(dir.path())
+                .await
+                .unwrap(),
+        );
+        let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
+        let ownership: Arc<dyn Ownership> = Arc::new(NeverOwns);
+        let mgr = FleetManager::with_seams(config, store, config_store, bus, ownership)
+            .await
+            .unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+
+        let id = mgr.spawn_agent("p", SpawnRequest::new("hi")).await.unwrap();
+        assert!(
+            !mgr.is_attached(&id),
+            "peer-owned agent must NOT be attached locally"
+        );
+    }
+
+    #[tokio::test]
     async fn spawn_passes_repo_provider_into_spawnspec() {
         use crate::registry::RepoProviderConfig;
         use crate::testkit::FakeCaliband;
@@ -1389,7 +1458,10 @@ mod tests {
         let inner = crate::store::JsonlStore::open(dir.path()).unwrap();
         let store = Arc::new(FlakyStore::new(inner, [1])); // fail the data event (seq 1)
         let emitter = emitter_with(store.clone());
-        let mut rx = emitter.bus.subscribe();
+        use tokio_stream::StreamExt;
+        let mut sub = emitter
+            .bus
+            .subscribe(&crate::event::stream_key_for("repo", "a1"));
 
         emitter
             .emit(
@@ -1403,11 +1475,17 @@ mod tests {
             .await;
 
         // Live SSE still flows (ADR-0004): the original event reaches the bus...
-        let ev = rx.try_recv().unwrap();
+        let ev = match sub.next().await {
+            Some(crate::bus::BusEvent::Event(ev)) => ev,
+            other => panic!("expected a live event, got {other:?}"),
+        };
         assert_eq!(ev.seq, 1);
         assert!(matches!(ev.kind, EventKind::Output { .. }));
         // ...immediately followed by a durable-gap marker naming the lost seq.
-        let marker = rx.try_recv().unwrap();
+        let marker = match sub.next().await {
+            Some(crate::bus::BusEvent::Event(ev)) => ev,
+            other => panic!("expected a live event, got {other:?}"),
+        };
         assert_eq!(marker.agent_id, "a1");
         assert!(matches!(
             marker.kind,
@@ -1434,14 +1512,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let emitter = emitter_with(store);
-        let mut rx = emitter.bus.subscribe();
+        use tokio_stream::StreamExt;
+        let mut sub = emitter
+            .bus
+            .subscribe(&crate::event::stream_key_for("repo", "a1"));
 
         emitter.emit("repo", "a1", EventKind::AgentSpawned).await;
 
-        let ev = rx.try_recv().unwrap();
+        let ev = match sub.next().await {
+            Some(crate::bus::BusEvent::Event(ev)) => ev,
+            other => panic!("expected a live event, got {other:?}"),
+        };
         assert!(matches!(ev.kind, EventKind::AgentSpawned));
+        // A healthy append must not emit a gap marker: nothing more arrives.
         assert!(
-            rx.try_recv().is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(100), sub.next())
+                .await
+                .is_err(),
             "a healthy append must not emit a gap marker"
         );
     }

@@ -13,7 +13,8 @@ use prospero_core::fleet::{AttachBackoff, FleetConfig, FleetManager, SpawnReques
 use prospero_core::model::{AgentStatus, RepoHealth};
 use prospero_core::store::JsonlStore;
 use prospero_core::testkit::{FakeCaliband, test_record};
-use prospero_core::{CoreError, RepoProviderConfig};
+use prospero_core::{BusEvent, BusSubscription, CoreError, RepoProviderConfig};
+use tokio_stream::StreamExt;
 
 /// Keeps the manager, fake, and all backing temp dirs alive for a test.
 struct Harness {
@@ -74,11 +75,10 @@ async fn setup() -> Harness {
     }
 }
 
-/// Drain events from a receiver into a Vec of kinds until quiet for `max_wait`.
-async fn collect_kinds(
-    rx: &mut tokio::sync::broadcast::Receiver<prospero_core::FleetEvent>,
-    max_wait: Duration,
-) -> Vec<EventKind> {
+/// Drain events from a subscription into a Vec of kinds until quiet for
+/// `max_wait`. The bus already filters to one stream, so every item is for the
+/// subscribed agent.
+async fn collect_kinds(sub: &mut BusSubscription, max_wait: Duration) -> Vec<EventKind> {
     let mut kinds = Vec::new();
     let deadline = tokio::time::Instant::now() + max_wait;
     loop {
@@ -86,8 +86,9 @@ async fn collect_kinds(
         if remaining.is_zero() {
             break;
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) => kinds.push(ev.kind),
+        match tokio::time::timeout(remaining, sub.next()).await {
+            Ok(Some(BusEvent::Event(ev))) => kinds.push(ev.kind),
+            Ok(Some(BusEvent::Lagged(_))) => continue,
             _ => break,
         }
     }
@@ -140,9 +141,9 @@ async fn poll_discovers_preexisting_agents_and_streams_them() {
         )
         .await;
 
-    let mut rx = h.manager.subscribe();
+    let mut sub = h.manager.subscribe("agent001");
     h.manager.poll_repo_once("repo").await;
-    let kinds = collect_kinds(&mut rx, Duration::from_secs(2)).await;
+    let kinds = collect_kinds(&mut sub, Duration::from_secs(2)).await;
 
     assert!(
         kinds
@@ -192,9 +193,9 @@ async fn attach_reconnects_after_drop_without_dup_or_loss() {
         )
         .await;
 
-    let mut rx = h.manager.subscribe();
+    let mut sub = h.manager.subscribe("agent001");
     h.manager.poll_repo_once("repo").await;
-    let kinds = collect_kinds(&mut rx, Duration::from_secs(2)).await;
+    let kinds = collect_kinds(&mut sub, Duration::from_secs(2)).await;
 
     // No loss: the terminal event arrives despite the mid-stream drop.
     assert_eq!(
@@ -251,9 +252,9 @@ async fn unknown_frame_advances_the_metrics_counter() {
         )
         .await;
 
-    let mut rx = h.manager.subscribe();
+    let mut sub = h.manager.subscribe("agent001");
     h.manager.poll_repo_once("repo").await;
-    let _ = collect_kinds(&mut rx, Duration::from_secs(1)).await;
+    let _ = collect_kinds(&mut sub, Duration::from_secs(1)).await;
 
     let m = h.manager.metrics();
     assert_eq!(
@@ -279,9 +280,9 @@ async fn history_is_persisted_and_replayable() {
         )
         .await;
 
-    let mut rx = h.manager.subscribe();
+    let mut sub = h.manager.subscribe("agent001");
     h.manager.poll_repo_once("repo").await;
-    let _ = collect_kinds(&mut rx, Duration::from_secs(1)).await;
+    let _ = collect_kinds(&mut sub, Duration::from_secs(1)).await;
 
     let history = h.manager.history("agent001", 0).await.unwrap();
     assert!(
@@ -304,11 +305,11 @@ async fn status_change_emits_event_across_polls() {
     h.fake.add_agent(rec, vec![]).await;
 
     h.manager.poll_repo_once("repo").await; // discover as Idle
-    let mut rx = h.manager.subscribe();
+    let mut sub = h.manager.subscribe("agent001");
     h.fake.set_status("agent001", AgentStatus::Done);
     h.manager.poll_repo_once("repo").await; // observe transition
 
-    let kinds = collect_kinds(&mut rx, Duration::from_secs(1)).await;
+    let kinds = collect_kinds(&mut sub, Duration::from_secs(1)).await;
     assert!(kinds.iter().any(|k| matches!(
         k,
         EventKind::StatusChanged {
@@ -385,10 +386,10 @@ async fn agent_gone_emitted_when_it_disappears() {
     h.fake.add_agent(rec, vec![]).await;
 
     h.manager.poll_repo_once("repo").await; // discover
-    let mut rx = h.manager.subscribe();
+    let mut sub = h.manager.subscribe("agent001");
     h.fake.remove_agent("agent001");
     h.manager.poll_repo_once("repo").await; // observe removal
 
-    let kinds = collect_kinds(&mut rx, Duration::from_secs(1)).await;
+    let kinds = collect_kinds(&mut sub, Duration::from_secs(1)).await;
     assert!(kinds.iter().any(|k| matches!(k, EventKind::AgentGone)));
 }

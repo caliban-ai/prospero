@@ -5,9 +5,9 @@
 //! `Lagged` self-heal path is unit-testable without HTTP or a real channel.
 
 use async_trait::async_trait;
+use prospero_core::BusEvent;
 use prospero_core::event::EventKind;
 use prospero_core::{FleetEvent, FleetManager};
-use tokio::sync::broadcast::error::RecvError;
 
 /// One unit the stream forwards to the client.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,9 +73,11 @@ impl<H: HistorySource + Send> Tailer<H> {
         }
     }
 
-    pub(crate) async fn on_recv(&mut self, r: Result<FleetEvent, RecvError>) -> Step {
-        match r {
-            Ok(ev) if ev.agent_id == self.agent_id && ev.seq > self.last_delivered => {
+    pub(crate) async fn on_recv(&mut self, item: Option<BusEvent>) -> Step {
+        match item {
+            Some(BusEvent::Event(ev))
+                if ev.agent_id == self.agent_id && ev.seq > self.last_delivered =>
+            {
                 self.last_delivered = ev.seq;
                 let terminal = is_terminal(&ev);
                 let frames = vec![Frame::Event(ev)];
@@ -85,8 +87,8 @@ impl<H: HistorySource + Send> Tailer<H> {
                     Step::Emit(frames)
                 }
             }
-            Ok(_) => Step::Skip, // other agent, or already-delivered seq
-            Err(RecvError::Lagged(skipped)) => {
+            Some(BusEvent::Event(_)) => Step::Skip, // other stream, or already-delivered seq
+            Some(BusEvent::Lagged(skipped)) => {
                 let mut frames = vec![Frame::Gap {
                     skipped,
                     last_seq: self.last_delivered,
@@ -113,7 +115,7 @@ impl<H: HistorySource + Send> Tailer<H> {
                     Step::Emit(frames)
                 }
             }
-            Err(RecvError::Closed) => Step::Close,
+            None => Step::Close, // bus/stream ended
         }
     }
 }
@@ -125,6 +127,7 @@ fn is_terminal(ev: &FleetEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prospero_core::BusEvent;
 
     fn ev(seq: u64, agent: &str) -> FleetEvent {
         FleetEvent {
@@ -170,7 +173,7 @@ mod tests {
     async fn forwards_in_order_event_for_this_agent() {
         let mut t = Tailer::new("a".into(), 0, FakeHistory(vec![]));
         assert_eq!(
-            t.on_recv(Ok(ev(1, "a"))).await,
+            t.on_recv(Some(BusEvent::Event(ev(1, "a")))).await,
             Step::Emit(vec![Frame::Event(ev(1, "a"))])
         );
     }
@@ -178,16 +181,25 @@ mod tests {
     #[tokio::test]
     async fn skips_other_agents_and_already_delivered() {
         let mut t = Tailer::new("a".into(), 5, FakeHistory(vec![]));
-        assert_eq!(t.on_recv(Ok(ev(9, "b"))).await, Step::Skip); // other agent
-        assert_eq!(t.on_recv(Ok(ev(5, "a"))).await, Step::Skip); // <= last_delivered
-        assert_eq!(t.on_recv(Ok(ev(3, "a"))).await, Step::Skip); // older than high-water
+        assert_eq!(
+            t.on_recv(Some(BusEvent::Event(ev(9, "b")))).await,
+            Step::Skip
+        ); // other agent
+        assert_eq!(
+            t.on_recv(Some(BusEvent::Event(ev(5, "a")))).await,
+            Step::Skip
+        ); // <= last_delivered
+        assert_eq!(
+            t.on_recv(Some(BusEvent::Event(ev(3, "a")))).await,
+            Step::Skip
+        ); // older than high-water
     }
 
     #[tokio::test]
     async fn terminal_event_closes() {
         let mut t = Tailer::new("a".into(), 0, FakeHistory(vec![]));
         assert_eq!(
-            t.on_recv(Ok(finished(2, "a"))).await,
+            t.on_recv(Some(BusEvent::Event(finished(2, "a")))).await,
             Step::EmitAndClose(vec![Frame::Event(finished(2, "a"))])
         );
     }
@@ -198,7 +210,7 @@ mod tests {
         let store = FakeHistory(vec![ev(3, "a"), ev(4, "a")]);
         let mut t = Tailer::new("a".into(), 2, store);
         assert_eq!(
-            t.on_recv(Err(RecvError::Lagged(7))).await,
+            t.on_recv(Some(BusEvent::Lagged(7))).await,
             Step::Emit(vec![
                 Frame::Gap {
                     skipped: 7,
@@ -209,7 +221,10 @@ mod tests {
             ])
         );
         // High-water advanced: a later live re-delivery of seq 4 is a no-op.
-        assert_eq!(t.on_recv(Ok(ev(4, "a"))).await, Step::Skip);
+        assert_eq!(
+            t.on_recv(Some(BusEvent::Event(ev(4, "a")))).await,
+            Step::Skip
+        );
     }
 
     #[tokio::test]
@@ -217,7 +232,7 @@ mod tests {
         let store = FakeHistory(vec![ev(3, "a"), finished(4, "a")]);
         let mut t = Tailer::new("a".into(), 2, store);
         assert_eq!(
-            t.on_recv(Err(RecvError::Lagged(1))).await,
+            t.on_recv(Some(BusEvent::Lagged(1))).await,
             Step::EmitAndClose(vec![
                 Frame::Gap {
                     skipped: 1,
@@ -237,7 +252,7 @@ mod tests {
         let store = FakeHistory(vec![ev(3, "a"), ev(50, "a"), ev(100, "a"), ev(101, "a")]);
         let mut t = Tailer::new("a".into(), 99, store);
         assert_eq!(
-            t.on_recv(Err(RecvError::Lagged(4))).await,
+            t.on_recv(Some(BusEvent::Lagged(4))).await,
             Step::Emit(vec![
                 Frame::Gap {
                     skipped: 4,
@@ -254,7 +269,7 @@ mod tests {
         // Persist is also behind: nothing newer than what we delivered.
         let mut t = Tailer::new("a".into(), 5, FakeHistory(vec![ev(5, "a")]));
         assert_eq!(
-            t.on_recv(Err(RecvError::Lagged(2))).await,
+            t.on_recv(Some(BusEvent::Lagged(2))).await,
             Step::Emit(vec![Frame::Gap {
                 skipped: 2,
                 last_seq: 5
@@ -265,6 +280,6 @@ mod tests {
     #[tokio::test]
     async fn closed_bus_closes() {
         let mut t = Tailer::new("a".into(), 0, FakeHistory(vec![]));
-        assert_eq!(t.on_recv(Err(RecvError::Closed)).await, Step::Close);
+        assert_eq!(t.on_recv(None).await, Step::Close);
     }
 }
