@@ -234,32 +234,10 @@ mod tests {
         assert_eq!(store.high_water("a").await.unwrap(), 1);
     }
 
-    /// The behavioral contract every `Store` must satisfy. Reused by later
-    /// backends (sqlite, Postgres) so parity is enforced, not assumed.
-    ///
-    /// Takes `&dyn Store`; a second backend should call it via the same erased
-    /// reference (e.g. `store_conformance(&store as &dyn Store).await`).
-    async fn store_conformance(store: &dyn Store) {
-        assert_eq!(store.high_water("a").await.unwrap(), 0);
-        assert!(store.replay("a", 0).await.unwrap().is_empty());
-        assert!(store.writable().await);
-        store.append(&ev(1, "a", "a1")).await.unwrap();
-        store.append(&ev(1, "b", "b1")).await.unwrap();
-        store.append(&ev(2, "a", "a2")).await.unwrap();
-        assert_eq!(store.high_water("a").await.unwrap(), 2);
-        assert_eq!(store.high_water("b").await.unwrap(), 1);
-        let a = store.replay("a", 0).await.unwrap();
-        assert_eq!(a.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-        let a_from2 = store.replay("a", 2).await.unwrap();
-        assert_eq!(a_from2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
-        let b = store.replay("b", 0).await.unwrap();
-        assert_eq!(b.len(), 1);
-    }
-
     #[tokio::test]
     async fn jsonl_store_satisfies_conformance() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        store_conformance(&store).await;
+        crate::testkit::store_conformance(&store).await;
     }
 }

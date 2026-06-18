@@ -16,6 +16,7 @@ pub mod model;
 pub mod ownership;
 pub mod provider_env;
 pub mod registry;
+pub mod sqlite_store;
 pub mod store;
 
 #[cfg(any(test, feature = "testkit"))]
@@ -30,6 +31,7 @@ pub use metrics::{Metrics, MetricsSnapshot};
 pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Repo, RepoHealth};
 pub use ownership::{Lease, Ownership, SelfOwnsAll};
 pub use registry::{RegisteredRepo, Registry, RepoProviderConfig};
+pub use sqlite_store::SqliteStore;
 pub use store::{JsonlStore, Store};
 
 /// Crate version, sourced from `Cargo.toml`.

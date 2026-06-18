@@ -352,6 +352,44 @@ async fn spawn_multi_script_stream_listener(
     })
 }
 
+/// The behavioral contract every [`crate::store::Store`] must satisfy. Backends
+/// (jsonl, sqlite, Postgres) call this with a freshly-opened, empty store to
+/// prove parity — so a new backend is correct by construction, not by hope.
+pub async fn store_conformance(store: &dyn crate::store::Store) {
+    use crate::event::{EventKind, FleetEvent, OutputStream};
+
+    fn ev(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
+        FleetEvent {
+            seq,
+            ts: "t".into(),
+            repo: "r".into(),
+            agent_id: agent.into(),
+            kind: EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk: chunk.into(),
+            },
+        }
+    }
+
+    assert_eq!(store.high_water("a").await.unwrap(), 0);
+    assert!(store.replay("a", 0).await.unwrap().is_empty());
+    assert!(store.writable().await);
+
+    store.append(&ev(1, "a", "a1")).await.unwrap();
+    store.append(&ev(1, "b", "b1")).await.unwrap();
+    store.append(&ev(2, "a", "a2")).await.unwrap();
+
+    assert_eq!(store.high_water("a").await.unwrap(), 2);
+    assert_eq!(store.high_water("b").await.unwrap(), 1);
+
+    let a = store.replay("a", 0).await.unwrap();
+    assert_eq!(a.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+    let a_from2 = store.replay("a", 2).await.unwrap();
+    assert_eq!(a_from2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+    let b = store.replay("b", 0).await.unwrap();
+    assert_eq!(b.len(), 1);
+}
+
 /// Build a minimal `AgentRecord` for tests.
 pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) -> AgentRecord {
     AgentRecord {
