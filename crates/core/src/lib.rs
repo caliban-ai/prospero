@@ -13,6 +13,7 @@ pub mod event;
 pub mod fleet;
 pub mod metrics;
 pub mod model;
+pub mod ownership;
 pub mod provider_env;
 pub mod registry;
 pub mod store;
@@ -27,6 +28,7 @@ pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Repo, RepoHealth};
+pub use ownership::{Lease, Ownership, SelfOwnsAll};
 pub use registry::{RegisteredRepo, Registry, RepoProviderConfig};
 pub use store::{JsonlStore, Store};
 

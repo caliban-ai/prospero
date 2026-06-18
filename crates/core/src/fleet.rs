@@ -22,6 +22,7 @@ use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
+use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
 use crate::store::Store;
 
@@ -270,6 +271,7 @@ struct Inner {
     /// Agent ids with a running attach task.
     attached: Mutex<HashSet<String>>,
     emitter: Emitter,
+    ownership: Arc<dyn Ownership>,
     /// Broadcast shutdown signal: `true` once a graceful drain has begun. The
     /// poll loop and attach tasks subscribe and stop cooperatively.
     shutdown: watch::Sender<bool>,
@@ -314,6 +316,7 @@ impl FleetManager {
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
                 emitter,
+                ownership: Arc::new(SelfOwnsAll),
                 shutdown: watch::channel(false).0,
             }),
         })
@@ -732,9 +735,15 @@ impl FleetManager {
     /// reads the agent's stream, normalizes frames into events, and exits when
     /// the stream closes.
     async fn start_attach(&self, repo: &str, agent_id: &str, client: CalibandClient) {
+        // Only drive an agent this process owns. Standalone always acquires;
+        // clustered consults the lease (Phase 2).
+        if self.inner.ownership.try_acquire(agent_id).is_none() {
+            return;
+        }
         {
             let mut attached = self.inner.attached.lock().unwrap();
             if !attached.insert(agent_id.to_string()) {
+                self.inner.ownership.release(agent_id); // re-acquired but already attached
                 return; // already attached
             }
         }
@@ -765,12 +774,18 @@ impl FleetManager {
                 );
             }
             attached.attached.lock().unwrap().remove(&agent_id);
+            attached.ownership.release(&agent_id);
         });
     }
 
     /// Names of repos with a cached control client (test/observability helper).
     pub async fn cached_client_names(&self) -> Vec<String> {
         self.inner.clients.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Whether a per-agent attach task is currently registered (test/obs helper).
+    pub async fn is_attached(&self, agent_id: &str) -> bool {
+        self.inner.attached.lock().unwrap().contains(agent_id)
     }
 
     /// Gracefully shut down a repo's caliband daemon and drop its cached client
@@ -1102,6 +1117,30 @@ mod tests {
             matches!(r3, Err(CoreError::AgentNotFound(_))),
             "unknown id must 404"
         );
+    }
+
+    #[tokio::test]
+    async fn ownership_gates_the_attach_path() {
+        // A FleetManager built with SelfOwnsAll attaches normally: spawning an
+        // agent records it in the attached set (ownership never refuses).
+        use crate::testkit::FakeCaliband;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+        let _fake = FakeCaliband::start_at(&socket).await.unwrap();
+
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+
+        let id = mgr.spawn_agent("p", SpawnRequest::new("hi")).await.unwrap();
+        // Ownership acquired → the agent is in the attached set.
+        assert!(mgr.is_attached(&id).await, "owned agent must be attached");
     }
 
     #[tokio::test]
