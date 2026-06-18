@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{RwLock, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast, watch};
 
 use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
@@ -173,37 +173,14 @@ struct Emitter {
     store: Arc<dyn Store>,
     bus: Arc<dyn EventBus>,
     /// Next `seq` per stream key, seeded lazily from the store's high-water.
-    seqs: Arc<Mutex<HashMap<String, u64>>>,
+    seqs: Arc<AsyncMutex<HashMap<String, u64>>>,
     metrics: Arc<Metrics>,
 }
 
 impl Emitter {
-    fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
+    async fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
         let stream_key = crate::event::stream_key_for(repo, agent_id);
-        // The seq lock is held across a `high_water` read (file I/O for
-        // JsonlStore) only on a stream's first event this run; subsequent events
-        // hit the in-memory counter. emit() is a synchronous (non-async) path.
-        let seq = {
-            let mut seqs = self.seqs.lock().unwrap();
-            let next = match seqs.get(&stream_key) {
-                Some(n) => n + 1,
-                // First event this run for the stream: resume from durable
-                // high-water. A read failure here is rare (the store was just
-                // opened); fall back to 0 and log, consistent with ADR-0004's
-                // best-effort posture.
-                None => {
-                    self.store.high_water(&stream_key).unwrap_or_else(|e| {
-                        tracing::warn!(
-                            target: "prospero_fleet", stream = %stream_key, error = %e,
-                            "high_water read failed seeding per-stream seq; starting at 0"
-                        );
-                        0
-                    }) + 1
-                }
-            };
-            seqs.insert(stream_key, next);
-            next
-        };
+        let seq = self.next_seq(&stream_key).await;
         FleetEvent {
             seq,
             ts: chrono::Utc::now().to_rfc3339(),
@@ -213,10 +190,41 @@ impl Emitter {
         }
     }
 
-    fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
-        let event = self.next_event(repo, agent_id, kind);
+    /// Allocate the next per-stream `seq`. The durable `high_water` read on a
+    /// stream's first event happens WITHOUT holding the `seqs` lock, so the lock
+    /// is never held across `.await` (no executor stall / cross-stream serialize).
+    async fn next_seq(&self, stream_key: &str) -> u64 {
+        // Fast path: counter already seeded for this stream this run.
+        {
+            let mut seqs = self.seqs.lock().await;
+            if let Some(n) = seqs.get(stream_key) {
+                let next = n + 1;
+                seqs.insert(stream_key.to_string(), next);
+                return next;
+            }
+        }
+        // Slow path: first event this run — read durable high-water unlocked.
+        let seeded = self.store.high_water(stream_key).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "prospero_fleet", stream = %stream_key, error = %e,
+                "high_water read failed seeding per-stream seq; starting at 0"
+            );
+            0
+        });
+        let mut seqs = self.seqs.lock().await;
+        // Re-check: a concurrent task may have seeded while we read high_water.
+        let next = match seqs.get(stream_key) {
+            Some(n) => n + 1,
+            None => seeded + 1,
+        };
+        seqs.insert(stream_key.to_string(), next);
+        next
+    }
+
+    async fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
+        let event = self.next_event(repo, agent_id, kind).await;
         let lost_seq = event.seq;
-        let append_err = match self.store.append(&event) {
+        let append_err = match self.store.append(&event).await {
             Ok(()) => {
                 self.metrics.record_append_ok();
                 None
@@ -231,7 +239,7 @@ impl Emitter {
         self.bus.publish(event);
         if let Some(e) = append_err {
             tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist event");
-            self.emit_persist_gap(repo, agent_id, lost_seq, e);
+            self.emit_persist_gap(repo, agent_id, lost_seq, e).await;
         }
     }
 
@@ -240,16 +248,18 @@ impl Emitter {
     /// marker — persisted best-effort so a history reader sees the gap, and sent
     /// on the bus so live consumers know history is incomplete. The marker keeps
     /// the live and durable views from silently diverging (#25, ADR-0004).
-    fn emit_persist_gap(&self, repo: &str, agent_id: &str, lost_seq: u64, err: CoreError) {
-        let marker = self.next_event(
-            repo,
-            agent_id,
-            EventKind::StorePersistFailed {
-                lost_seq,
-                detail: err.to_string(),
-            },
-        );
-        match self.store.append(&marker) {
+    async fn emit_persist_gap(&self, repo: &str, agent_id: &str, lost_seq: u64, err: CoreError) {
+        let marker = self
+            .next_event(
+                repo,
+                agent_id,
+                EventKind::StorePersistFailed {
+                    lost_seq,
+                    detail: err.to_string(),
+                },
+            )
+            .await;
+        match self.store.append(&marker).await {
             Ok(()) => self.metrics.record_append_ok(),
             Err(e) => {
                 // Hard-down store: the gap is now observable only via logs
@@ -292,7 +302,7 @@ impl FleetManager {
         let emitter = Emitter {
             store,
             bus,
-            seqs: Arc::new(Mutex::new(HashMap::new())),
+            seqs: Arc::new(AsyncMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         };
         let snapshot = FleetSnapshot {
@@ -352,7 +362,7 @@ impl FleetManager {
     /// per-repo health. Used by the `/readyz` endpoint to distinguish liveness
     /// from readiness.
     pub async fn readiness(&self) -> crate::model::Readiness {
-        let store_writable = self.inner.emitter.store.writable();
+        let store_writable = self.inner.emitter.store.writable().await;
         let snap = self.inner.snapshot.read().await;
         let repos_total = snap.repos.len();
         let repos_healthy = snap
@@ -373,8 +383,8 @@ impl FleetManager {
     /// watching a single agent pass the agent id, which is that agent's stream
     /// key (see [`crate::event::stream_key_for`]); repo/fleet-level history uses
     /// the `repo:<name>` / `fleet` keys.
-    pub fn history(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-        self.inner.emitter.store.replay(stream_key, from_seq)
+    pub async fn history(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+        self.inner.emitter.store.replay(stream_key, from_seq).await
     }
 
     /// Register a repo and persist the registry. Triggers an immediate poll.
@@ -526,7 +536,7 @@ impl FleetManager {
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
         let (id, _socket) = client.spawn(spec).await?;
-        self.inner.emitter.emit(repo, &id, EventKind::AgentSpawned);
+        self.inner.emitter.emit(repo, &id, EventKind::AgentSpawned).await;
         self.start_attach(repo, &id, client).await;
         Ok(id)
     }
@@ -642,7 +652,8 @@ impl FleetManager {
                 drop(snap);
                 self.inner
                     .emitter
-                    .emit(repo, "", EventKind::RepoHealth { state: new_health });
+                    .emit(repo, "", EventKind::RepoHealth { state: new_health })
+                    .await;
             }
         }
     }
@@ -679,18 +690,22 @@ impl FleetManager {
                 None if !attached_now.contains(&rec.id) => {
                     self.inner
                         .emitter
-                        .emit(repo, &rec.id, EventKind::AgentDiscovered);
+                        .emit(repo, &rec.id, EventKind::AgentDiscovered)
+                        .await;
                 }
                 None => {}
                 Some(&old) if old != rec.status => {
-                    self.inner.emitter.emit(
-                        repo,
-                        &rec.id,
-                        EventKind::StatusChanged {
-                            from: old,
-                            to: rec.status,
-                        },
-                    );
+                    self.inner
+                        .emitter
+                        .emit(
+                            repo,
+                            &rec.id,
+                            EventKind::StatusChanged {
+                                from: old,
+                                to: rec.status,
+                            },
+                        )
+                        .await;
                 }
                 _ => {}
             }
@@ -703,7 +718,10 @@ impl FleetManager {
         // Agents that disappeared from caliban's registry.
         for (old_id, _) in prior.iter() {
             if !records.iter().any(|r| &r.id == old_id) {
-                self.inner.emitter.emit(repo, old_id, EventKind::AgentGone);
+                self.inner
+                    .emitter
+                    .emit(repo, old_id, EventKind::AgentGone)
+                    .await;
             }
         }
 
@@ -715,13 +733,16 @@ impl FleetManager {
                 r.agents = new_agents;
                 if was_unreachable {
                     drop(snap);
-                    self.inner.emitter.emit(
-                        repo,
-                        "",
-                        EventKind::RepoHealth {
-                            state: RepoHealth::Healthy,
-                        },
-                    );
+                    self.inner
+                        .emitter
+                        .emit(
+                            repo,
+                            "",
+                            EventKind::RepoHealth {
+                                state: RepoHealth::Healthy,
+                            },
+                        )
+                        .await;
                 }
             }
         }
@@ -1007,7 +1028,7 @@ async fn attach_once(
                 if matches!(kind, EventKind::AgentFinished { .. }) {
                     saw_terminal = true;
                 }
-                emitter.emit(repo, agent_id, kind);
+                emitter.emit(repo, agent_id, kind).await;
             }
             Normalized::Dropped => {}
             Normalized::Unknown => {
@@ -1235,21 +1256,22 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl Store for FlakyStore {
-        fn append(&self, event: &FleetEvent) -> Result<()> {
+        async fn append(&self, event: &FleetEvent) -> Result<()> {
             if self.fail_seqs.lock().unwrap().contains(&event.seq) {
                 return Err(CoreError::Store("injected append failure".into()));
             }
-            self.inner.append(event)
+            self.inner.append(event).await
         }
-        fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-            self.inner.replay(stream_key, from_seq)
+        async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+            self.inner.replay(stream_key, from_seq).await
         }
-        fn high_water(&self, stream_key: &str) -> Result<u64> {
-            self.inner.high_water(stream_key)
+        async fn high_water(&self, stream_key: &str) -> Result<u64> {
+            self.inner.high_water(stream_key).await
         }
-        fn writable(&self) -> bool {
-            self.inner.writable()
+        async fn writable(&self) -> bool {
+            self.inner.writable().await
         }
     }
 
@@ -1257,7 +1279,7 @@ mod tests {
         Emitter {
             store,
             bus: Arc::new(InProcessBus::new(16)),
-            seqs: Arc::new(Mutex::new(HashMap::new())),
+            seqs: Arc::new(AsyncMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         }
     }
@@ -1276,51 +1298,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn seq_is_monotonic_per_stream_not_global() {
+    #[tokio::test]
+    async fn seq_is_monotonic_per_stream_not_global() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let emitter = emitter_with(store);
 
         // Interleave two agents; each stream numbers from 1 independently.
-        emitter.emit("r", "a1", EventKind::AgentSpawned);
-        emitter.emit("r", "a2", EventKind::AgentSpawned);
-        emitter.emit("r", "a1", EventKind::AgentGone);
+        emitter.emit("r", "a1", EventKind::AgentSpawned).await;
+        emitter.emit("r", "a2", EventKind::AgentSpawned).await;
+        emitter.emit("r", "a1", EventKind::AgentGone).await;
 
         let a1 = emitter
             .store
             .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
             .unwrap();
         let a2 = emitter
             .store
             .replay(&crate::event::stream_key_for("r", "a2"), 0)
+            .await
             .unwrap();
         assert_eq!(a1.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(a2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
     }
 
-    #[test]
-    fn seq_resumes_per_stream_from_high_water() {
+    #[tokio::test]
+    async fn seq_resumes_per_stream_from_high_water() {
         let dir = tempfile::tempdir().unwrap();
         // Pre-seed the store: stream "a1" already reached seq 5.
         {
             let store = crate::store::JsonlStore::open(dir.path()).unwrap();
-            store.append(&ev(5, "a1", "old")).unwrap();
+            store.append(&ev(5, "a1", "old")).await.unwrap();
         }
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let emitter = emitter_with(store);
-        emitter.emit("r", "a1", EventKind::AgentGone);
+        emitter.emit("r", "a1", EventKind::AgentGone).await;
 
         let a1 = emitter
             .store
             .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
             .unwrap();
         // The new event continues from the stored high-water (5 → 6).
         assert_eq!(a1.last().unwrap().seq, 6);
     }
 
-    #[test]
-    fn append_failure_emits_persist_gap_marker_visible_to_history() {
+    #[tokio::test]
+    async fn append_failure_emits_persist_gap_marker_visible_to_history() {
         use crate::event::OutputStream;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1329,14 +1354,16 @@ mod tests {
         let emitter = emitter_with(store.clone());
         let mut rx = emitter.bus.subscribe();
 
-        emitter.emit(
-            "repo",
-            "a1",
-            EventKind::Output {
-                stream: OutputStream::Stdout,
-                chunk: "lost".into(),
-            },
-        );
+        emitter
+            .emit(
+                "repo",
+                "a1",
+                EventKind::Output {
+                    stream: OutputStream::Stdout,
+                    chunk: "lost".into(),
+                },
+            )
+            .await;
 
         // Live SSE still flows (ADR-0004): the original event reaches the bus...
         let ev = rx.try_recv().unwrap();
@@ -1352,7 +1379,7 @@ mod tests {
 
         // The marker is visible to a history reader (persisted), not just logs,
         // and the lost event itself is absent — the gap is real but now labeled.
-        let history = store.replay("a1", 0).unwrap();
+        let history = store.replay("a1", 0).await.unwrap();
         assert!(
             history
                 .iter()
@@ -1365,14 +1392,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn healthy_append_emits_no_gap_marker() {
+    #[tokio::test]
+    async fn healthy_append_emits_no_gap_marker() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let emitter = emitter_with(store);
         let mut rx = emitter.bus.subscribe();
 
-        emitter.emit("repo", "a1", EventKind::AgentSpawned);
+        emitter.emit("repo", "a1", EventKind::AgentSpawned).await;
 
         let ev = rx.try_recv().unwrap();
         assert!(matches!(ev.kind, EventKind::AgentSpawned));
@@ -1382,15 +1409,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_failure_and_success_advance_metrics() {
+    #[tokio::test]
+    async fn append_failure_and_success_advance_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let inner = crate::store::JsonlStore::open(dir.path()).unwrap();
         // Fail the data event (seq 1); the gap marker (seq 2) appends fine.
         let store = Arc::new(FlakyStore::new(inner, [1]));
         let emitter = emitter_with(store);
 
-        emitter.emit("repo", "a1", EventKind::AgentSpawned);
+        emitter.emit("repo", "a1", EventKind::AgentSpawned).await;
 
         let m = emitter.metrics.snapshot(0);
         assert_eq!(m.append_failures, 1, "the failed append must be counted");

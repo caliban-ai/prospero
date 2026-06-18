@@ -224,7 +224,7 @@ async fn attach_reconnects_after_drop_without_dup_or_loss() {
     );
 
     // Durable history is likewise free of duplicates.
-    let history = h.manager.history("agent001", 0).unwrap();
+    let history = h.manager.history("agent001", 0).await.unwrap();
     assert_eq!(
         history
             .iter()
@@ -283,7 +283,7 @@ async fn history_is_persisted_and_replayable() {
     h.manager.poll_repo_once("repo").await;
     let _ = collect_kinds(&mut rx, Duration::from_secs(1)).await;
 
-    let history = h.manager.history("agent001", 0).unwrap();
+    let history = h.manager.history("agent001", 0).await.unwrap();
     assert!(
         history
             .iter()
