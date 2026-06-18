@@ -53,7 +53,7 @@ async fn cli_drives_the_full_stack() {
     };
     config.poll_interval = Duration::from_millis(100);
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     manager.add_repo("repo", repo_root).await.unwrap();
     tokio::spawn(manager.clone().run());
 

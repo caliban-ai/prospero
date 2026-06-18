@@ -17,6 +17,7 @@ use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
 use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
+use crate::config_store::{ConfigStore, SqliteConfigStore};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
@@ -82,7 +83,7 @@ impl SpawnRequest {
 pub struct FleetConfig {
     /// Host identity (single host in the first stab).
     pub host: String,
-    /// Directory for the registry file and event store.
+    /// Directory for the config store and event store (both in `events.db`).
     pub data_dir: PathBuf,
     /// How often the poll loop refreshes each repo.
     pub poll_interval: Duration,
@@ -160,10 +161,6 @@ impl FleetConfig {
             default_env: std::collections::BTreeMap::new(),
             attach_backoff: AttachBackoff::default(),
         }
-    }
-
-    fn registry_path(&self) -> PathBuf {
-        self.data_dir.join("registry.json")
     }
 }
 
@@ -280,6 +277,7 @@ struct Inner {
     config: FleetConfig,
     snapshot: RwLock<FleetSnapshot>,
     registry: RwLock<Registry>,
+    config_store: Arc<dyn ConfigStore>,
     /// Per-repo control clients, cached after first discovery.
     clients: Mutex<HashMap<String, CalibandClient>>,
     /// Agent ids with a running attach task.
@@ -298,10 +296,24 @@ pub struct FleetManager {
 }
 
 impl FleetManager {
-    /// Build a manager, loading the persisted registry and seeding the event
-    /// sequence from the store's high-water mark.
-    pub fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
-        let registry = Registry::load(&config.registry_path())?;
+    /// Build a manager, loading the persisted registry from a default
+    /// [`SqliteConfigStore`] in `config.data_dir` (the same dir as the event
+    /// store). For an injected config backend (e.g. Postgres), use
+    /// [`Self::with_config_store`].
+    pub async fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
+        let config_store = Arc::new(SqliteConfigStore::open(&config.data_dir).await?);
+        Self::with_config_store(config, store, config_store).await
+    }
+
+    /// Build a manager with an explicit [`ConfigStore`].
+    pub async fn with_config_store(
+        config: FleetConfig,
+        store: Arc<dyn Store>,
+        config_store: Arc<dyn ConfigStore>,
+    ) -> Result<Self> {
+        let registry = Registry {
+            repos: config_store.list_repos().await?,
+        };
         let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
         let emitter = Emitter {
             store,
@@ -327,6 +339,7 @@ impl FleetManager {
                 config,
                 snapshot: RwLock::new(snapshot),
                 registry: RwLock::new(registry),
+                config_store,
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
                 emitter,
@@ -414,12 +427,15 @@ impl FleetManager {
     ) -> Result<()> {
         let name = name.into();
         let root = root.into();
-        {
+        let repo = {
             let mut reg = self.inner.registry.write().await;
             reg.add(name.clone(), root.clone())?;
             reg.set_config(&name, config);
-            reg.save(&self.inner.config.registry_path())?;
-        }
+            reg.get(&name)
+                .cloned()
+                .expect("repo just inserted must exist")
+        };
+        self.inner.config_store.upsert_repo(&repo).await?;
         {
             let mut snap = self.inner.snapshot.write().await;
             if !snap.repos.iter().any(|r| r.name == name) {
@@ -449,13 +465,11 @@ impl FleetManager {
     pub async fn remove_repo(&self, name: &str) -> Result<bool> {
         let removed = {
             let mut reg = self.inner.registry.write().await;
-            let removed = reg.remove(name);
-            if removed {
-                reg.save(&self.inner.config.registry_path())?;
-            }
-            removed
+            reg.remove(name)
         };
         if removed {
+            // Persist the removal first; only prune derived state once durable.
+            self.inner.config_store.delete_repo(name).await?;
             self.inner
                 .snapshot
                 .write()
@@ -490,11 +504,16 @@ impl FleetManager {
         repo: &str,
         config: crate::registry::RepoProviderConfig,
     ) -> Result<()> {
-        let mut reg = self.inner.registry.write().await;
-        if !reg.set_config(repo, config) {
-            return Err(CoreError::RepoNotFound(repo.to_string()));
-        }
-        reg.save(&self.inner.config.registry_path())?;
+        let record = {
+            let mut reg = self.inner.registry.write().await;
+            if !reg.set_config(repo, config) {
+                return Err(CoreError::RepoNotFound(repo.to_string()));
+            }
+            reg.get(repo)
+                .cloned()
+                .expect("repo exists after successful set_config")
+        };
+        self.inner.config_store.upsert_repo(&record).await?;
         Ok(())
     }
 
@@ -1099,7 +1118,7 @@ mod tests {
 
         let fake = FakeCaliband::start_at(&socket).await.unwrap();
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("p", &root).await.unwrap();
 
         mgr.poll_repo_once("p").await; // cache a client by talking to the repo
@@ -1139,7 +1158,7 @@ mod tests {
         fake.add_agent(idle, vec![]).await;
 
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("repo", &root).await.unwrap();
         mgr.poll_repo_once("repo").await;
 
@@ -1180,7 +1199,7 @@ mod tests {
         let _fake = FakeCaliband::start_at(&socket).await.unwrap();
 
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("p", &root).await.unwrap();
 
         let id = mgr.spawn_agent("p", SpawnRequest::new("hi")).await.unwrap();
@@ -1204,7 +1223,7 @@ mod tests {
 
         let fake = FakeCaliband::start_at(&socket).await.unwrap();
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
         mgr.add_repo("p", &root).await.unwrap();
         mgr.set_repo_config_registry_only(
             "p",
@@ -1234,7 +1253,7 @@ mod tests {
         let mut config = FleetConfig::new("local", dir.path());
         config.default_env.insert("KEEP".into(), "global".into());
         let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
 
         mgr.add_repo("p", "/tmp/p").await.ok(); // discovery may fail; the registry write is what matters
         let cfg = RepoProviderConfig {
@@ -1451,7 +1470,7 @@ mod tests {
         let mut config = FleetConfig::new("local", dir.path());
         config.poll_interval = Duration::from_millis(50);
         let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
 
         let signaller = mgr.clone();
         let handle = tokio::spawn(mgr.run());
@@ -1491,7 +1510,7 @@ mod tests {
             .unwrap();
 
         let config = FleetConfig::new("local", dir.path());
-        let mgr = FleetManager::new(config, store).unwrap();
+        let mgr = FleetManager::new(config, store).await.unwrap();
 
         let removed = mgr
             .prune_older_than(std::time::Duration::from_secs(24 * 3600))

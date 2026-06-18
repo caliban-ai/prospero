@@ -73,7 +73,7 @@ async fn setup() -> Harness {
     config.poll_interval = Duration::from_millis(20);
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     manager.add_repo("repo", repo_root).await.unwrap();
 
     Harness {
@@ -168,7 +168,7 @@ async fn readyz_returns_503_when_store_unwritable() {
     let data_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(UnwritableStore(JsonlStore::open(data_dir.path()).unwrap()));
     let config = FleetConfig::new("test-host", data_dir.path());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     let app = router(manager);
 
     let resp = app
@@ -425,7 +425,7 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
     };
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     let app = router(manager);
 
     // POST /api/repos with a config object.

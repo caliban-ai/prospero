@@ -98,7 +98,9 @@ async fn main() -> anyhow::Result<()> {
             .await
             .with_context(|| "opening event store")?,
     );
-    let manager = FleetManager::new(config, store).with_context(|| "building fleet manager")?;
+    let manager = FleetManager::new(config, store)
+        .await
+        .with_context(|| "building fleet manager")?;
 
     // Background poll loop.
     let poll_handle = tokio::spawn(manager.clone().run());

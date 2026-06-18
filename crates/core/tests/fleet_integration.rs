@@ -62,7 +62,7 @@ async fn setup() -> Harness {
     };
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     manager.add_repo("repo", repo_root).await.unwrap();
 
     Harness {
@@ -338,7 +338,7 @@ async fn unreachable_repo_degrades_without_failing() {
         ..EnsureConfig::default()
     };
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
-    let manager = FleetManager::new(config, store).unwrap();
+    let manager = FleetManager::new(config, store).await.unwrap();
     manager.add_repo("repo", repo_root).await.unwrap();
 
     manager.poll_repo_once("repo").await;
