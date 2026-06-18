@@ -185,21 +185,35 @@ mod tests {
         let agent = unique_agent("agent-deliver");
         let mut sub = bus.subscribe(&agent);
 
-        // Poll the subscription in a task so its LISTEN connection is
-        // established BEFORE we append+notify (otherwise the doorbell races
-        // listener setup and the recv would block).
+        // The subscriber establishes its LISTEN connection and seeds its
+        // high-water lazily on first poll; that moment isn't observable, and a
+        // single fixed sleep races it under a slow/instrumented build (e.g.
+        // coverage). The bus only tails events appended AFTER it seeds, so we
+        // drive delivery with a bounded retry — append a fresh event and ring
+        // the doorbell until one lands after the listener is live. (Production
+        // doesn't need this: the SSE handler reads history right after
+        // subscribing, which backfills any event in the setup window.)
         let recv =
             tokio::spawn(
-                async move { tokio::time::timeout(Duration::from_secs(5), sub.next()).await },
+                async move { tokio::time::timeout(Duration::from_secs(20), sub.next()).await },
             );
-        tokio::time::sleep(Duration::from_millis(400)).await;
 
-        let e = ev(1, &agent);
-        store.append(&e).await.unwrap();
-        bus.publish(e.clone());
+        let mut delivered = None;
+        for seq in 1..=40u64 {
+            let e = ev(seq, &agent);
+            store.append(&e).await.unwrap();
+            bus.publish(e);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if recv.is_finished() {
+                delivered = Some(recv.await.unwrap().expect("doorbell timed out"));
+                break;
+            }
+        }
 
-        let got = recv.await.unwrap().expect("timed out waiting for doorbell");
-        assert_eq!(got, Some(BusEvent::Event(e)));
+        match delivered.expect("subscriber never received a doorbell event after 40 tries") {
+            Some(BusEvent::Event(ev)) => assert_eq!(ev.agent_id, agent),
+            other => panic!("expected a live event, got {other:?}"),
+        }
     }
 
     #[tokio::test]
