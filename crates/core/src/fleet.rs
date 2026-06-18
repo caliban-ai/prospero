@@ -178,6 +178,9 @@ struct Emitter {
 impl Emitter {
     fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
         let stream_key = crate::event::stream_key_for(repo, agent_id);
+        // The seq lock is held across a `high_water` read (file I/O for
+        // JsonlStore) only on a stream's first event this run; subsequent events
+        // hit the in-memory counter. emit() is a synchronous (non-async) path.
         let seq = {
             let mut seqs = self.seqs.lock().unwrap();
             let next = match seqs.get(&stream_key) {
@@ -362,9 +365,12 @@ impl FleetManager {
         }
     }
 
-    /// Replay an agent's history from the store, with `seq >= from_seq`.
-    pub fn history(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-        self.inner.emitter.store.replay(agent_id, from_seq)
+    /// Replay a stream's history from the store, with `seq >= from_seq`. Callers
+    /// watching a single agent pass the agent id, which is that agent's stream
+    /// key (see [`crate::event::stream_key_for`]); repo/fleet-level history uses
+    /// the `repo:<name>` / `fleet` keys.
+    pub fn history(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+        self.inner.emitter.store.replay(stream_key, from_seq)
     }
 
     /// Register a repo and persist the registry. Triggers an immediate poll.
@@ -1232,8 +1238,14 @@ mod tests {
         emitter.emit("r", "a2", EventKind::AgentSpawned);
         emitter.emit("r", "a1", EventKind::AgentGone);
 
-        let a1 = emitter.store.replay("a1", 0).unwrap();
-        let a2 = emitter.store.replay("a2", 0).unwrap();
+        let a1 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .unwrap();
+        let a2 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a2"), 0)
+            .unwrap();
         assert_eq!(a1.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(a2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
     }
@@ -1250,7 +1262,10 @@ mod tests {
         let emitter = emitter_with(store);
         emitter.emit("r", "a1", EventKind::AgentGone);
 
-        let a1 = emitter.store.replay("a1", 0).unwrap();
+        let a1 = emitter
+            .store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .unwrap();
         // The new event continues from the stored high-water (5 → 6).
         assert_eq!(a1.last().unwrap().seq, 6);
     }

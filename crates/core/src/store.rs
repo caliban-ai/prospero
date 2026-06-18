@@ -30,7 +30,7 @@ pub trait Store: Send + Sync {
 }
 
 /// Append-only JSON-lines store. All events go to a single `events.jsonl`;
-/// replay filters by agent. Simple and debuggable for the first stab; rotation
+/// replay filters by stream key. Simple and debuggable for the first stab; rotation
 /// and per-agent sharding are deferred.
 pub struct JsonlStore {
     path: PathBuf,
