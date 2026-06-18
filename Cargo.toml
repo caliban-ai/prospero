@@ -28,4 +28,4 @@ clap = { version = "4", features = ["derive", "env"] }
 ureq = { version = "2", features = ["json"] }
 tempfile = "3"
 async-trait = "0.1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
