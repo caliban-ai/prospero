@@ -261,7 +261,7 @@ impl FleetManager {
     /// sequence from the store's high-water mark.
     pub fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
         let registry = Registry::load(&config.registry_path())?;
-        let high_water = store.high_water()?;
+        let high_water = store.global_high_water()?;
         let (bus, _) = broadcast::channel(config.event_buffer);
         let emitter = Emitter {
             store,
@@ -1166,11 +1166,14 @@ mod tests {
             }
             self.inner.append(event)
         }
-        fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-            self.inner.replay(agent_id, from_seq)
+        fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+            self.inner.replay(stream_key, from_seq)
         }
-        fn high_water(&self) -> Result<u64> {
-            self.inner.high_water()
+        fn high_water(&self, stream_key: &str) -> Result<u64> {
+            self.inner.high_water(stream_key)
+        }
+        fn global_high_water(&self) -> Result<u64> {
+            self.inner.global_high_water()
         }
         fn writable(&self) -> bool {
             self.inner.writable()

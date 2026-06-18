@@ -17,16 +17,19 @@ pub trait Store: Send + Sync {
     /// Append one event to durable storage.
     fn append(&self, event: &FleetEvent) -> Result<()>;
 
-    /// Replay events for one agent with `seq >= from_seq`, in `seq` order.
-    fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>>;
+    /// Replay events for one stream with `seq >= from_seq`, in `seq` order.
+    fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>>;
 
-    /// The highest `seq` ever persisted (0 if empty). Used to resume the
-    /// sequence counter across daemon restarts.
-    fn high_water(&self) -> Result<u64>;
+    /// The highest `seq` ever persisted for `stream_key` (0 if none). Used to
+    /// resume that stream's sequence counter across daemon restarts.
+    fn high_water(&self, stream_key: &str) -> Result<u64>;
+
+    /// The highest `seq` ever persisted across *all* streams (0 if empty). Used
+    /// to seed the global monotonic sequence counter on daemon restart.
+    fn global_high_water(&self) -> Result<u64>;
 
     /// Whether the backend can currently accept writes. A cheap, non-destructive
-    /// probe used by the readiness endpoint to distinguish liveness from
-    /// readiness (e.g. a full or read-only data dir).
+    /// probe used by the readiness endpoint.
     fn writable(&self) -> bool;
 }
 
@@ -96,17 +99,27 @@ impl Store for JsonlStore {
         Ok(())
     }
 
-    fn replay(&self, agent_id: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+    fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         let mut events: Vec<FleetEvent> = self
             .read_all()?
             .into_iter()
-            .filter(|e| e.agent_id == agent_id && e.seq >= from_seq)
+            .filter(|e| e.stream_key() == stream_key && e.seq >= from_seq)
             .collect();
         events.sort_by_key(|e| e.seq);
         Ok(events)
     }
 
-    fn high_water(&self) -> Result<u64> {
+    fn high_water(&self, stream_key: &str) -> Result<u64> {
+        Ok(self
+            .read_all()?
+            .iter()
+            .filter(|e| e.stream_key() == stream_key)
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0))
+    }
+
+    fn global_high_water(&self) -> Result<u64> {
         Ok(self.read_all()?.iter().map(|e| e.seq).max().unwrap_or(0))
     }
 
@@ -166,14 +179,14 @@ mod tests {
             store.append(&ev(9, "a", "y")).unwrap();
         }
         let reopened = JsonlStore::open(dir.path()).unwrap();
-        assert_eq!(reopened.high_water().unwrap(), 9);
+        assert_eq!(reopened.high_water("a").unwrap(), 9);
     }
 
     #[test]
     fn high_water_is_zero_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
-        assert_eq!(store.high_water().unwrap(), 0);
+        assert_eq!(store.high_water("a").unwrap(), 0);
     }
 
     #[cfg(unix)]
@@ -197,6 +210,20 @@ mod tests {
     }
 
     #[test]
+    fn high_water_is_scoped_per_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        // Two independent agent streams, each with its own seq line.
+        store.append(&ev(1, "a", "one")).unwrap();
+        store.append(&ev(1, "b", "one")).unwrap();
+        store.append(&ev(2, "a", "two")).unwrap();
+
+        assert_eq!(store.high_water("a").unwrap(), 2);
+        assert_eq!(store.high_water("b").unwrap(), 1);
+        assert_eq!(store.high_water("missing").unwrap(), 0);
+    }
+
+    #[test]
     fn corrupt_trailing_line_is_tolerated() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
@@ -210,6 +237,6 @@ mod tests {
         drop(f);
         let events = store.replay("a", 0).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(store.high_water().unwrap(), 1);
+        assert_eq!(store.high_water("a").unwrap(), 1);
     }
 }
