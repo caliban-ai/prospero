@@ -406,11 +406,22 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
         }
     }
 
-    store.append(&ev(1, "2026-01-01T00:00:00Z")).await.unwrap();
-    store.append(&ev(2, "2026-03-01T00:00:00Z")).await.unwrap();
-    store.append(&ev(3, "2026-06-01T00:00:00Z")).await.unwrap();
+    // Match the production timestamp format (`chrono::Utc::now().to_rfc3339()`
+    // emits `+00:00`, not `Z`); lexical ordering only holds within one offset form.
+    store
+        .append(&ev(1, "2026-01-01T00:00:00+00:00"))
+        .await
+        .unwrap();
+    store
+        .append(&ev(2, "2026-03-01T00:00:00+00:00"))
+        .await
+        .unwrap();
+    store
+        .append(&ev(3, "2026-06-01T00:00:00+00:00"))
+        .await
+        .unwrap();
 
-    let removed = store.prune("2026-03-01T00:00:00Z").await.unwrap();
+    let removed = store.prune("2026-03-01T00:00:00+00:00").await.unwrap();
     assert_eq!(removed, 1);
 
     let remaining = store.replay("a", 0).await.unwrap();
@@ -419,7 +430,7 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
         vec![2, 3]
     );
 
-    assert_eq!(store.prune("2026-03-01T00:00:00Z").await.unwrap(), 0);
+    assert_eq!(store.prune("2026-03-01T00:00:00+00:00").await.unwrap(), 0);
 }
 
 /// Build a minimal `AgentRecord` for tests.
