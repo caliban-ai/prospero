@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::Parser;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig};
 use prospero_core::fleet::{FleetConfig, FleetManager};
-use prospero_core::store::JsonlStore;
+use prospero_core::sqlite_store::SqliteStore;
 
 /// Prospero control-plane daemon.
 #[derive(Debug, Parser)]
@@ -89,7 +89,11 @@ async fn main() -> anyhow::Result<()> {
     };
     config.default_env = args.default_env.iter().cloned().collect();
 
-    let store = Arc::new(JsonlStore::open(&data_dir).with_context(|| "opening event store")?);
+    let store = Arc::new(
+        SqliteStore::open(&data_dir)
+            .await
+            .with_context(|| "opening event store")?,
+    );
     let manager = FleetManager::new(config, store).with_context(|| "building fleet manager")?;
 
     // Background poll loop.
