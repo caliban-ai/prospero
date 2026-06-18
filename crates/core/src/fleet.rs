@@ -345,6 +345,7 @@ impl FleetManager {
                     name: r.name.clone(),
                     root: r.root.clone(),
                     health: RepoHealth::Healthy,
+                    config: r.config.clone(),
                     agents: Vec::new(),
                 })
                 .collect(),
@@ -380,9 +381,17 @@ impl FleetManager {
         self.inner.emitter.bus.subscribe(stream_key)
     }
 
-    /// A clone of the current fleet snapshot.
+    /// A clone of the current fleet snapshot, with each repo's provider config
+    /// joined in from the registry so a single read reflects any `set_config`.
     pub async fn snapshot(&self) -> FleetSnapshot {
-        self.inner.snapshot.read().await.clone()
+        let mut snap = self.inner.snapshot.read().await.clone();
+        let reg = self.inner.registry.read().await;
+        for repo in &mut snap.repos {
+            if let Some(r) = reg.get(&repo.name) {
+                repo.config = r.config.clone();
+            }
+        }
+        snap
     }
 
     /// A snapshot of prosperod's operational counters (`active_attaches` is read
@@ -466,6 +475,7 @@ impl FleetManager {
                     name: name.clone(),
                     root: root.clone(),
                     health: RepoHealth::Healthy,
+                    config: repo.config.clone(),
                     agents: Vec::new(),
                 });
             }
