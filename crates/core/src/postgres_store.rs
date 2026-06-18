@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 
 use crate::error::{CoreError, Result};
 use crate::event::FleetEvent;
@@ -31,14 +31,8 @@ pub struct PostgresStore {
 impl PostgresStore {
     /// Connect to Postgres at `url` and ensure the schema exists.
     pub async fn connect(url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .connect(url)
-            .await
-            .map_err(|e| CoreError::Store(format!("connecting to postgres: {e}")))?;
-        sqlx::query(SCHEMA)
-            .execute(&pool)
-            .await
-            .map_err(|e| CoreError::Store(format!("initializing postgres schema: {e}")))?;
+        let pool = crate::pg::connect(url).await?;
+        crate::pg::ensure_schema(&pool, SCHEMA, "events table").await?;
         Ok(Self { pool })
     }
 

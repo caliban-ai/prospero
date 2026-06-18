@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 
 use crate::config_store::ConfigStore;
 use crate::error::{CoreError, Result};
@@ -25,14 +25,8 @@ pub struct PostgresConfigStore {
 impl PostgresConfigStore {
     /// Connect to Postgres at `url` and ensure the schema exists.
     pub async fn connect(url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .connect(url)
-            .await
-            .map_err(|e| CoreError::Store(format!("connecting to postgres: {e}")))?;
-        sqlx::query(SCHEMA)
-            .execute(&pool)
-            .await
-            .map_err(|e| CoreError::Store(format!("initializing config schema: {e}")))?;
+        let pool = crate::pg::connect(url).await?;
+        crate::pg::ensure_schema(&pool, SCHEMA, "repos table").await?;
         Ok(Self { pool })
     }
 

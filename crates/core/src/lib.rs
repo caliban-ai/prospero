@@ -17,6 +17,7 @@ pub mod leased_ownership;
 pub mod metrics;
 pub mod model;
 pub mod ownership;
+mod pg;
 pub mod postgres_config_store;
 pub mod postgres_store;
 pub mod provider_env;

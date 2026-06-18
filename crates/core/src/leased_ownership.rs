@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 
 use crate::Result;
 use crate::error::CoreError;
@@ -41,29 +41,8 @@ impl LeasedOwnership {
     /// Connect, ensure the lease table exists, and identify this replica.
     /// `ttl_secs` is the lease lifetime; call [`Self::heartbeat`] well within it.
     pub async fn connect(url: &str, replica_id: String, ttl_secs: f64) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .connect(url)
-            .await
-            .map_err(|e| CoreError::Store(format!("connecting to postgres: {e}")))?;
-        // `CREATE TABLE IF NOT EXISTS` is not atomic at the system-catalog level:
-        // when several replicas boot concurrently against a fresh DB they can race
-        // creating the table. The loser surfaces the race as one of a few codes —
-        // a duplicate-key error on a `pg_*` catalog index (e.g.
-        // `pg_type_typname_nsp_index`, SQLSTATE 23505 unique_violation),
-        // duplicate_table (42P07), or duplicate_object/type for the table's
-        // implicit row-type (42710, "type \"leases\" already exists"). All three
-        // mean the table now exists, which is all we wanted, so treat them as
-        // success and fail only on a genuine error.
-        if let Err(e) = sqlx::query(SCHEMA).execute(&pool).await {
-            let benign = e
-                .as_database_error()
-                .and_then(|db| db.code())
-                .map(|code| matches!(code.as_ref(), "23505" | "42P07" | "42710"))
-                .unwrap_or(false);
-            if !benign {
-                return Err(CoreError::Store(format!("creating leases table: {e}")));
-            }
-        }
+        let pool = crate::pg::connect(url).await?;
+        crate::pg::ensure_schema(&pool, SCHEMA, "leases table").await?;
         Ok(Self {
             pool,
             replica_id,
@@ -358,9 +337,9 @@ mod tests {
         let thief = owner(&url, 30.0).await;
         a.try_acquire(&kept).await.unwrap();
         a.try_acquire(&lost).await.unwrap();
-        // A peer steals `lost` out from under `a` (forced, simulating a takeover
-        // after a missed heartbeat). Use the raw DELETE+claim via try_acquire on
-        // an expired lease is slow, so steal directly:
+        // A peer steals `lost` out from under `a` (simulating a takeover after a
+        // missed heartbeat). Stealing via an expired lease would mean waiting out
+        // a TTL, so force the takeover directly.
         thief.force_steal(&lost).await;
 
         a.heartbeat().await;
