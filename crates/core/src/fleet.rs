@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{RwLock, broadcast, watch};
 
+use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
 use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
@@ -169,7 +170,7 @@ impl FleetConfig {
 #[derive(Clone)]
 struct Emitter {
     store: Arc<dyn Store>,
-    bus: broadcast::Sender<FleetEvent>,
+    bus: Arc<dyn EventBus>,
     /// Next `seq` per stream key, seeded lazily from the store's high-water.
     seqs: Arc<Mutex<HashMap<String, u64>>>,
     metrics: Arc<Metrics>,
@@ -226,7 +227,7 @@ impl Emitter {
         };
         // Live SSE flows regardless of persistence (ADR-0004 favors a never-down
         // fleet view). Ignore send errors: no subscribers is fine.
-        let _ = self.bus.send(event);
+        self.bus.publish(event);
         if let Some(e) = append_err {
             tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist event");
             self.emit_persist_gap(repo, agent_id, lost_seq, e);
@@ -256,7 +257,7 @@ impl Emitter {
                 tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist store-gap marker");
             }
         }
-        let _ = self.bus.send(marker);
+        self.bus.publish(marker);
     }
 }
 
@@ -285,7 +286,7 @@ impl FleetManager {
     /// sequence from the store's high-water mark.
     pub fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
         let registry = Registry::load(&config.registry_path())?;
-        let (bus, _) = broadcast::channel(config.event_buffer);
+        let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
         let emitter = Emitter {
             store,
             bus,
@@ -1204,10 +1205,9 @@ mod tests {
     }
 
     fn emitter_with(store: Arc<dyn Store>) -> Emitter {
-        let (bus, _keep) = broadcast::channel(16);
         Emitter {
             store,
-            bus,
+            bus: Arc::new(InProcessBus::new(16)),
             seqs: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         }

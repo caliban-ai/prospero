@@ -5,6 +5,7 @@
 //! agents across repos and speaks caliban's NDJSON IPC protocol through a thin,
 //! self-contained client — the wire format is the only coupling to caliban.
 
+pub mod bus;
 pub mod caliband;
 pub mod discovery;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod store;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 
+pub use bus::{EventBus, InProcessBus};
 pub use caliband::wire::AttachInbound;
 pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
