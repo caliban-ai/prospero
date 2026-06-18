@@ -28,7 +28,7 @@ pub async fn agent_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Subscribe BEFORE reading history so no live event is missed in the gap.
     let mut rx = st.manager.subscribe();
-    let history = st.manager.history(&id, q.from).unwrap_or_default();
+    let history = st.manager.history(&id, q.from).await.unwrap_or_default();
 
     let body = stream! {
         // 1) Replay persisted history, stopping if it already contains the
@@ -54,7 +54,7 @@ pub async fn agent_stream(
         //    the durable store, rather than silently skipping them.
         let mut tailer = Tailer::new(id, last_delivered, st.manager.clone());
         loop {
-            match tailer.on_recv(rx.recv().await) {
+            match tailer.on_recv(rx.recv().await).await {
                 Step::Emit(frames) => {
                     for f in frames {
                         yield Ok(frame_to_event(&f));

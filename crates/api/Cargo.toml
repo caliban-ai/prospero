@@ -9,6 +9,7 @@ axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 async-stream = { workspace = true }
+async-trait = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -16,6 +17,7 @@ tracing.workspace = true
 [dev-dependencies]
 prospero-core = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["test-util"] }
+async-trait = { workspace = true }
 tower = "0.5"
 tempfile.workspace = true
 http-body-util = "0.1"

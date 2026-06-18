@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -21,17 +22,18 @@ use tower::ServiceExt;
 /// readiness endpoint's degraded (503) path.
 struct UnwritableStore(JsonlStore);
 
+#[async_trait]
 impl Store for UnwritableStore {
-    fn append(&self, event: &FleetEvent) -> Result<()> {
-        self.0.append(event)
+    async fn append(&self, event: &FleetEvent) -> Result<()> {
+        self.0.append(event).await
     }
-    fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
-        self.0.replay(stream_key, from_seq)
+    async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
+        self.0.replay(stream_key, from_seq).await
     }
-    fn high_water(&self, stream_key: &str) -> Result<u64> {
-        self.0.high_water(stream_key)
+    async fn high_water(&self, stream_key: &str) -> Result<u64> {
+        self.0.high_water(stream_key).await
     }
-    fn writable(&self) -> bool {
+    async fn writable(&self) -> bool {
         false
     }
 }

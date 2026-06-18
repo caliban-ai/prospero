@@ -117,7 +117,7 @@ pub async fn get_agent_events(
     Path(id): Path<String>,
     Query(q): Query<FromSeq>,
 ) -> Result<Json<Vec<prospero_core::FleetEvent>>, ApiError> {
-    Ok(Json(st.manager.history(&id, q.from)?))
+    Ok(Json(st.manager.history(&id, q.from).await?))
 }
 
 /// `POST /api/agents/{id}/kill`.
