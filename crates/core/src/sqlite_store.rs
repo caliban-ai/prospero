@@ -42,7 +42,11 @@ impl SqliteStore {
         let opts = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            // WAL lets readers run during a write; concurrent *writers* still
+            // serialize, so wait for the write lock instead of erroring with
+            // SQLITE_BUSY immediately.
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .connect_with(opts)
             .await
@@ -119,17 +123,23 @@ impl Store for SqliteStore {
     }
 
     async fn writable(&self) -> bool {
-        match self.pool.begin().await {
-            Ok(mut tx) => {
-                let ok = sqlx::query("CREATE TABLE IF NOT EXISTS _writable_probe (x INTEGER)")
-                    .execute(&mut *tx)
-                    .await
-                    .is_ok();
-                let _ = tx.rollback().await;
-                ok
-            }
-            Err(_) => false,
-        }
+        // Non-destructive write probe: insert a sentinel row inside a
+        // transaction we always roll back. Exercises the same write path as
+        // `append` (detecting a read-only / full store) without persisting
+        // anything and without DDL. `seq = -1` cannot collide with a real
+        // event (seq is u64) and the rollback ensures it never lands.
+        let Ok(mut tx) = self.pool.begin().await else {
+            return false;
+        };
+        let ok = sqlx::query(
+            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind) \
+             VALUES ('__writable_probe__', -1, '', '', '', 'null')",
+        )
+        .execute(&mut *tx)
+        .await
+        .is_ok();
+        let _ = tx.rollback().await;
+        ok
     }
 }
 
