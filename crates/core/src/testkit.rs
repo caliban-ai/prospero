@@ -182,17 +182,21 @@ async fn handle_control_conn(
                 st.next_id += 1;
                 let id = format!("agent{:03}", st.next_id);
                 let socket_path = dir.join(format!("{id}.sock"));
-                // Default script: an init frame then a success result.
+                // Default script: a turn-start book-keeping frame then a
+                // run-end (caliban's `TurnEvent` vocabulary — see ADR-0003).
                 let script = vec![
                     serde_json::json!({
-                        "type": "system", "subtype": "init",
+                        "type": "TurnStart",
+                        "turn_index": 0,
+                        "message_id": id.clone(),
                         "model": spec.model.clone().unwrap_or_else(|| "model".into()),
-                        "tools": ["Read"],
-                        "session_id": id.clone(),
                     }),
                     serde_json::json!({
-                        "type": "result", "subtype": "success",
-                        "total_cost_usd": 0.0, "turns": 1,
+                        "type": "RunEnd",
+                        "final_messages": [],
+                        "total_usage": {},
+                        "turn_count": 1,
+                        "stopped_for": "EndOfTurn",
                     }),
                 ];
                 let record = AgentRecord {

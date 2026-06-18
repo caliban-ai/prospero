@@ -335,7 +335,7 @@ async fn events_endpoint_returns_history_after_poll() {
     h.fake
         .add_agent(
             rec,
-            vec![serde_json::json!({"type":"text","delta":"hi from api"})],
+            vec![serde_json::json!({"type":"AssistantTextDelta","turn_index":0,"content_block_index":0,"text":"hi from api"})],
         )
         .await;
     h.manager.poll_repo_once("repo").await;
@@ -371,8 +371,8 @@ async fn sse_stream_closes_after_agent_finished() {
         .add_agent(
             rec,
             vec![
-                serde_json::json!({"type":"system","subtype":"init","model":"m","tools":[],"session_id":"s"}),
-                serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.0,"turns":1}),
+                serde_json::json!({"type":"TurnStart","turn_index":0,"message_id":"s","model":"m"}),
+                serde_json::json!({"type":"RunEnd","final_messages":[],"total_usage":{},"turn_count":1,"stopped_for":"EndOfTurn"}),
             ],
         )
         .await;
