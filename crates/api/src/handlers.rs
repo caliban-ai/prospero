@@ -21,17 +21,17 @@ pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
 /// `GET /api/repos` — managed repos with health and agent counts.
 pub async fn get_repos(State(st): State<AppState>) -> Json<Vec<RepoSummary>> {
     let snap = st.manager.snapshot().await;
-    let mut out = Vec::with_capacity(snap.repos.len());
-    for r in snap.repos {
-        let config = st.manager.repo_config(&r.name).await.unwrap_or_default();
-        out.push(RepoSummary {
+    let out = snap
+        .repos
+        .into_iter()
+        .map(|r| RepoSummary {
             name: r.name,
             root: r.root.display().to_string(),
             health: r.health,
             agent_count: r.agents.len(),
-            config,
-        });
-    }
+            config: r.config,
+        })
+        .collect();
     Json(out)
 }
 

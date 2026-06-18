@@ -465,6 +465,28 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
         .expect("repo 'p' not found");
     assert_eq!(p["config"]["provider"], "ollama");
     assert_eq!(p["config"]["base_url"], "http://h:11434");
+
+    // The fleet snapshot must surface the same config (#48).
+    let fleet_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/fleet")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fleet_resp.status(), StatusCode::OK);
+    let fleet = json_body(fleet_resp).await;
+    let fp = fleet["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "p")
+        .expect("repo 'p' not in fleet snapshot");
+    assert_eq!(fp["config"]["provider"], "ollama");
+    assert_eq!(fp["config"]["base_url"], "http://h:11434");
 }
 
 #[tokio::test]

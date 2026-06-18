@@ -280,7 +280,11 @@ fn print_repos(repos: &serde_json::Value) {
         let root = r["root"].as_str().unwrap_or("?");
         let health = r["health"]["state"].as_str().unwrap_or("?");
         let count = r["agent_count"].as_u64().unwrap_or(0);
-        println!("{name:<16} {health:<12} {count} agents   {root}");
+        let provider = r["config"]["provider"]
+            .as_str()
+            .map(|p| format!("  {p}"))
+            .unwrap_or_default();
+        println!("{name:<16} {health:<12} {count} agents   {root}{provider}");
     }
 }
 
@@ -297,7 +301,11 @@ fn print_fleet(fleet: &serde_json::Value) {
     for repo in repos {
         let name = repo["name"].as_str().unwrap_or("?");
         let health = repo["health"]["state"].as_str().unwrap_or("?");
-        println!("\n{name}  [{health}]");
+        let provider = repo["config"]["provider"]
+            .as_str()
+            .map(|p| format!("  provider={p}"))
+            .unwrap_or_default();
+        println!("\n{name}  [{health}]{provider}");
         let agents = repo["agents"].as_array().cloned().unwrap_or_default();
         if agents.is_empty() {
             println!("  (no agents)");

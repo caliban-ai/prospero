@@ -105,6 +105,10 @@ pub struct Repo {
     pub root: PathBuf,
     /// Health of the repo's caliband daemon.
     pub health: RepoHealth,
+    /// The repo's provider config (so operators can read back what a repo is
+    /// configured with). Defaults to empty for repos with no config set.
+    #[serde(default)]
+    pub config: crate::registry::RepoProviderConfig,
     /// Agents currently known under this repo.
     pub agents: Vec<Agent>,
 }
@@ -176,6 +180,7 @@ mod tests {
                 name: "prospero".into(),
                 root: "/r".into(),
                 health: RepoHealth::Healthy,
+                config: crate::registry::RepoProviderConfig::default(),
                 agents: vec![Agent {
                     id: "a1".into(),
                     name: "x".into(),
