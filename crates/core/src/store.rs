@@ -231,4 +231,37 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(store.high_water("a").unwrap(), 1);
     }
+
+    /// The behavioral contract every `Store` must satisfy. Reused by later
+    /// backends (sqlite, Postgres) so parity is enforced, not assumed.
+    fn store_conformance(store: &dyn Store) {
+        // Empty store: high-water 0, replay empty, writable.
+        assert_eq!(store.high_water("a").unwrap(), 0);
+        assert!(store.replay("a", 0).unwrap().is_empty());
+        assert!(store.writable());
+
+        // Appends are per-stream ordered and isolated.
+        store.append(&ev(1, "a", "a1")).unwrap();
+        store.append(&ev(1, "b", "b1")).unwrap();
+        store.append(&ev(2, "a", "a2")).unwrap();
+
+        assert_eq!(store.high_water("a").unwrap(), 2);
+        assert_eq!(store.high_water("b").unwrap(), 1);
+
+        let a = store.replay("a", 0).unwrap();
+        assert_eq!(a.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        // from_seq is inclusive lower bound.
+        let a_from2 = store.replay("a", 2).unwrap();
+        assert_eq!(a_from2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+        // Stream isolation: "b" never sees "a"'s events.
+        let b = store.replay("b", 0).unwrap();
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn jsonl_store_satisfies_conformance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        store_conformance(&store);
+    }
 }
