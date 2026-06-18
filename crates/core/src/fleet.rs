@@ -444,6 +444,12 @@ impl FleetManager {
     ) -> Result<()> {
         let name = name.into();
         let root = root.into();
+        // Canonicalize so symlink aliases (e.g. `/tmp` vs `/private/tmp`)
+        // collapse to one root — both for the duplicate-alias guard in the
+        // registry and so the stored root matches the one caliband hashes for
+        // its socket (#45, #47). Best-effort: a not-yet-existing path is kept
+        // as-is rather than rejected.
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         let repo = {
             let mut reg = self.inner.registry.write().await;
             reg.add(name.clone(), root.clone())?;

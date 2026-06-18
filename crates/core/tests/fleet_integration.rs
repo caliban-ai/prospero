@@ -388,3 +388,25 @@ async fn agent_gone_emitted_when_it_disappears() {
     let kinds = collect_kinds(&mut sub, Duration::from_secs(1)).await;
     assert!(kinds.iter().any(|k| matches!(k, EventKind::AgentGone)));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_repo_rejects_a_symlink_alias_of_an_existing_root() {
+    // A repo registered under one name, then a symlink to the same dir under
+    // another name, must be rejected: both canonicalize to one caliban daemon
+    // and would double-emit into the same agent stream. (#47)
+    let h = setup().await;
+    let real = tempfile::tempdir().unwrap();
+    let real_canon = real.path().canonicalize().unwrap();
+    h.manager.add_repo("real", &real_canon).await.unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let link = scratch.path().join("alias");
+    std::os::unix::fs::symlink(&real_canon, &link).unwrap();
+
+    let err = h.manager.add_repo("alias", &link).await.unwrap_err();
+    assert!(
+        err.to_string().contains("repo 'real'"),
+        "the alias must be rejected naming the holder, got: {err}"
+    );
+}

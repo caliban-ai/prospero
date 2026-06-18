@@ -90,6 +90,18 @@ impl Registry {
                 "repo name '{name}' already registered with a different root"
             )));
         }
+        // Reject a *different* name occupying the same root: two names for one
+        // root alias a single caliband daemon, so both poll the same agents and
+        // double-emit into the same event stream. Roots are canonicalized
+        // before they reach here (see `FleetManager::add_repo_with_config`), so
+        // this also catches symlink aliases like `/tmp` vs `/private/tmp`. (#47)
+        if let Some(other) = self.repos.iter().find(|r| r.root == root) {
+            return Err(CoreError::Discovery(format!(
+                "root {} is already registered as repo '{}'",
+                root.display(),
+                other.name
+            )));
+        }
         self.repos.push(RegisteredRepo {
             name,
             root,
@@ -146,6 +158,17 @@ mod tests {
         let mut reg = Registry::default();
         reg.add("p", "/r1").unwrap();
         assert!(reg.add("p", "/r2").is_err());
+    }
+
+    #[test]
+    fn add_different_name_same_root_errors() {
+        // Two names for one root would alias a single caliban daemon and
+        // double-emit events into the same agent stream. (#47)
+        let mut reg = Registry::default();
+        reg.add("a", "/r").unwrap();
+        let err = reg.add("b", "/r").unwrap_err().to_string();
+        assert!(err.contains("repo 'a'"), "names the holder: {err}");
+        assert_eq!(reg.repos.len(), 1, "the alias must not be registered");
     }
 
     #[test]
