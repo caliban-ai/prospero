@@ -35,7 +35,7 @@ pub async fn agent_stream(
         //    terminal event. Track the last seq delivered as the dedup
         //    high-water mark for the live tail. Seed it from the client's
         //    `from` floor so a later self-heal replay never re-sends events
-        //    below what the client asked for (seq is a global counter, so an
+        //    below what the client asked for (seq is monotonic per stream, so an
         //    agent can legitimately have no events at or above `from` yet).
         let mut last_delivered = q.from.saturating_sub(1);
         for ev in history {
