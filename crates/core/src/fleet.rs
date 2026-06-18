@@ -737,13 +737,22 @@ impl FleetManager {
     async fn start_attach(&self, repo: &str, agent_id: &str, client: CalibandClient) {
         // Only drive an agent this process owns. Standalone always acquires;
         // clustered consults the lease (Phase 2).
+        //
+        // Phase 2 note: the returned Lease is intentionally dropped here because
+        // SelfOwnsAll needs no renewal. A real LeasedOwnership will instead need
+        // the spawned attach task to hold the Lease and renew it periodically,
+        // which means threading the Lease into the task rather than only gating on it.
         if self.inner.ownership.try_acquire(agent_id).is_none() {
             return;
         }
         {
             let mut attached = self.inner.attached.lock().unwrap();
             if !attached.insert(agent_id.to_string()) {
-                self.inner.ownership.release(agent_id); // re-acquired but already attached
+                // SelfOwnsAll: release is a no-op. Phase 2 note: a real
+                // LeasedOwnership must NOT blindly release here — the already-running
+                // attach task still holds this stream's lease. Make try_acquire
+                // idempotent (return the live lease) rather than releasing it.
+                self.inner.ownership.release(agent_id);
                 return; // already attached
             }
         }
@@ -784,7 +793,7 @@ impl FleetManager {
     }
 
     /// Whether a per-agent attach task is currently registered (test/obs helper).
-    pub async fn is_attached(&self, agent_id: &str) -> bool {
+    pub fn is_attached(&self, agent_id: &str) -> bool {
         self.inner.attached.lock().unwrap().contains(agent_id)
     }
 
@@ -1139,8 +1148,9 @@ mod tests {
         mgr.add_repo("p", &root).await.unwrap();
 
         let id = mgr.spawn_agent("p", SpawnRequest::new("hi")).await.unwrap();
-        // Ownership acquired → the agent is in the attached set.
-        assert!(mgr.is_attached(&id).await, "owned agent must be attached");
+        // is_attached is set synchronously in start_attach before tokio::spawn,
+        // so the check needs no delay.
+        assert!(mgr.is_attached(&id), "owned agent must be attached");
     }
 
     #[tokio::test]
