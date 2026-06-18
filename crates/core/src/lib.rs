@@ -7,6 +7,7 @@
 
 pub mod bus;
 pub mod caliband;
+pub mod config_store;
 pub mod discovery;
 pub mod error;
 pub mod event;
@@ -24,6 +25,7 @@ pub mod testkit;
 
 pub use bus::{EventBus, InProcessBus};
 pub use caliband::wire::AttachInbound;
+pub use config_store::{ConfigStore, SqliteConfigStore};
 pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};

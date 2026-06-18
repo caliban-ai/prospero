@@ -433,6 +433,61 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
     assert_eq!(store.prune("2026-03-01T00:00:00+00:00").await.unwrap(), 0);
 }
 
+/// Contract every [`crate::config_store::ConfigStore`] must satisfy: upsert is
+/// insert-or-update by name, list returns all repos (name-ordered), delete is
+/// idempotent. Backends call this to prove identical config semantics.
+pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigStore) {
+    use crate::registry::{RegisteredRepo, RepoProviderConfig};
+
+    assert!(store.list_repos().await.unwrap().is_empty());
+
+    let r = RegisteredRepo {
+        name: "p".into(),
+        root: "/r".into(),
+        config: RepoProviderConfig {
+            provider: Some("ollama".into()),
+            ..Default::default()
+        },
+    };
+    store.upsert_repo(&r).await.unwrap();
+    let repos = store.list_repos().await.unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "p");
+    assert_eq!(repos[0].root, std::path::PathBuf::from("/r"));
+    assert_eq!(repos[0].config.provider.as_deref(), Some("ollama"));
+
+    let mut r2 = r.clone();
+    r2.config.provider = Some("anthropic".into());
+    store.upsert_repo(&r2).await.unwrap();
+    let repos = store.list_repos().await.unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].config.provider.as_deref(), Some("anthropic"));
+
+    assert!(store.delete_repo("p").await.unwrap());
+    assert!(!store.delete_repo("p").await.unwrap());
+    assert!(store.list_repos().await.unwrap().is_empty());
+
+    // `list_repos` is name-ordered: insert out of order, expect sorted output.
+    for name in ["z", "a"] {
+        store
+            .upsert_repo(&RegisteredRepo {
+                name: name.into(),
+                root: format!("/{name}").into(),
+                config: RepoProviderConfig::default(),
+            })
+            .await
+            .unwrap();
+    }
+    let names: Vec<String> = store
+        .list_repos()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(names, vec!["a".to_string(), "z".to_string()]);
+}
+
 /// Build a minimal `AgentRecord` for tests.
 pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) -> AgentRecord {
     AgentRecord {
