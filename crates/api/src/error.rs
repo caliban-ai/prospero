@@ -36,9 +36,10 @@ impl IntoResponse for ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "unreachable")
             }
             CoreError::Protocol(_) => (StatusCode::BAD_GATEWAY, "protocol"),
-            CoreError::Store(_) | CoreError::Io(_) | CoreError::Json(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-            }
+            CoreError::Store(_)
+            | CoreError::SeqConflict
+            | CoreError::Io(_)
+            | CoreError::Json(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         let body = ErrorBody {
             error: self.0.to_string(),

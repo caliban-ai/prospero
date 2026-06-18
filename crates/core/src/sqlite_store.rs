@@ -13,7 +13,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 
 use crate::error::{CoreError, Result};
 use crate::event::FleetEvent;
-use crate::store::Store;
+use crate::store::{Store, map_append_error};
 
 /// One-table schema. `global_ordinal` (rowid) is durable insertion order;
 /// `UNIQUE(stream_key, seq)` is the per-stream monotonicity backstop and also
@@ -75,7 +75,7 @@ impl Store for SqliteStore {
         .bind(kind)
         .execute(&self.pool)
         .await
-        .map_err(|e| CoreError::Store(format!("append: {e}")))?;
+        .map_err(map_append_error)?;
         Ok(())
     }
 

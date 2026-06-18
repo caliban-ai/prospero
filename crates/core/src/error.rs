@@ -47,6 +47,12 @@ pub enum CoreError {
     #[error("store error: {0}")]
     Store(String),
 
+    /// An append lost the race for a per-stream `seq` to a concurrent writer
+    /// (another replica). Distinct from [`CoreError::Store`] so the emitter can
+    /// re-seed from the durable high-water and retry rather than drop the event.
+    #[error("event seq conflict")]
+    SeqConflict,
+
     /// A repo name was not registered.
     #[error("repo not registered: {0}")]
     RepoNotFound(String),

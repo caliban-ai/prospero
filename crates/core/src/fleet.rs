@@ -223,25 +223,50 @@ impl Emitter {
     }
 
     async fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
-        let event = self.next_event(repo, agent_id, kind).await;
+        let mut event = self.next_event(repo, agent_id, kind).await;
+        let append_err = self.append_with_seq_retry(&mut event).await;
         let lost_seq = event.seq;
-        let append_err = match self.store.append(&event).await {
-            Ok(()) => {
-                self.metrics.record_append_ok();
-                None
-            }
-            Err(e) => {
-                self.metrics.record_append_failure();
-                Some(e)
-            }
-        };
+        match &append_err {
+            None => self.metrics.record_append_ok(),
+            Some(_) => self.metrics.record_append_failure(),
+        }
         // Live SSE flows regardless of persistence (ADR-0004 favors a never-down
-        // fleet view). Ignore send errors: no subscribers is fine.
+        // fleet view). Ignore send errors: no subscribers is fine. Publish the
+        // event with its FINAL seq (a conflict retry may have bumped it).
         self.bus.publish(event);
         if let Some(e) = append_err {
             tracing::warn!(target: "prospero_fleet", error = %e, "failed to persist event");
             self.emit_persist_gap(repo, agent_id, lost_seq, e).await;
         }
+    }
+
+    /// Append `event`, re-seeding its `seq` from the durable high-water and
+    /// retrying when a concurrent writer (another replica) took the same
+    /// per-stream seq. This preserves the event on a benign cross-replica race
+    /// instead of dropping it. Returns the terminal error, if any. (#49)
+    async fn append_with_seq_retry(&self, event: &mut FleetEvent) -> Option<CoreError> {
+        const SEQ_CONFLICT_RETRIES: u32 = 8;
+        let stream_key = event.stream_key();
+        let mut attempts = 0;
+        loop {
+            match self.store.append(event).await {
+                Ok(()) => return None,
+                Err(CoreError::SeqConflict) if attempts < SEQ_CONFLICT_RETRIES => {
+                    attempts += 1;
+                    // The winning write is now durable, so re-reading the
+                    // high-water yields a fresh, higher seq.
+                    self.reseed_seq(&stream_key).await;
+                    event.seq = self.next_seq(&stream_key).await;
+                }
+                Err(e) => return Some(e),
+            }
+        }
+    }
+
+    /// Forget the cached counter for `stream_key` so the next [`next_seq`] call
+    /// re-reads the durable high-water (which reflects the winning write).
+    async fn reseed_seq(&self, stream_key: &str) {
+        self.seqs.lock().await.remove(stream_key);
     }
 
     /// Record a durable-store divergence: the event at `lost_seq` reached the
@@ -250,7 +275,7 @@ impl Emitter {
     /// on the bus so live consumers know history is incomplete. The marker keeps
     /// the live and durable views from silently diverging (#25, ADR-0004).
     async fn emit_persist_gap(&self, repo: &str, agent_id: &str, lost_seq: u64, err: CoreError) {
-        let marker = self
+        let mut marker = self
             .next_event(
                 repo,
                 agent_id,
@@ -260,9 +285,9 @@ impl Emitter {
                 },
             )
             .await;
-        match self.store.append(&marker).await {
-            Ok(()) => self.metrics.record_append_ok(),
-            Err(e) => {
+        match self.append_with_seq_retry(&mut marker).await {
+            None => self.metrics.record_append_ok(),
+            Some(e) => {
                 // Hard-down store: the gap is now observable only via logs
                 // (documented degradation), but live consumers are still signalled.
                 self.metrics.record_append_failure();
@@ -1464,6 +1489,51 @@ mod tests {
             .unwrap();
         // The new event continues from the stored high-water (5 → 6).
         assert_eq!(a1.last().unwrap().seq, 6);
+    }
+
+    #[tokio::test]
+    async fn emit_retries_on_seq_conflict_instead_of_dropping() {
+        // A peer replica racing on the same stream takes a seq this emitter also
+        // computes; the append must re-seed from the durable high-water and
+        // retry, preserving the event rather than dropping it. Uses the real
+        // SqliteStore for its `UNIQUE(stream_key, seq)` constraint. (#49)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::sqlite_store::SqliteStore::open(dir.path())
+                .await
+                .unwrap(),
+        );
+        let emitter = emitter_with(store.clone());
+
+        // First emit → seq 1; the emitter caches the stream counter at 1.
+        emitter.emit("r", "a1", EventKind::AgentSpawned).await;
+
+        // A peer writes seq 2 directly to the shared store (high-water → 2).
+        store.append(&ev(2, "a1", "from-peer")).await.unwrap();
+
+        // The emitter's cached counter is still 1, so it computes seq 2 →
+        // conflict → re-seed (high-water 2) → retry at seq 3 → persisted.
+        emitter.emit("r", "a1", EventKind::AgentGone).await;
+
+        let hist = store
+            .replay(&crate::event::stream_key_for("r", "a1"), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            hist.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the racing event must be preserved at the next free seq, not dropped"
+        );
+        assert!(
+            matches!(hist.last().unwrap().kind, EventKind::AgentGone),
+            "the retried emitter event lands at seq 3: {:?}",
+            hist.last().unwrap().kind
+        );
+        assert_eq!(
+            emitter.metrics.snapshot(0).append_failures,
+            0,
+            "a resolved conflict must not count as a persist failure"
+        );
     }
 
     #[tokio::test]

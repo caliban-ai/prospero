@@ -14,6 +14,21 @@ use async_trait::async_trait;
 use crate::error::{CoreError, Result};
 use crate::event::FleetEvent;
 
+/// Map a sqlx error from an event `append` into a [`CoreError`]. A unique
+/// constraint violation on `(stream_key, seq)` means a concurrent writer
+/// (another replica) took this seq, surfaced as [`CoreError::SeqConflict`] so
+/// the emitter can re-seed from the durable high-water and retry instead of
+/// dropping the event. Shared by the sqlite and postgres backends. (#49)
+pub(crate) fn map_append_error(e: sqlx::Error) -> CoreError {
+    if e.as_database_error()
+        .is_some_and(|d| d.is_unique_violation())
+    {
+        CoreError::SeqConflict
+    } else {
+        CoreError::Store(format!("append: {e}"))
+    }
+}
+
 /// A durable, append-only event log keyed by stream.
 #[async_trait]
 pub trait Store: Send + Sync {
