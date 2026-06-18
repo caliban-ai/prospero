@@ -141,6 +141,15 @@ impl Store for SqliteStore {
         let _ = tx.rollback().await;
         ok
     }
+
+    async fn prune(&self, before_ts: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM events WHERE ts < ?")
+            .bind(before_ts)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Store(format!("prune: {e}")))?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +190,12 @@ mod tests {
         let s = SqliteStore::open(dir.path()).await.unwrap();
         s.append(&ev(1, "a")).await.unwrap();
         assert!(s.append(&ev(1, "a")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_prunes_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path()).await.unwrap();
+        crate::testkit::store_prune_conformance(&store).await;
     }
 }

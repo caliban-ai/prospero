@@ -390,6 +390,38 @@ pub async fn store_conformance(store: &dyn crate::store::Store) {
     assert_eq!(b.len(), 1);
 }
 
+/// Retention contract: `prune(before_ts)` deletes events with `ts < before_ts`
+/// (RFC-3339, lexically ordered) and returns the count removed, leaving newer
+/// events intact. Backends call this to prove identical retention semantics.
+pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
+    use crate::event::{EventKind, FleetEvent};
+
+    fn ev(seq: u64, ts: &str) -> FleetEvent {
+        FleetEvent {
+            seq,
+            ts: ts.into(),
+            repo: "r".into(),
+            agent_id: "a".into(),
+            kind: EventKind::AgentSpawned,
+        }
+    }
+
+    store.append(&ev(1, "2026-01-01T00:00:00Z")).await.unwrap();
+    store.append(&ev(2, "2026-03-01T00:00:00Z")).await.unwrap();
+    store.append(&ev(3, "2026-06-01T00:00:00Z")).await.unwrap();
+
+    let removed = store.prune("2026-03-01T00:00:00Z").await.unwrap();
+    assert_eq!(removed, 1);
+
+    let remaining = store.replay("a", 0).await.unwrap();
+    assert_eq!(
+        remaining.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    assert_eq!(store.prune("2026-03-01T00:00:00Z").await.unwrap(), 0);
+}
+
 /// Build a minimal `AgentRecord` for tests.
 pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) -> AgentRecord {
     AgentRecord {

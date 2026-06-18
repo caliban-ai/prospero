@@ -30,6 +30,10 @@ pub trait Store: Send + Sync {
     /// Whether the backend can currently accept writes. A cheap, non-destructive
     /// probe used by the readiness endpoint.
     async fn writable(&self) -> bool;
+
+    /// Delete events with `ts < before_ts` (RFC-3339, lexically ordered).
+    /// Returns the number removed. Backs age-based retention (#4).
+    async fn prune(&self, before_ts: &str) -> Result<u64>;
 }
 
 /// Append-only JSON-lines store. All events go to a single `events.jsonl`;
@@ -127,6 +131,30 @@ impl Store for JsonlStore {
             .append(true)
             .open(&self.path)
             .is_ok()
+    }
+
+    async fn prune(&self, before_ts: &str) -> Result<u64> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CoreError::Store("event store write lock poisoned".into()))?;
+        let all = self.read_all()?;
+        let before = all.len();
+        let kept: Vec<FleetEvent> = all
+            .into_iter()
+            .filter(|e| e.ts.as_str() >= before_ts)
+            .collect();
+        let removed = (before - kept.len()) as u64;
+        if removed == 0 {
+            return Ok(0);
+        }
+        let mut body = String::new();
+        for e in &kept {
+            body.push_str(&serde_json::to_string(e)?);
+            body.push('\n');
+        }
+        std::fs::write(&self.path, body)?;
+        Ok(removed)
     }
 }
 
@@ -239,5 +267,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
         crate::testkit::store_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn jsonl_store_prunes_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        crate::testkit::store_prune_conformance(&store).await;
     }
 }

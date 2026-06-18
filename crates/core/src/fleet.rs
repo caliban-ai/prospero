@@ -1280,6 +1280,9 @@ mod tests {
         async fn writable(&self) -> bool {
             self.inner.writable().await
         }
+        async fn prune(&self, before_ts: &str) -> Result<u64> {
+            self.inner.prune(before_ts).await
+        }
     }
 
     fn emitter_with(store: Arc<dyn Store>) -> Emitter {

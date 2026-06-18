@@ -36,6 +36,9 @@ impl Store for UnwritableStore {
     async fn writable(&self) -> bool {
         false
     }
+    async fn prune(&self, before_ts: &str) -> Result<u64> {
+        self.0.prune(before_ts).await
+    }
 }
 
 struct Harness {
