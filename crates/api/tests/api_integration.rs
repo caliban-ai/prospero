@@ -31,9 +31,6 @@ impl Store for UnwritableStore {
     fn high_water(&self, stream_key: &str) -> Result<u64> {
         self.0.high_water(stream_key)
     }
-    fn global_high_water(&self) -> Result<u64> {
-        self.0.global_high_water()
-    }
     fn writable(&self) -> bool {
         false
     }

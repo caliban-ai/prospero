@@ -24,10 +24,6 @@ pub trait Store: Send + Sync {
     /// resume that stream's sequence counter across daemon restarts.
     fn high_water(&self, stream_key: &str) -> Result<u64>;
 
-    /// The highest `seq` ever persisted across *all* streams (0 if empty). Used
-    /// to seed the global monotonic sequence counter on daemon restart.
-    fn global_high_water(&self) -> Result<u64>;
-
     /// Whether the backend can currently accept writes. A cheap, non-destructive
     /// probe used by the readiness endpoint.
     fn writable(&self) -> bool;
@@ -117,10 +113,6 @@ impl Store for JsonlStore {
             .map(|e| e.seq)
             .max()
             .unwrap_or(0))
-    }
-
-    fn global_high_water(&self) -> Result<u64> {
-        Ok(self.read_all()?.iter().map(|e| e.seq).max().unwrap_or(0))
     }
 
     fn writable(&self) -> bool {

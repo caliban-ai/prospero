@@ -7,7 +7,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -171,13 +170,35 @@ impl FleetConfig {
 struct Emitter {
     store: Arc<dyn Store>,
     bus: broadcast::Sender<FleetEvent>,
-    seq: Arc<AtomicU64>,
+    /// Next `seq` per stream key, seeded lazily from the store's high-water.
+    seqs: Arc<Mutex<HashMap<String, u64>>>,
     metrics: Arc<Metrics>,
 }
 
 impl Emitter {
     fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let stream_key = crate::event::stream_key_for(repo, agent_id);
+        let seq = {
+            let mut seqs = self.seqs.lock().unwrap();
+            let next = match seqs.get(&stream_key) {
+                Some(n) => n + 1,
+                // First event this run for the stream: resume from durable
+                // high-water. A read failure here is rare (the store was just
+                // opened); fall back to 0 and log, consistent with ADR-0004's
+                // best-effort posture.
+                None => {
+                    self.store.high_water(&stream_key).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            target: "prospero_fleet", stream = %stream_key, error = %e,
+                            "high_water read failed seeding per-stream seq; starting at 0"
+                        );
+                        0
+                    }) + 1
+                }
+            };
+            seqs.insert(stream_key, next);
+            next
+        };
         FleetEvent {
             seq,
             ts: chrono::Utc::now().to_rfc3339(),
@@ -261,12 +282,11 @@ impl FleetManager {
     /// sequence from the store's high-water mark.
     pub fn new(config: FleetConfig, store: Arc<dyn Store>) -> Result<Self> {
         let registry = Registry::load(&config.registry_path())?;
-        let high_water = store.global_high_water()?;
         let (bus, _) = broadcast::channel(config.event_buffer);
         let emitter = Emitter {
             store,
             bus,
-            seq: Arc::new(AtomicU64::new(high_water)),
+            seqs: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         };
         let snapshot = FleetSnapshot {
@@ -1172,9 +1192,6 @@ mod tests {
         fn high_water(&self, stream_key: &str) -> Result<u64> {
             self.inner.high_water(stream_key)
         }
-        fn global_high_water(&self) -> Result<u64> {
-            self.inner.global_high_water()
-        }
         fn writable(&self) -> bool {
             self.inner.writable()
         }
@@ -1185,9 +1202,57 @@ mod tests {
         Emitter {
             store,
             bus,
-            seq: Arc::new(AtomicU64::new(0)),
+            seqs: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    fn ev(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
+        use crate::event::OutputStream;
+        FleetEvent {
+            seq,
+            ts: "t".into(),
+            repo: "r".into(),
+            agent_id: agent.into(),
+            kind: EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk: chunk.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn seq_is_monotonic_per_stream_not_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+
+        // Interleave two agents; each stream numbers from 1 independently.
+        emitter.emit("r", "a1", EventKind::AgentSpawned);
+        emitter.emit("r", "a2", EventKind::AgentSpawned);
+        emitter.emit("r", "a1", EventKind::AgentGone);
+
+        let a1 = emitter.store.replay("a1", 0).unwrap();
+        let a2 = emitter.store.replay("a2", 0).unwrap();
+        assert_eq!(a1.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(a2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn seq_resumes_per_stream_from_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-seed the store: stream "a1" already reached seq 5.
+        {
+            let store = crate::store::JsonlStore::open(dir.path()).unwrap();
+            store.append(&ev(5, "a1", "old")).unwrap();
+        }
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let emitter = emitter_with(store);
+        emitter.emit("r", "a1", EventKind::AgentGone);
+
+        let a1 = emitter.store.replay("a1", 0).unwrap();
+        // The new event continues from the stored high-water (5 → 6).
+        assert_eq!(a1.last().unwrap().seq, 6);
     }
 
     #[test]
