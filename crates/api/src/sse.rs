@@ -26,7 +26,10 @@ pub async fn agent_stream(
     Path(id): Path<String>,
     Query(q): Query<FromSeq>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Subscribe BEFORE reading history so no live event is missed in the gap.
+    // Subscribe BEFORE reading history so no live event is missed in the gap:
+    // InProcessBus registers its receiver here (eagerly); DistributedBus replays
+    // from seq 0 on its first doorbell. Either way the live tail covers every
+    // event after this point, and the `seq` dedup below drops the history overlap.
     let mut sub = st.manager.subscribe(&id);
     let history = st.manager.history(&id, q.from).await.unwrap_or_default();
 

@@ -51,7 +51,8 @@ impl LeasedOwnership {
         })
     }
 
-    /// Build on an existing pool (shared-pool clustered wiring, Phase 2d).
+    /// Build on an existing pool (shared-pool wiring; the daemon uses a pool per
+    /// seam today, so this is for a future single-pool setup).
     pub fn new(pool: PgPool, replica_id: String, ttl_secs: f64) -> Self {
         Self {
             pool,

@@ -9,11 +9,12 @@
 //! durable-first (§4) — the live tail carries only what is durable.
 //!
 //! **Scaling note:** each `subscribe` holds one dedicated `LISTEN` connection
-//! from the pool for the subscription's lifetime, so live subscribers and pool
-//! connections grow 1:1. When 2d shares a single pool across the store, bus,
-//! ownership, and config-store, size that pool for the expected concurrent SSE
-//! fan-out (or, if that ceiling is ever hit, multiplex one listener across
-//! streams — deferred until measured).
+//! from this bus's pool for the subscription's lifetime, so live subscribers and
+//! pool connections grow 1:1. The daemon gives the bus its own pool (the
+//! clustered seams use a pool each today; a single shared pool is a future
+//! tuning option), sized by [`DistributedBus::connect`] for the expected
+//! concurrent SSE fan-out. If that ceiling is ever hit, multiplex one listener
+//! across streams — deferred until measured.
 
 use std::sync::Arc;
 
@@ -34,18 +35,21 @@ pub struct DistributedBus {
 }
 
 impl DistributedBus {
-    /// Build a bus on its own pool (standalone-of-the-bus wiring / tests). In
-    /// `clustered` deployment 2d will instead share one pool across the store,
-    /// bus, ownership, and config-store via [`DistributedBus::new`].
+    /// Build a bus on its own pool. Each live subscription pins one connection
+    /// for its `LISTEN`, so the pool is sized above sqlx's default of 10 to
+    /// allow a useful SSE fan-out before `subscribe`/`publish` start queuing on
+    /// the pool; raise it further (or share a pool) for high-fan-out deployments.
     pub async fn connect(url: &str, store: Arc<dyn Store>) -> Result<Self> {
         let pool = PgPoolOptions::new()
+            .max_connections(32)
             .connect(url)
             .await
             .map_err(|e| crate::error::CoreError::Store(format!("connecting to postgres: {e}")))?;
         Ok(Self { pool, store })
     }
 
-    /// Build a bus on an existing pool (shared-pool clustered wiring).
+    /// Build a bus on an existing pool (shared-pool wiring — size the pool for
+    /// the SSE fan-out, since each subscription pins a `LISTEN` connection).
     pub fn new(pool: PgPool, store: Arc<dyn Store>) -> Self {
         Self { pool, store }
     }
@@ -90,10 +94,19 @@ impl EventBus for DistributedBus {
                 return;
             }
 
-            // Seed from the durable high-water: the bus is the LIVE tail (new
-            // events only); the SSE history path backfills the rest, and the
-            // consumer dedups the overlap on `seq`.
-            let mut last_seq = store.high_water(&key).await.unwrap_or(0);
+            // Seed at 0, so the FIRST doorbell replays the whole durable stream
+            // and the consumer's `seq`-dedup drops the history overlap. Seeding
+            // from a late `high_water()` read instead would be a gap: this
+            // subscription's LISTEN + seed run lazily on first poll — AFTER the
+            // SSE handler has already read history — so an event appended in that
+            // window would be below a late high-water and never replayed by any
+            // later doorbell, yet also absent from the history snapshot. Seeding
+            // at 0 makes delivery independent of the subscribe-vs-history race
+            // (the cost is one deduped re-read of the stream on the first
+            // doorbell; subsequent doorbells replay only the delta as `last_seq`
+            // advances). A floor passed in by the consumer could bound this, but
+            // that is a future optimization, not a correctness need.
+            let mut last_seq = 0u64;
 
             loop {
                 let notif = match listener.recv().await {
@@ -185,14 +198,11 @@ mod tests {
         let agent = unique_agent("agent-deliver");
         let mut sub = bus.subscribe(&agent);
 
-        // The subscriber establishes its LISTEN connection and seeds its
-        // high-water lazily on first poll; that moment isn't observable, and a
-        // single fixed sleep races it under a slow/instrumented build (e.g.
-        // coverage). The bus only tails events appended AFTER it seeds, so we
-        // drive delivery with a bounded retry — append a fresh event and ring
-        // the doorbell until one lands after the listener is live. (Production
-        // doesn't need this: the SSE handler reads history right after
-        // subscribing, which backfills any event in the setup window.)
+        // The subscriber establishes its LISTEN connection lazily on first poll;
+        // that moment isn't observable, and a single fixed sleep races it under a
+        // slow/instrumented build (e.g. coverage). So drive delivery with a
+        // bounded retry — append an event and ring the doorbell until the
+        // (now-live) listener replays it.
         let recv =
             tokio::spawn(
                 async move { tokio::time::timeout(Duration::from_secs(20), sub.next()).await },
@@ -213,6 +223,60 @@ mod tests {
         match delivered.expect("subscriber never received a doorbell event after 40 tries") {
             Some(BusEvent::Event(ev)) => assert_eq!(ev.agent_id, agent),
             other => panic!("expected a live event, got {other:?}"),
+        }
+    }
+
+    /// Regression for the cross-replica subscribe-window gap: the subscriber's
+    /// LISTEN + seed run lazily on first poll, so an event already durable
+    /// BEFORE that first doorbell (e.g. appended on the owner replica between a
+    /// reader replica's history read and its first poll) must still be
+    /// delivered. Seeding `last_seq` from 0 replays it; a late `high_water` seed
+    /// would skip it forever.
+    #[tokio::test]
+    async fn delivers_an_event_that_predates_the_first_doorbell() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "SKIP delivers_an_event_that_predates_the_first_doorbell: DATABASE_URL unset"
+            );
+            return;
+        };
+
+        let store = PostgresStore::connect(&url).await.unwrap();
+        let store: Arc<dyn Store> = Arc::new(store);
+        let bus = DistributedBus::connect(&url, store.clone()).await.unwrap();
+
+        let agent = unique_agent("agent-predate");
+        // Append the "window" event BEFORE the subscriber's first poll.
+        let early = ev(1, &agent);
+        store.append(&early).await.unwrap();
+
+        let mut sub = bus.subscribe(&agent);
+        let recv =
+            tokio::spawn(
+                async move { tokio::time::timeout(Duration::from_secs(20), sub.next()).await },
+            );
+
+        // Ring the doorbell until the (now-live) listener replays the delta;
+        // re-NOTIFY is idempotent (replay starts from last_seq+1 = 1).
+        let mut delivered = None;
+        for _ in 0..40 {
+            bus.publish(early.clone());
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if recv.is_finished() {
+                delivered = Some(recv.await.unwrap().expect("doorbell timed out"));
+                break;
+            }
+        }
+
+        match delivered.expect("never delivered the pre-doorbell event") {
+            Some(BusEvent::Event(ev)) => {
+                assert_eq!(ev.agent_id, agent);
+                assert_eq!(
+                    ev.seq, 1,
+                    "the event appended before the first doorbell must arrive"
+                );
+            }
+            other => panic!("expected the early event, got {other:?}"),
         }
     }
 
