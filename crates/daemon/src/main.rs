@@ -10,9 +10,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use prospero_core::bus::EventBus;
+use prospero_core::config_store::ConfigStore;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig};
 use prospero_core::fleet::{FleetConfig, FleetManager};
+use prospero_core::ownership::Ownership;
 use prospero_core::sqlite_store::SqliteStore;
+use prospero_core::store::Store;
+use prospero_core::{DistributedBus, LeasedOwnership, PostgresConfigStore, PostgresStore};
+use tokio::task::JoinHandle;
 
 /// Prospero control-plane daemon.
 #[derive(Debug, Parser)]
@@ -49,6 +55,27 @@ struct Args {
     /// Delete events older than this many days on an hourly loop. 0 disables.
     #[arg(long, default_value_t = 0)]
     retention_days: u64,
+
+    /// Postgres connection URL. When set, prosperod runs in CLUSTERED mode
+    /// (Postgres store/config + LISTEN/NOTIFY bus + leased ownership); when
+    /// unset, it runs STANDALONE (sqlite + in-process bus + self-owns-all).
+    #[arg(long, env = "PROSPERO_DATABASE_URL")]
+    database_url: Option<String>,
+
+    /// Clustered only: this replica's identity for lease ownership. Defaults to
+    /// the HOSTNAME env (the pod name under k8s). MUST be unique per replica.
+    #[arg(long, env = "PROSPERO_REPLICA_ID")]
+    replica_id: Option<String>,
+
+    /// Clustered only: lease time-to-live in seconds. A stream's owner must
+    /// heartbeat within this window or a peer may take the stream over.
+    #[arg(long, default_value_t = 30.0)]
+    lease_ttl_secs: f64,
+
+    /// Clustered only: how often (ms) to renew held leases. Defaults to a third
+    /// of the lease TTL.
+    #[arg(long)]
+    heartbeat_interval_ms: Option<u64>,
 }
 
 /// Parse a `KEY=VALUE` pair (value may contain further `=`).
@@ -56,6 +83,27 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
         _ => Err(format!("expected KEY=VALUE, got '{s}'")),
+    }
+}
+
+/// This replica's lease identity: the explicit `--replica-id`, else the
+/// `HOSTNAME` env (the pod name in k8s), else a local fallback.
+fn resolve_replica_id(explicit: Option<&str>) -> String {
+    explicit
+        .map(str::to_string)
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "prosperod-local".to_string())
+}
+
+/// Heartbeat period: explicit `--heartbeat-interval-ms`, else a third of the
+/// lease TTL (clamped to at least 1s so a tiny TTL can't busy-loop).
+fn heartbeat_interval(explicit_ms: Option<u64>, lease_ttl_secs: f64) -> Duration {
+    match explicit_ms {
+        Some(ms) => Duration::from_millis(ms.max(1)),
+        None => {
+            let secs = (lease_ttl_secs / 3.0).max(1.0);
+            Duration::from_secs_f64(secs)
+        }
     }
 }
 
@@ -93,14 +141,71 @@ async fn main() -> anyhow::Result<()> {
     };
     config.default_env = args.default_env.iter().cloned().collect();
 
-    let store = Arc::new(
-        SqliteStore::open(&data_dir)
-            .await
-            .with_context(|| "opening event store")?,
-    );
-    let manager = FleetManager::new(config, store)
+    // Select the storage/ownership topology. A Postgres URL ⇒ clustered.
+    let mut heartbeat_handle: Option<JoinHandle<()>> = None;
+    let manager = if let Some(url) = args.database_url.clone() {
+        let replica_id = resolve_replica_id(args.replica_id.as_deref());
+        let store: Arc<dyn Store> = Arc::new(
+            PostgresStore::connect(&url)
+                .await
+                .with_context(|| "connecting clustered event store")?,
+        );
+        let config_store: Arc<dyn ConfigStore> = Arc::new(
+            PostgresConfigStore::connect(&url)
+                .await
+                .with_context(|| "connecting clustered config store")?,
+        );
+        let bus: Arc<dyn EventBus> = Arc::new(
+            DistributedBus::connect(&url, store.clone())
+                .await
+                .with_context(|| "connecting clustered event bus")?,
+        );
+        let ownership = Arc::new(
+            LeasedOwnership::connect(&url, replica_id.clone(), args.lease_ttl_secs)
+                .await
+                .with_context(|| "connecting clustered ownership")?,
+        );
+
+        // Heartbeat: renew this replica's held leases so it keeps its streams.
+        let interval = heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_secs);
+        let hb = ownership.clone();
+        heartbeat_handle = Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                hb.heartbeat().await;
+            }
+        }));
+
+        tracing::info!(
+            target: "prosperod",
+            topology = "clustered", %replica_id,
+            lease_ttl_secs = args.lease_ttl_secs,
+            heartbeat_ms = interval.as_millis() as u64,
+            "selected clustered topology"
+        );
+
+        FleetManager::with_seams(
+            config,
+            store,
+            config_store,
+            bus,
+            ownership as Arc<dyn Ownership>,
+        )
         .await
-        .with_context(|| "building fleet manager")?;
+        .with_context(|| "building clustered fleet manager")?
+    } else {
+        let store = Arc::new(
+            SqliteStore::open(&data_dir)
+                .await
+                .with_context(|| "opening event store")?,
+        );
+        tracing::info!(target: "prosperod", topology = "standalone", "selected standalone topology");
+        FleetManager::new(config, store)
+            .await
+            .with_context(|| "building fleet manager")?
+    };
 
     // Background poll loop.
     let poll_handle = tokio::spawn(manager.clone().run());
@@ -147,6 +252,9 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = poll_handle.await {
         tracing::warn!(error = %e, "poll loop did not drain cleanly");
     }
+    if let Some(hb) = heartbeat_handle {
+        hb.abort();
+    }
 
     tracing::info!("prosperod shut down");
     Ok(())
@@ -178,6 +286,28 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::parse_key_val;
+    use super::{heartbeat_interval, resolve_replica_id};
+    use std::time::Duration;
+
+    #[test]
+    fn replica_id_prefers_explicit_then_falls_back() {
+        assert_eq!(resolve_replica_id(Some("r7")), "r7");
+        // With no explicit id, falls back to HOSTNAME or the local default.
+        // (We don't mutate process env here; just assert it returns non-empty.)
+        assert!(!resolve_replica_id(None).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_defaults_to_a_third_of_ttl_and_is_clamped() {
+        assert_eq!(
+            heartbeat_interval(Some(500), 30.0),
+            Duration::from_millis(500)
+        );
+        assert_eq!(heartbeat_interval(None, 30.0), Duration::from_secs(10));
+        // Tiny TTL clamps to >= 1s; explicit 0 clamps to >= 1ms.
+        assert_eq!(heartbeat_interval(None, 0.6), Duration::from_secs(1));
+        assert_eq!(heartbeat_interval(Some(0), 30.0), Duration::from_millis(1));
+    }
 
     #[test]
     fn parses_key_value() {
