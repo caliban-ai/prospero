@@ -128,15 +128,16 @@ async fn poll_discovers_preexisting_agents_and_streams_them() {
     let mut h = setup().await;
     let dir = h.socket_dir();
 
-    // Pre-seed an active agent whose stream replays an init then a result.
+    // Pre-seed an active agent whose stream replays a turn-start, a text
+    // delta, then a run-end (caliban's `TurnEvent` vocabulary).
     let rec = test_record("agent001", &dir, AgentStatus::Running, true);
     h.fake
         .add_agent(
             rec,
             vec![
-                serde_json::json!({"type":"system","subtype":"init","model":"m","tools":["Read"],"session_id":"s"}),
-                serde_json::json!({"type":"text","delta":"hello"}),
-                serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.5,"turns":2}),
+                serde_json::json!({"type":"TurnStart","turn_index":0,"message_id":"s","model":"m"}),
+                serde_json::json!({"type":"AssistantTextDelta","turn_index":0,"content_block_index":0,"text":"hello"}),
+                serde_json::json!({"type":"RunEnd","final_messages":[],"total_usage":{},"turn_count":2,"stopped_for":"EndOfTurn"}),
             ],
         )
         .await;
@@ -153,15 +154,10 @@ async fn poll_discovers_preexisting_agents_and_streams_them() {
     assert!(
         kinds
             .iter()
-            .any(|k| matches!(k, EventKind::AgentInit { .. }))
-    );
-    assert!(
-        kinds
-            .iter()
             .any(|k| matches!(k, EventKind::Output { chunk, .. } if chunk == "hello"))
     );
     assert!(kinds.iter().any(
-        |k| matches!(k, EventKind::AgentFinished { cost_usd, turns, .. } if *cost_usd == 0.5 && *turns == 2)
+        |k| matches!(k, EventKind::AgentFinished { outcome, turns, .. } if outcome == "EndOfTurn" && *turns == 2)
     ));
 
     let snap = h.manager.snapshot().await;
@@ -176,19 +172,18 @@ async fn attach_reconnects_after_drop_without_dup_or_loss() {
     let dir = h.socket_dir();
     let rec = test_record("agent001", &dir, AgentStatus::Running, true);
 
-    let init = serde_json::json!({"type":"system","subtype":"init","model":"m","tools":["Read"],"session_id":"s"});
-    let hello = serde_json::json!({"type":"text","delta":"hello"});
-    let result =
-        serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.5,"turns":2});
+    let tool = serde_json::json!({"type":"ToolCallStart","turn_index":0,"tool_use_id":"tu_1","name":"Read"});
+    let hello = serde_json::json!({"type":"AssistantTextDelta","turn_index":0,"content_block_index":0,"text":"hello"});
+    let result = serde_json::json!({"type":"RunEnd","final_messages":[],"total_usage":{},"turn_count":2,"stopped_for":"EndOfTurn"});
 
-    // Connection 1 drops mid-stream after init+hello (no terminal result);
-    // the reconnect replays the full stream including the result.
+    // Connection 1 drops mid-stream after tool+hello (no terminal run-end);
+    // the reconnect replays the full stream including the run-end.
     h.fake
         .add_agent_with_scripts(
             rec,
             vec![
-                vec![init.clone(), hello.clone()],
-                vec![init.clone(), hello.clone(), result.clone()],
+                vec![tool.clone(), hello.clone()],
+                vec![tool.clone(), hello.clone(), result.clone()],
             ],
         )
         .await;
@@ -206,14 +201,14 @@ async fn attach_reconnects_after_drop_without_dup_or_loss() {
         1,
         "the post-drop terminal event must not be lost: {kinds:?}"
     );
-    // No duplicates: the replayed prefix (init, hello) is emitted exactly once.
+    // No duplicates: the replayed prefix (tool, hello) is emitted exactly once.
     assert_eq!(
         kinds
             .iter()
-            .filter(|k| matches!(k, EventKind::AgentInit { .. }))
+            .filter(|k| matches!(k, EventKind::ToolStarted { .. }))
             .count(),
         1,
-        "init must not be duplicated across the reconnect: {kinds:?}"
+        "tool-start must not be duplicated across the reconnect: {kinds:?}"
     );
     assert_eq!(
         kinds
@@ -247,7 +242,7 @@ async fn unknown_frame_advances_the_metrics_counter() {
             rec,
             vec![
                 serde_json::json!({"type":"future_thing","data":1}),
-                serde_json::json!({"type":"result","subtype":"success","total_cost_usd":0.0,"turns":1}),
+                serde_json::json!({"type":"RunEnd","final_messages":[],"total_usage":{},"turn_count":1,"stopped_for":"EndOfTurn"}),
             ],
         )
         .await;
@@ -276,7 +271,7 @@ async fn history_is_persisted_and_replayable() {
     h.fake
         .add_agent(
             rec,
-            vec![serde_json::json!({"type":"text","delta":"persisted"})],
+            vec![serde_json::json!({"type":"AssistantTextDelta","turn_index":0,"content_block_index":0,"text":"persisted"})],
         )
         .await;
 
