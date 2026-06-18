@@ -10,7 +10,7 @@ use sqlx::postgres::PgPool;
 
 use crate::error::{CoreError, Result};
 use crate::event::FleetEvent;
-use crate::store::Store;
+use crate::store::{Store, map_append_error};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (\
     global_ordinal BIGSERIAL PRIMARY KEY,\
@@ -63,7 +63,7 @@ impl Store for PostgresStore {
         .bind(kind)
         .execute(&self.pool)
         .await
-        .map_err(|e| CoreError::Store(format!("append: {e}")))?;
+        .map_err(map_append_error)?;
         Ok(())
     }
 
