@@ -391,6 +391,14 @@ impl FleetManager {
         self.inner.emitter.store.replay(stream_key, from_seq).await
     }
 
+    /// Delete persisted events older than `max_age`. Returns the count removed.
+    /// Backs the daemon's age-based retention loop (#4).
+    pub async fn prune_older_than(&self, max_age: std::time::Duration) -> Result<u64> {
+        let max = chrono::Duration::from_std(max_age).unwrap_or_else(|_| chrono::Duration::zero());
+        let before = (chrono::Utc::now() - max).to_rfc3339();
+        self.inner.emitter.store.prune(&before).await
+    }
+
     /// Register a repo and persist the registry. Triggers an immediate poll.
     pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
         self.add_repo_with_config(name, root, Default::default())
@@ -1455,6 +1463,42 @@ mod tests {
             .await
             .expect("run() must return after begin_shutdown")
             .expect("run task panicked");
+    }
+
+    #[tokio::test]
+    async fn prune_older_than_removes_aged_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        store
+            .append(&FleetEvent {
+                seq: 1,
+                ts: "2000-01-01T00:00:00+00:00".into(),
+                repo: "r".into(),
+                agent_id: "a".into(),
+                kind: EventKind::AgentSpawned,
+            })
+            .await
+            .unwrap();
+        store
+            .append(&FleetEvent {
+                seq: 2,
+                ts: chrono::Utc::now().to_rfc3339(),
+                repo: "r".into(),
+                agent_id: "a".into(),
+                kind: EventKind::AgentGone,
+            })
+            .await
+            .unwrap();
+
+        let config = FleetConfig::new("local", dir.path());
+        let mgr = FleetManager::new(config, store).unwrap();
+
+        let removed = mgr
+            .prune_older_than(std::time::Duration::from_secs(24 * 3600))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(mgr.history("a", 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
