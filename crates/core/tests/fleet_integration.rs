@@ -16,6 +16,34 @@ use prospero_core::testkit::{FakeCaliband, test_record};
 use prospero_core::{BusEvent, BusSubscription, CoreError, RepoProviderConfig};
 use tokio_stream::StreamExt;
 
+use async_trait::async_trait;
+use prospero_core::ownership::{Lease, Ownership};
+
+/// Ownership that owns every stream EXCEPT the per-repo lifecycle lease
+/// (`repo:` keys). Simulates a clustered replica that polls and attaches but is
+/// not the authoritative lifecycle emitter for the repo. (#59)
+struct RepoBlind;
+#[async_trait]
+impl Ownership for RepoBlind {
+    async fn try_acquire(&self, key: &str) -> Option<Lease> {
+        if key.starts_with("repo:") {
+            None
+        } else {
+            Some(Lease {
+                stream_key: key.to_string(),
+                epoch: 1,
+            })
+        }
+    }
+    async fn renew(&self, _: &Lease) -> prospero_core::error::Result<()> {
+        Ok(())
+    }
+    async fn release(&self, _: &str) {}
+    fn owns(&self, key: &str) -> bool {
+        !key.starts_with("repo:")
+    }
+}
+
 /// Keeps the manager, fake, and all backing temp dirs alive for a test.
 struct Harness {
     manager: FleetManager,
@@ -479,5 +507,206 @@ async fn add_repo_rejects_a_symlink_alias_of_an_existing_root() {
     assert!(
         err.to_string().contains("repo 'real'"),
         "the alias must be rejected naming the holder, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn clustered_status_change_emits_once_not_per_replica() {
+    // Two managers share one data dir (store + config store) and one FakeCaliband
+    // socket — i.e. two clustered replicas over one repo. A status transition both
+    // observe must land in the durable log exactly once: only the repo-lifecycle-
+    // lease owner emits. Before #59 both emitted, duplicating the event. (#59)
+    use prospero_core::bus::InProcessBus;
+    use prospero_core::config_store::SqliteConfigStore;
+    use prospero_core::ownership::SelfOwnsAll;
+    use prospero_core::store::Store;
+    use prospero_core::{ConfigStore, EventBus};
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+
+    let env = DiscoveryEnv {
+        caliban_daemon_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+        xdg_runtime_dir: None,
+        tmpdir: None,
+    };
+    let socket = control_socket_path(&repo_root, &env);
+    let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+    let dir = socket.parent().unwrap().to_path_buf();
+    let rec = test_record("agent001", &dir, AgentStatus::Idle, false);
+    fake.add_agent(rec, vec![]).await;
+
+    let mk = || {
+        let mut config = FleetConfig::new("h", data_dir.path());
+        config.discovery_env = env.clone();
+        config.ensure = EnsureConfig {
+            autostart: false,
+            ..EnsureConfig::default()
+        };
+        config
+    };
+    let shared_store: Arc<dyn Store> = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+
+    let cfg_a: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(data_dir.path()).await.unwrap());
+    let bus_a: Arc<dyn EventBus> = Arc::new(InProcessBus::new(1024));
+    let a = FleetManager::with_seams(
+        mk(),
+        shared_store.clone(),
+        cfg_a,
+        bus_a,
+        Arc::new(SelfOwnsAll),
+    )
+    .await
+    .unwrap();
+    a.add_repo("repo", &repo_root).await.unwrap();
+
+    let cfg_b: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(data_dir.path()).await.unwrap());
+    let bus_b: Arc<dyn EventBus> = Arc::new(InProcessBus::new(1024));
+    let b = FleetManager::with_seams(
+        mk(),
+        shared_store.clone(),
+        cfg_b,
+        bus_b,
+        Arc::new(RepoBlind),
+    )
+    .await
+    .unwrap();
+    b.poll_all_once().await; // B picks up the shared repo
+
+    a.poll_repo_once("repo").await;
+    b.poll_repo_once("repo").await;
+    fake.set_status("agent001", AgentStatus::Done);
+    a.poll_repo_once("repo").await;
+    b.poll_repo_once("repo").await;
+
+    let events = shared_store.replay("agent001", 0).await.unwrap();
+    let status_changes = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                EventKind::StatusChanged {
+                    from: AgentStatus::Idle,
+                    to: AgentStatus::Done
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        status_changes, 1,
+        "exactly one replica may emit the lifecycle event; got {status_changes}"
+    );
+}
+
+#[tokio::test]
+async fn non_owner_suppresses_agent_lifecycle_events() {
+    // A replica that does not own the repo lifecycle lease emits no
+    // AgentDiscovered / StatusChanged even though it polls and attaches. (#59)
+    use prospero_core::bus::InProcessBus;
+    use prospero_core::config_store::SqliteConfigStore;
+    use prospero_core::store::Store;
+    use prospero_core::{ConfigStore, EventBus};
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+    let env = DiscoveryEnv {
+        caliban_daemon_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+        xdg_runtime_dir: None,
+        tmpdir: None,
+    };
+    let socket = control_socket_path(&repo_root, &env);
+    let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+    let dir = socket.parent().unwrap().to_path_buf();
+    fake.add_agent(
+        test_record("agent001", &dir, AgentStatus::Idle, false),
+        vec![],
+    )
+    .await;
+
+    let mut config = FleetConfig::new("h", data_dir.path());
+    config.discovery_env = env;
+    config.ensure = EnsureConfig {
+        autostart: false,
+        ..EnsureConfig::default()
+    };
+    let store: Arc<dyn Store> = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let cfg: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(data_dir.path()).await.unwrap());
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(1024));
+    let mgr = FleetManager::with_seams(config, store.clone(), cfg, bus, Arc::new(RepoBlind))
+        .await
+        .unwrap();
+    mgr.add_repo("repo", &repo_root).await.unwrap();
+
+    mgr.poll_repo_once("repo").await; // discover (suppressed)
+    fake.set_status("agent001", AgentStatus::Done);
+    mgr.poll_repo_once("repo").await; // transition (suppressed)
+
+    let events = store.replay("agent001", 0).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::AgentDiscovered)),
+        "non-owner must not emit AgentDiscovered"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::StatusChanged { .. })),
+        "non-owner must not emit StatusChanged"
+    );
+}
+
+#[tokio::test]
+async fn non_owner_suppresses_repo_health_events() {
+    // A repo-blind replica polling an unreachable repo updates its own snapshot
+    // health but emits no RepoHealth event. (#59)
+    use prospero_core::bus::InProcessBus;
+    use prospero_core::config_store::SqliteConfigStore;
+    use prospero_core::store::Store;
+    use prospero_core::{ConfigStore, EventBus};
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+    let env = DiscoveryEnv {
+        caliban_daemon_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+        xdg_runtime_dir: None,
+        tmpdir: None,
+    };
+    // No FakeCaliband started → repo is unreachable.
+    let mut config = FleetConfig::new("h", data_dir.path());
+    config.discovery_env = env;
+    config.ensure = EnsureConfig {
+        autostart: false,
+        ..EnsureConfig::default()
+    };
+    let store: Arc<dyn Store> = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let cfg: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(data_dir.path()).await.unwrap());
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(1024));
+    let mgr = FleetManager::with_seams(config, store.clone(), cfg, bus, Arc::new(RepoBlind))
+        .await
+        .unwrap();
+    mgr.add_repo("repo", &repo_root).await.unwrap();
+
+    mgr.poll_repo_once("repo").await;
+
+    let snap = mgr.snapshot().await;
+    let repo = snap.repos.iter().find(|r| r.name == "repo").unwrap();
+    assert!(matches!(repo.health, RepoHealth::Unreachable { .. }));
+    let events = store.replay("repo:repo", 0).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::RepoHealth { .. })),
+        "non-owner must not emit RepoHealth"
     );
 }

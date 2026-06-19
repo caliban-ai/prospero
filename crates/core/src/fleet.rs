@@ -756,25 +756,38 @@ impl FleetManager {
     /// repo to `Unreachable` rather than propagating.
     pub async fn poll_repo_once(&self, repo: &str) {
         self.inner.emitter.metrics.record_repo_poll();
+        // Designate a single authoritative emitter for this repo's poll-derived
+        // lifecycle events. The lease keys off the repo's own event stream; in
+        // standalone (SelfOwnsAll) this is always owned, so behavior is
+        // unchanged. In clustered mode only the holder emits, so peers don't
+        // double-write the same transition. (#59)
+        let own_lifecycle = self
+            .inner
+            .ownership
+            .try_acquire(&crate::event::stream_key_for(repo, ""))
+            .await
+            .is_some();
         let client = match self.client_for(repo).await {
             Ok(c) => c,
             Err(e) => {
-                self.mark_unreachable(repo, e.to_string()).await;
+                self.mark_unreachable(repo, e.to_string(), own_lifecycle)
+                    .await;
                 return;
             }
         };
         match client.list().await {
-            Ok(records) => self.reconcile(repo, records, client).await,
+            Ok(records) => self.reconcile(repo, records, client, own_lifecycle).await,
             Err(e) => {
                 // A failed list usually means the socket died; drop the cached
                 // client so the next poll re-discovers.
                 self.inner.clients.lock().unwrap().remove(repo);
-                self.mark_unreachable(repo, e.to_string()).await;
+                self.mark_unreachable(repo, e.to_string(), own_lifecycle)
+                    .await;
             }
         }
     }
 
-    async fn mark_unreachable(&self, repo: &str, reason: String) {
+    async fn mark_unreachable(&self, repo: &str, reason: String, own_lifecycle: bool) {
         let mut snap = self.inner.snapshot.write().await;
         if let Some(r) = snap.repos.iter_mut().find(|r| r.name == repo) {
             let new_health = RepoHealth::Unreachable {
@@ -783,15 +796,25 @@ impl FleetManager {
             if r.health != new_health {
                 r.health = new_health.clone();
                 drop(snap);
-                self.inner
-                    .emitter
-                    .emit(repo, "", EventKind::RepoHealth { state: new_health })
-                    .await;
+                // Snapshot health is per-replica; only the lifecycle-lease owner
+                // writes the transition to the shared log. (#59)
+                if own_lifecycle {
+                    self.inner
+                        .emitter
+                        .emit(repo, "", EventKind::RepoHealth { state: new_health })
+                        .await;
+                }
             }
         }
     }
 
-    async fn reconcile(&self, repo: &str, records: Vec<AgentRecord>, client: CalibandClient) {
+    async fn reconcile(
+        &self,
+        repo: &str,
+        records: Vec<AgentRecord>,
+        client: CalibandClient,
+        own_lifecycle: bool,
+    ) {
         // Snapshot prior agent statuses for diffing.
         let prior: HashMap<String, AgentStatus> = {
             let snap = self.inner.snapshot.read().await;
@@ -819,15 +842,18 @@ impl FleetManager {
             };
             match prior.get(&rec.id) {
                 // New to the snapshot. Suppress "discovered" for agents we just
-                // spawned (already attached + emitted AgentSpawned).
-                None if !attached_now.contains(&rec.id) => {
+                // spawned (already attached + emitted AgentSpawned). Only the
+                // repo lifecycle-lease owner emits it, so peers don't duplicate
+                // the observation. (#59)
+                None if own_lifecycle && !attached_now.contains(&rec.id) => {
                     self.inner
                         .emitter
                         .emit(repo, &rec.id, EventKind::AgentDiscovered)
                         .await;
                 }
                 None => {}
-                Some(&old) if old != rec.status => {
+                // Only the repo lifecycle-lease owner emits transitions. (#59)
+                Some(&old) if own_lifecycle && old != rec.status => {
                     self.inner
                         .emitter
                         .emit(
@@ -853,9 +879,10 @@ impl FleetManager {
             new_agents.push(agent);
         }
 
-        // Agents that disappeared from caliban's registry.
+        // Agents that disappeared from caliban's registry. Only the repo
+        // lifecycle-lease owner emits it. (#59)
         for (old_id, _) in prior.iter() {
-            if !records.iter().any(|r| &r.id == old_id) {
+            if own_lifecycle && !records.iter().any(|r| &r.id == old_id) {
                 self.inner
                     .emitter
                     .emit(repo, old_id, EventKind::AgentGone)
@@ -871,16 +898,20 @@ impl FleetManager {
                 r.agents = new_agents;
                 if was_unreachable {
                     drop(snap);
-                    self.inner
-                        .emitter
-                        .emit(
-                            repo,
-                            "",
-                            EventKind::RepoHealth {
-                                state: RepoHealth::Healthy,
-                            },
-                        )
-                        .await;
+                    // Snapshot health is per-replica; only the lifecycle-lease
+                    // owner writes the recovery transition to the shared log. (#59)
+                    if own_lifecycle {
+                        self.inner
+                            .emitter
+                            .emit(
+                                repo,
+                                "",
+                                EventKind::RepoHealth {
+                                    state: RepoHealth::Healthy,
+                                },
+                            )
+                            .await;
+                    }
                 }
             }
         }
