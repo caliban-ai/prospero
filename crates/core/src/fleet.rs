@@ -699,14 +699,55 @@ impl FleetManager {
             .ok_or_else(|| CoreError::AgentNotFound(agent_id.to_string()))
     }
 
-    /// Poll every registered repo once.
+    /// Poll every registered repo once. Refreshes the registry from the shared
+    /// config store first so a clustered replica picks up repos a peer
+    /// added/removed/reconfigured between cycles.
     pub async fn poll_all_once(&self) {
+        self.refresh_registry_from_store().await;
         let names: Vec<String> = {
             let reg = self.inner.registry.read().await;
             reg.repos.iter().map(|r| r.name.clone()).collect()
         };
         for name in names {
             self.poll_repo_once(&name).await;
+        }
+    }
+
+    /// Reload the repo registry from the shared config store (the source of
+    /// truth) so a clustered replica converges on repos its peers registered or
+    /// removed. The in-memory registry is replaced wholesale and the snapshot is
+    /// reconciled — new repos added, removed repos dropped, existing repos keep
+    /// their health/agents. A read failure leaves the cached view intact. For
+    /// standalone (single writer) this is a cheap, idempotent no-op. (#50)
+    async fn refresh_registry_from_store(&self) {
+        let durable = match self.inner.config_store.list_repos().await {
+            Ok(repos) => repos,
+            Err(e) => {
+                tracing::warn!(
+                    target: "prospero_fleet", error = %e,
+                    "registry refresh from config store failed; keeping cached view"
+                );
+                return;
+            }
+        };
+        {
+            let mut reg = self.inner.registry.write().await;
+            reg.repos = durable.clone();
+        }
+        let mut snap = self.inner.snapshot.write().await;
+        snap.repos
+            .retain(|r| durable.iter().any(|d| d.name == r.name));
+        for d in &durable {
+            if !snap.repos.iter().any(|r| r.name == d.name) {
+                // New to this replica — the imminent poll sets real health.
+                snap.repos.push(Repo {
+                    name: d.name.clone(),
+                    root: d.root.clone(),
+                    health: RepoHealth::Healthy,
+                    config: d.config.clone(),
+                    agents: Vec::new(),
+                });
+            }
         }
     }
 
