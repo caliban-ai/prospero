@@ -344,6 +344,36 @@ async fn unreachable_repo_degrades_without_failing() {
 }
 
 #[tokio::test]
+async fn idle_agents_are_attached_so_their_stream_is_observed() {
+    // An idle (interactive, awaiting-input) agent must still be attached: its
+    // stream can resume, and holding the lease is what lets a survivor replica
+    // fail it over. Before the fix only `is_active()` agents were attached, so
+    // an idle agent's output never reached the log. (#51)
+    let mut h = setup().await;
+    let dir = h.socket_dir();
+    let rec = test_record("agent001", &dir, AgentStatus::Idle, false);
+    h.fake
+        .add_agent(
+            rec,
+            vec![serde_json::json!({
+                "type":"AssistantTextDelta","turn_index":0,"content_block_index":0,"text":"resumed"
+            })],
+        )
+        .await;
+
+    let mut sub = h.manager.subscribe("agent001");
+    h.manager.poll_repo_once("repo").await;
+    let kinds = collect_kinds(&mut sub, Duration::from_secs(2)).await;
+
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::Output { chunk, .. } if chunk == "resumed")),
+        "an idle agent must be attached and its stream output captured: {kinds:?}"
+    );
+}
+
+#[tokio::test]
 async fn poll_refreshes_registry_from_shared_config_store() {
     // Two managers over one shared config store (same data dir) simulate two
     // clustered replicas. A repo added on A must become visible to B after a
