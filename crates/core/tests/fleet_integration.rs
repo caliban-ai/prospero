@@ -344,6 +344,47 @@ async fn unreachable_repo_degrades_without_failing() {
 }
 
 #[tokio::test]
+async fn poll_refreshes_registry_from_shared_config_store() {
+    // Two managers over one shared config store (same data dir) simulate two
+    // clustered replicas. A repo added on A must become visible to B after a
+    // poll — without restarting B. (#50)
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+
+    let mk = || {
+        let mut config = FleetConfig::new("h", data_dir.path());
+        config.ensure = EnsureConfig {
+            autostart: false,
+            ..EnsureConfig::default()
+        };
+        config
+    };
+    let a = FleetManager::new(mk(), Arc::new(JsonlStore::open(data_dir.path()).unwrap()))
+        .await
+        .unwrap();
+    let b = FleetManager::new(mk(), Arc::new(JsonlStore::open(data_dir.path()).unwrap()))
+        .await
+        .unwrap();
+
+    // A registers a repo, persisted to the shared config store.
+    a.add_repo("shared", &repo_root).await.unwrap();
+
+    // B loaded its registry at startup (before the add) so it can't see it yet.
+    assert!(
+        b.snapshot().await.repos.iter().all(|r| r.name != "shared"),
+        "B should not see the peer's repo before refreshing"
+    );
+
+    // A poll refreshes B's registry from the shared store, surfacing the repo.
+    b.poll_all_once().await;
+    assert!(
+        b.snapshot().await.repos.iter().any(|r| r.name == "shared"),
+        "B must pick up the peer-registered repo after a poll, without a restart"
+    );
+}
+
+#[tokio::test]
 async fn spawn_rejects_provider_with_unset_api_key() {
     let h = setup().await;
     h.manager
