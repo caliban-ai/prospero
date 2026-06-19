@@ -842,7 +842,12 @@ impl FleetManager {
                 }
                 _ => {}
             }
-            if rec.status.is_active() && !attached_now.contains(&rec.id) {
+            // Attach any non-terminal agent (Spawning/Running/Idle), not just
+            // active ones: an idle interactive agent can resume, and — in
+            // clustered mode — holding its lease is what lets a survivor replica
+            // reap the expired lease and fail it over. The lease still gates who
+            // actually attaches. (#51)
+            if !rec.status.is_terminal() && !attached_now.contains(&rec.id) {
                 to_attach.push(rec.id.clone());
             }
             new_agents.push(agent);
