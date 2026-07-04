@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -1168,31 +1168,48 @@ impl FleetManager {
 ///
 /// `AgentDiscovered` carries no payload beyond the stream key (`reconcile`
 /// emits it as a bare marker, fleet.rs:895) — the full [`Agent`] it names is
-/// resolved via a bounded, yield-and-retry lookup against `mgr`'s current
+/// resolved via a bounded, sleep-and-retry lookup against `mgr`'s current
 /// snapshot. This closes the narrow window between the event reaching the bus
 /// (inside `reconcile`'s per-record loop) and `reconcile`'s own snapshot write
 /// landing (after the loop, same poll cycle) without adding a payload to
 /// `EventKind::AgentDiscovered` or touching `reconcile` itself.
+///
+/// The retry is bounded by a **wall-clock deadline**, not a fixed yield count:
+/// `reconcile` emits this event *before* `.await`ing `emitter.emit(...)`, which
+/// can itself be a real I/O wait (e.g. `DistributedBus::emit` round-trips to
+/// Postgres). A yield-count bound (`tokio::task::yield_now()` N times) can
+/// exhaust in microseconds if the executor keeps rescheduling this task
+/// eagerly, dropping the `Discovered` change even though the snapshot write
+/// was only milliseconds away. Sleeping in small increments against a deadline
+/// gives real I/O the time it needs while still failing safe (log + drop,
+/// never blocking forever) if the agent genuinely never appears.
 async fn event_to_change(mgr: &FleetManager, ev: FleetEvent) -> Option<FleetChange> {
     match ev.kind {
         EventKind::AgentDiscovered => {
-            const MAX_ATTEMPTS: u32 = 50;
-            for _ in 0..MAX_ATTEMPTS {
-                let snap = mgr.snapshot().await;
-                if let Some((_, agent)) = snap.find_agent(&ev.agent_id) {
-                    return Some(FleetChange::Discovered {
-                        id: AgentId::from(ev.agent_id.clone()),
-                        repo: ev.repo.clone(),
-                        agent: agent.clone(),
-                    });
+            const RETRY_BUDGET: Duration = Duration::from_millis(250);
+            const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+            let deadline = Instant::now() + RETRY_BUDGET;
+            loop {
+                {
+                    let snap = mgr.snapshot().await;
+                    if let Some((_, agent)) = snap.find_agent(&ev.agent_id) {
+                        return Some(FleetChange::Discovered {
+                            id: AgentId::from(ev.agent_id.clone()),
+                            repo: ev.repo.clone(),
+                            agent: agent.clone(),
+                        });
+                    }
                 }
-                tokio::task::yield_now().await;
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(RETRY_INTERVAL).await;
             }
             tracing::warn!(
                 target: "prospero_fleet",
                 agent_id = %ev.agent_id, repo = %ev.repo,
                 "watch_changes: AgentDiscovered fired but the agent never appeared in the \
-                 snapshot; dropping the FleetChange"
+                 snapshot within the retry budget; dropping the FleetChange"
             );
             None
         }
