@@ -39,6 +39,12 @@ pub trait EventBus: Send + Sync {
     /// only events whose stream key equals `stream_key`; consumers dedup the
     /// initial-history/live overlap on `seq`.
     fn subscribe(&self, stream_key: &str) -> BusSubscription;
+
+    /// A live subscription to EVERY stream's events, unfiltered. Needed by
+    /// fleet-wide watchers (e.g. `FleetManager::watch_changes`) that can't name
+    /// a stream key in advance — a brand-new agent's own id keys its
+    /// `AgentDiscovered` event, so no one can pre-subscribe to it by key.
+    fn subscribe_all(&self) -> BusSubscription;
 }
 
 /// In-process broadcast bus — the standalone implementation.
@@ -73,6 +79,23 @@ impl EventBus for InProcessBus {
                         yield BusEvent::Event(ev);
                     }
                     Ok(_) => continue, // an event on a different stream
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        yield BusEvent::Lagged(n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+
+    fn subscribe_all(&self) -> BusSubscription {
+        // Same eager-registration discipline as `subscribe`, just without the
+        // per-key filter.
+        let mut rx = self.tx.subscribe();
+        Box::pin(async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => yield BusEvent::Event(ev),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         yield BusEvent::Lagged(n);
                     }
@@ -120,5 +143,15 @@ mod tests {
     async fn publish_with_no_subscriber_is_a_noop() {
         let bus = InProcessBus::new(8);
         bus.publish(ev_for(1, "a")); // must not panic
+    }
+
+    #[tokio::test]
+    async fn subscribe_all_sees_every_stream_unfiltered() {
+        let bus = InProcessBus::new(8);
+        let mut sub = bus.subscribe_all();
+        bus.publish(ev_for(1, "a"));
+        bus.publish(ev_for(2, "b"));
+        assert_eq!(sub.next().await, Some(BusEvent::Event(ev_for(1, "a"))));
+        assert_eq!(sub.next().await, Some(BusEvent::Event(ev_for(2, "b"))));
     }
 }

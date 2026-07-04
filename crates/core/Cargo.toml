@@ -21,6 +21,7 @@ async-trait.workspace = true
 sqlx = { workspace = true }
 tokio-stream.workspace = true
 async-stream = { workspace = true }
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -13,18 +13,26 @@ pub mod sse;
 
 use axum::Router;
 use axum::routing::{delete, get, post, put};
-use prospero_core::FleetManager;
+use prospero_core::{FleetManager, LocalFleet};
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
 pub struct AppState {
-    /// The fleet control plane.
+    /// The fleet control plane. Almost every handler (fleet/repo listing,
+    /// agent lookup, kill/respawn, the session plane) still talks to this
+    /// directly — unchanged in P1.
     pub manager: FleetManager,
+    /// The `FleetProvider` seam, wrapping the same `manager`. Only the
+    /// spawn/ensure path is routed through it today; see
+    /// `handlers::spawn_agent`.
+    pub fleet: LocalFleet,
 }
 
-/// Build the application router over the given fleet manager.
-pub fn router(manager: FleetManager) -> Router {
-    let state = AppState { manager };
+/// Build the application router over the given fleet manager and its
+/// `FleetProvider` wrapper (constructed once, at the daemon's composition
+/// edge — see `prospero-daemon`'s `main.rs`).
+pub fn router(manager: FleetManager, fleet: LocalFleet) -> Router {
+    let state = AppState { manager, fleet };
     Router::new()
         // Dashboard.
         .route("/", get(dashboard::index))

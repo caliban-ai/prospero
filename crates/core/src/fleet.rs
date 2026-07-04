@@ -8,8 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
@@ -22,7 +24,7 @@ use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
+use crate::model::{Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, Repo, RepoHealth};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
 use crate::store::Store;
@@ -30,7 +32,7 @@ use crate::store::Store;
 /// A Prospero-level request to launch a new agent. Worktree isolation is the
 /// default for parallel work on one codebase; opt out with `isolation_worktree:
 /// false`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     /// Initial prompt / task.
     pub prompt: String,
@@ -406,6 +408,15 @@ impl FleetManager {
         self.inner.emitter.bus.subscribe(stream_key)
     }
 
+    /// Subscribe to every stream's live events, unfiltered (see
+    /// [`crate::bus::EventBus::subscribe_all`]). [`Self::watch_changes`] needs
+    /// this rather than [`Self::subscribe`]: a brand-new agent's own id (its
+    /// stream key) isn't knowable until *after* its `AgentDiscovered` event has
+    /// already fired, so a fleet-wide watcher can't pre-subscribe to it.
+    fn subscribe_all(&self) -> crate::bus::BusSubscription {
+        self.inner.emitter.bus.subscribe_all()
+    }
+
     /// A clone of the current fleet snapshot, with each repo's provider config
     /// joined in from the registry so a single read reflects any `set_config`.
     pub async fn snapshot(&self) -> FleetSnapshot {
@@ -616,6 +627,18 @@ impl FleetManager {
 
     /// Launch a new agent under `repo`. Returns the new agent id.
     pub async fn spawn_agent(&self, repo: &str, req: SpawnRequest) -> Result<String> {
+        Ok(self.spawn_agent_with_socket(repo, req).await?.0)
+    }
+
+    /// Launch a new agent under `repo`, returning both its id and the
+    /// per-agent socket path `client.spawn` (`client.rs:72`) already handed
+    /// back — so callers that need the socket (e.g. `LocalFleet::ensure_agent`)
+    /// don't have to issue a redundant `Attach` to re-derive it.
+    pub async fn spawn_agent_with_socket(
+        &self,
+        repo: &str,
+        req: SpawnRequest,
+    ) -> Result<(String, PathBuf)> {
         self.validate_provider_env(repo).await?;
         let client = self.client_for(repo).await?;
         let mut spec = req.into_spec();
@@ -624,13 +647,13 @@ impl FleetManager {
         // configured provider through. Base URL / API key still flow via the
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
-        let (id, _socket) = client.spawn(spec).await?;
+        let (id, socket) = client.spawn(spec).await?;
         self.inner
             .emitter
             .emit(repo, &id, EventKind::AgentSpawned)
             .await;
         self.start_attach(repo, &id, client).await;
-        Ok(id)
+        Ok((id, socket))
     }
 
     /// Kill an agent (resolving its repo from the snapshot).
@@ -681,6 +704,91 @@ impl FleetManager {
     pub async fn respawn_agent(&self, agent_id: &str) -> Result<String> {
         let repo = self.repo_of(agent_id).await?;
         self.client_for(&repo).await?.respawn(agent_id).await
+    }
+
+    /// Minimal graceful drain (P1): send `EndInput` (`fleet.rs:650`), best-effort
+    /// (the agent may not be interactive, or may already be terminal — either
+    /// way drain still proceeds), then poll [`Self::snapshot`] up to `timeout`
+    /// for the agent to reach a terminal [`AgentStatus`], then unconditionally
+    /// [`Self::kill_agent`]. Full checkpoint-drain is P2/operator territory —
+    /// this just avoids yanking an agent mid-turn when the caller can wait a
+    /// bit.
+    pub async fn drain_agent(&self, agent_id: &str, timeout: Duration) -> Result<()> {
+        let _ = self
+            .send_agent_input(agent_id, AttachInbound::EndInput)
+            .await;
+
+        let poll_interval = Duration::from_millis(20).min(timeout);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            let snap = self.snapshot().await;
+            match snap.find_agent(agent_id) {
+                Some((_, agent)) if agent.status.is_terminal() => break,
+                None => break,
+                _ => tokio::time::sleep(poll_interval).await,
+            }
+        }
+
+        self.kill_agent(agent_id).await
+    }
+
+    /// Observe fleet changes as they happen: an initial burst of `Discovered`
+    /// (one per currently-known agent) and `RepoHealth` (one per repo) built
+    /// from the current [`Self::snapshot`], followed by a live [`FleetChange`]
+    /// feed translated from the bus's `EventKind` diffs — the same ones
+    /// `reconcile` already computes (fleet.rs:811); `reconcile` itself is
+    /// untouched.
+    ///
+    /// Subscribes to the bus (via [`Self::subscribe_all`]) *before* reading the
+    /// snapshot, mirroring [`InProcessBus::subscribe`]'s own eager-registration
+    /// discipline, so no event published in the gap between "read snapshot" and
+    /// "start the live feed" is lost.
+    pub fn watch_changes(&self) -> BoxStream<'static, FleetChange> {
+        let live = self.subscribe_all();
+
+        let seed_mgr = self.clone();
+        let seed = futures::stream::once(async move {
+            let snap = seed_mgr.snapshot().await;
+            let mut items = Vec::new();
+            for repo in snap.repos {
+                items.push(FleetChange::RepoHealth {
+                    repo: repo.name.clone(),
+                    health: repo.health.clone(),
+                });
+                for agent in repo.agents {
+                    items.push(FleetChange::Discovered {
+                        id: AgentId::from(agent.id.clone()),
+                        repo: repo.name.clone(),
+                        agent,
+                    });
+                }
+            }
+            futures::stream::iter(items)
+        });
+        let seed = futures::stream::StreamExt::flatten(seed);
+
+        let live_mgr = self.clone();
+        let live_changes = futures::stream::StreamExt::filter_map(live, move |be| {
+            let mgr = live_mgr.clone();
+            async move {
+                match be {
+                    crate::bus::BusEvent::Event(ev) => event_to_change(&mgr, ev).await,
+                    // A slow local subscriber dropped events (`InProcessBus`
+                    // only); this fleet-wide view has no seq-replay path of its
+                    // own, so the gap surfaces only as a log, same posture as
+                    // other best-effort live consumers (ADR-0004).
+                    crate::bus::BusEvent::Lagged(n) => {
+                        tracing::warn!(
+                            target: "prospero_fleet", skipped = n,
+                            "watch_changes subscriber lagged; some live FleetChanges were dropped"
+                        );
+                        None
+                    }
+                }
+            }
+        });
+
+        Box::pin(futures::stream::StreamExt::chain(seed, live_changes))
     }
 
     /// Remove an agent from caliban's registry.
@@ -1056,6 +1164,84 @@ impl FleetManager {
             }
         }
         tracing::info!(target: "prospero_fleet", "poll loop drained on shutdown");
+    }
+}
+
+/// Translate one bus [`FleetEvent`] into the [`FleetChange`] `watch_changes`
+/// yields, skipping variants that aren't fleet-membership/health diffs (output
+/// chunks, tool calls, init/finish accounting, etc. stay on the per-agent SSE
+/// tail, not this fleet-wide view).
+///
+/// `AgentDiscovered` carries no payload beyond the stream key (`reconcile`
+/// emits it as a bare marker, fleet.rs:895) — the full [`Agent`] it names is
+/// resolved via a bounded, sleep-and-retry lookup against `mgr`'s current
+/// snapshot. This closes the narrow window between the event reaching the bus
+/// (inside `reconcile`'s per-record loop) and `reconcile`'s own snapshot write
+/// landing (after the loop, same poll cycle) without adding a payload to
+/// `EventKind::AgentDiscovered` or touching `reconcile` itself.
+///
+/// The retry is bounded by a **wall-clock deadline**, not a fixed yield count:
+/// `reconcile` emits this event *before* `.await`ing `emitter.emit(...)`, which
+/// can itself be a real I/O wait (e.g. `DistributedBus::emit` round-trips to
+/// Postgres). A yield-count bound (`tokio::task::yield_now()` N times) can
+/// exhaust in microseconds if the executor keeps rescheduling this task
+/// eagerly, dropping the `Discovered` change even though the snapshot write
+/// was only milliseconds away. Sleeping in small increments against a deadline
+/// gives real I/O the time it needs while still failing safe (log + drop,
+/// never blocking forever) if the agent genuinely never appears.
+async fn event_to_change(mgr: &FleetManager, ev: FleetEvent) -> Option<FleetChange> {
+    match ev.kind {
+        EventKind::AgentDiscovered => {
+            const RETRY_BUDGET: Duration = Duration::from_millis(250);
+            const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+            let deadline = Instant::now() + RETRY_BUDGET;
+            loop {
+                {
+                    let snap = mgr.snapshot().await;
+                    if let Some((_, agent)) = snap.find_agent(&ev.agent_id) {
+                        return Some(FleetChange::Discovered {
+                            id: AgentId::from(ev.agent_id.clone()),
+                            repo: ev.repo.clone(),
+                            agent: agent.clone(),
+                        });
+                    }
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+            tracing::warn!(
+                target: "prospero_fleet",
+                agent_id = %ev.agent_id, repo = %ev.repo,
+                "watch_changes: AgentDiscovered fired but the agent never appeared in the \
+                 snapshot within the retry budget; dropping the FleetChange"
+            );
+            None
+        }
+        EventKind::StatusChanged { from, to } => Some(FleetChange::StatusChanged {
+            id: AgentId::from(ev.agent_id.clone()),
+            repo: ev.repo.clone(),
+            from,
+            to,
+        }),
+        EventKind::AgentGone => Some(FleetChange::Gone {
+            id: AgentId::from(ev.agent_id.clone()),
+            repo: ev.repo.clone(),
+        }),
+        EventKind::RepoHealth { state } => Some(FleetChange::RepoHealth {
+            repo: ev.repo.clone(),
+            health: state,
+        }),
+        // Fleet-membership/health view only; per-agent output/tool/lifecycle
+        // accounting stays on the per-agent SSE tail (`crate::api::sse`).
+        EventKind::AgentSpawned
+        | EventKind::AgentInit { .. }
+        | EventKind::Output { .. }
+        | EventKind::ToolStarted { .. }
+        | EventKind::ToolFinished { .. }
+        | EventKind::AgentFinished { .. }
+        | EventKind::StorePersistFailed { .. } => None,
     }
 }
 

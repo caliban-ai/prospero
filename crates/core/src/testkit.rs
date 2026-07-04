@@ -26,6 +26,9 @@ struct FakeState {
     scripts: HashMap<String, Vec<serde_json::Value>>,
     /// Every spawn spec the fake has received (for assertions).
     received_specs: Vec<SpawnSpec>,
+    /// Every agent id an `Attach` request has named, in order (for asserting
+    /// that a code path did/didn't take the extra attach round-trip).
+    received_attach_ids: Vec<String>,
     /// Monotonic id counter for spawns.
     next_id: u64,
     /// How many `Shutdown` requests have been received.
@@ -125,6 +128,13 @@ impl FakeCaliband {
         self.state.lock().unwrap().received_specs.clone()
     }
 
+    /// All agent ids named by an `Attach` request so far (in order). Lets a
+    /// test prove a code path did *not* issue a second control round-trip to
+    /// resolve a socket it already had.
+    pub fn received_attach_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().received_attach_ids.clone()
+    }
+
     /// Number of `Shutdown` requests the fake has received.
     pub fn shutdowns(&self) -> u32 {
         self.state.lock().unwrap().shutdowns
@@ -218,20 +228,23 @@ async fn handle_control_conn(
                     Some((socket_path, script)),
                 )
             }
-            CtlRequest::Attach { id } => match st.agents.get(&id) {
-                Some(a) => (
-                    CtlReply::AttachAck {
-                        socket_path: a.socket_path.clone(),
-                    },
-                    None,
-                ),
-                None => (
-                    CtlReply::Error {
-                        error: SupervisorError::NotFound { id },
-                    },
-                    None,
-                ),
-            },
+            CtlRequest::Attach { id } => {
+                st.received_attach_ids.push(id.clone());
+                match st.agents.get(&id) {
+                    Some(a) => (
+                        CtlReply::AttachAck {
+                            socket_path: a.socket_path.clone(),
+                        },
+                        None,
+                    ),
+                    None => (
+                        CtlReply::Error {
+                            error: SupervisorError::NotFound { id },
+                        },
+                        None,
+                    ),
+                }
+            }
             CtlRequest::Kill { id } => {
                 if let Some(a) = st.agents.get_mut(&id) {
                     a.status = AgentStatus::Killed;
@@ -490,6 +503,133 @@ pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigSto
         .map(|r| r.name)
         .collect();
     assert_eq!(names, vec!["a".to_string(), "z".to_string()]);
+}
+
+/// Behavioral contract every [`crate::fleet_provider::FleetProvider`] backend
+/// must satisfy: `ensure_agent` provisions an attachable handle and its spec
+/// reaches caliband; `watch_fleet` observes the new agent (`Discovered`);
+/// `stop_agent` stops it and `watch_fleet` observes its departure (`Gone`);
+/// `restart_agent` yields a fresh id. Mirrors the store/config conformance
+/// style — driven over a `FakeCaliband` so it needs no real caliban. Runs
+/// against `LocalFleet` here; `K8sFleet` (epic #274, P2) calls this too, so a
+/// new backend is correct by construction, not by hope.
+///
+/// Deliberately drives everything through the `FleetProvider` trait plus
+/// `FakeCaliband`'s own hooks (`received_specs`, `remove_agent`) — never a
+/// backend-internal poll method (e.g. `LocalFleet`'s `FleetManager::
+/// poll_repo_once`) — so this same function is reusable across backends with
+/// their own reconciliation loop. That means the caller (each backend's own
+/// test wiring) is responsible for actually running that backend's background
+/// reconciliation (for `LocalFleet`, `FleetManager::run` on a fast poll
+/// interval) so the bounded waits below converge instead of timing out.
+pub async fn fleet_provider_conformance(provider: &dyn crate::FleetProvider, fake: &FakeCaliband) {
+    use crate::fleet::SpawnRequest;
+    use crate::model::{AgentId, DrainPolicy, FleetChange, TaskSpec};
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    const STEP_TIMEOUT: Duration = Duration::from_secs(2);
+    const POLL_BACKOFF: Duration = Duration::from_millis(20);
+
+    /// Re-subscribe (bounded by `STEP_TIMEOUT`) until a fresh `watch_fleet`
+    /// subscription's *initial listing* carries a `Discovered` for `id`.
+    /// Re-subscribing rather than sleeping arbitrarily: each attempt cheaply
+    /// re-reads current state instead of guessing how long the backend's own
+    /// reconciliation takes to converge.
+    async fn wait_for_discovered(provider: &dyn crate::FleetProvider, id: &AgentId) {
+        let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watch_fleet never observed a Discovered for {id}"
+            );
+            let mut changes = provider.watch_fleet();
+            while let Ok(Some(item)) =
+                tokio::time::timeout(Duration::from_millis(50), changes.next()).await
+            {
+                if matches!(&item, FleetChange::Discovered { id: i, .. } if i == id) {
+                    return;
+                }
+            }
+            tokio::time::sleep(POLL_BACKOFF).await;
+        }
+    }
+
+    // 1. `ensure_agent` provisions and returns an attachable handle; the spec
+    // reached caliband.
+    let h = provider
+        .ensure_agent(TaskSpec {
+            repo: "repo-a".into(),
+            request: SpawnRequest::new("task"),
+        })
+        .await
+        .expect("ensure_agent");
+    assert_eq!(h.repo, "repo-a");
+    assert!(!fake.received_specs().is_empty(), "spec reached caliband");
+
+    // 2. `watch_fleet` observes it. `ensure_agent` attaches the agent as part
+    // of spawning it, so `reconcile` treats it as already-known and suppresses
+    // a *live* `Discovered` diff for it (fleet.rs's `reconcile`: "Suppress
+    // discovered for agents we just spawned"). The half of the contract this
+    // exercises is `watch_fleet`'s *initial listing* (its doc comment: "an
+    // initial listing followed by live change events").
+    wait_for_discovered(provider, &h.id).await;
+
+    // 3. `stop_agent(id, DrainPolicy::Kill)` stops it; `watch_fleet` observes
+    // `Gone`. Subscribe *before* triggering the stop so this is a genuine live
+    // diff, not another initial-listing read. `FakeCaliband`'s `Kill` marks
+    // the agent `Killed` but — matching real caliban, where a killed agent's
+    // registry entry is reaped later, not instantly — leaves it registered,
+    // so `remove_agent` simulates that eventual reap deterministically
+    // instead of the test waiting on it.
+    let mut changes = provider.watch_fleet();
+    provider
+        .stop_agent(&h.id, DrainPolicy::Kill)
+        .await
+        .expect("stop_agent");
+    fake.remove_agent(h.id.as_str());
+
+    let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+    let mut gone = false;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(item)) = tokio::time::timeout(Duration::from_millis(200), changes.next()).await
+        else {
+            continue;
+        };
+        if matches!(&item, FleetChange::Gone { id, .. } if id == &h.id) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(
+        gone,
+        "watch_fleet did not observe Gone for the stopped agent"
+    );
+
+    // 4. `restart_agent` yields a fresh id. Provision a second, still-live
+    // agent for this rather than reusing `h`: the `remove_agent` call above
+    // that let us observe `Gone` also means `h.id` is no longer registered at
+    // all, so a respawn against it would legitimately fail with `NotFound`
+    // rather than exercise the "restart a live agent" contract.
+    let h2 = provider
+        .ensure_agent(TaskSpec {
+            repo: "repo-a".into(),
+            request: SpawnRequest::new("task-2"),
+        })
+        .await
+        .expect("ensure_agent (2nd agent, for restart)");
+    wait_for_discovered(provider, &h2.id).await;
+
+    // `FakeCaliband`'s `Respawn` handler (this file, `handle_control_conn`)
+    // removes the old agent record but does not register a new one for the
+    // id it returns (no `AgentRecord`, no stream listener) — a known fake
+    // limitation, not a provider one. So this only asserts what's actually
+    // observable through the trait: the call succeeds and hands back an id
+    // distinct from the one it replaced. It deliberately does NOT assert the
+    // new id later shows up in a `watch_fleet` listing, since the fake never
+    // makes that true.
+    let new_id = provider.restart_agent(&h2.id).await.expect("restart_agent");
+    assert_ne!(new_id, h2.id, "restart_agent must yield a fresh id");
 }
 
 /// Build a minimal `AgentRecord` for tests.

@@ -148,6 +148,61 @@ impl EventBus for DistributedBus {
             }
         })
     }
+
+    fn subscribe_all(&self) -> BusSubscription {
+        let pool = self.pool.clone();
+        let store = self.store.clone();
+        Box::pin(async_stream::stream! {
+            let mut listener = match PgListener::connect_with(&pool).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(target: "prospero_bus", error = %e, "PgListener connect failed");
+                    return;
+                }
+            };
+            if let Err(e) = listener.listen(CHANNEL).await {
+                tracing::warn!(target: "prospero_bus", error = %e, "LISTEN failed");
+                return;
+            }
+
+            // Unlike `subscribe` (one stream, one `last_seq`), an unfiltered
+            // doorbell can arrive for any stream key, so the high-water mark is
+            // tracked per key, seeded at 0 the same way and for the same reason
+            // (see `subscribe`'s comment): correctness over a late-seed race,
+            // at the cost of one deduped re-read per stream on its first
+            // doorbell.
+            let mut last_seq: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+            loop {
+                let notif = match listener.recv().await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(target: "prospero_bus", error = %e, "LISTEN recv failed");
+                        break;
+                    }
+                };
+                let Some((nkey, _seq)) = notif.payload().rsplit_once(':') else {
+                    continue;
+                };
+                let from = last_seq.get(nkey).copied().unwrap_or(0) + 1;
+                match store.replay(nkey, from).await {
+                    Ok(events) => {
+                        for ev in events {
+                            let cur = last_seq.entry(nkey.to_string()).or_insert(0);
+                            if ev.seq <= *cur {
+                                continue;
+                            }
+                            *cur = ev.seq;
+                            yield BusEvent::Event(ev);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "prospero_bus", error = %e, "doorbell replay failed");
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +362,80 @@ mod tests {
         assert!(
             recv.await.unwrap().is_err(),
             "should have timed out (no event on our stream)"
+        );
+    }
+
+    /// `subscribe_all` (unlike `subscribe`) has no stream-key filter, and
+    /// tracks a `last_seq` per discovered key rather than one fixed key. This
+    /// is the opposite assertion from `doorbell_ignores_other_streams`: two
+    /// DIFFERENT streams must both reach one unfiltered subscription, and
+    /// ringing either doorbell repeatedly must not re-deliver an already-seen
+    /// event on either key (per-key high-water advances independently).
+    #[tokio::test]
+    async fn subscribe_all_delivers_events_from_multiple_streams() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "SKIP subscribe_all_delivers_events_from_multiple_streams: DATABASE_URL unset"
+            );
+            return;
+        };
+
+        let store = PostgresStore::connect(&url).await.unwrap();
+        let store: Arc<dyn Store> = Arc::new(store);
+        let bus = DistributedBus::connect(&url, store.clone()).await.unwrap();
+
+        let agent_a = unique_agent("agent-all-a");
+        let agent_b = unique_agent("agent-all-b");
+
+        let mut sub = bus.subscribe_all();
+        let recv = tokio::spawn(async move {
+            let first = tokio::time::timeout(Duration::from_secs(20), sub.next()).await;
+            let second = tokio::time::timeout(Duration::from_secs(20), sub.next()).await;
+            (first, second)
+        });
+
+        // Same bounded-retry doorbell-ring pattern as
+        // `doorbell_delivers_a_live_event_to_a_subscriber`: the LISTEN
+        // connection is established lazily on first poll, so ring both
+        // doorbells repeatedly (idempotent — replay starts from
+        // last_seq+1 per key) until the now-live, unfiltered subscriber has
+        // consumed both events.
+        let event_a = ev(1, &agent_a);
+        let event_b = ev(1, &agent_b);
+        store.append(&event_a).await.unwrap();
+        store.append(&event_b).await.unwrap();
+        for _ in 0..40 {
+            bus.publish(event_a.clone());
+            bus.publish(event_b.clone());
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if recv.is_finished() {
+                break;
+            }
+        }
+
+        let (first, second) = recv.await.unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for r in [first, second] {
+            match r.expect("doorbell timed out") {
+                Some(BusEvent::Event(ev)) => {
+                    assert!(
+                        ev.agent_id == agent_a || ev.agent_id == agent_b,
+                        "unexpected stream key delivered: {}",
+                        ev.agent_id
+                    );
+                    assert!(
+                        seen.insert(ev.agent_id.clone()),
+                        "duplicate delivery for stream {} (per-key high-water not advancing)",
+                        ev.agent_id
+                    );
+                }
+                other => panic!("expected a live event, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "subscribe_all must deliver events from both streams, unfiltered"
         );
     }
 }
