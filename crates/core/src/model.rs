@@ -134,6 +134,113 @@ impl FleetSnapshot {
     }
 }
 
+/// Stable identifier for a running agent (caliband's agent id).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AgentId(pub String);
+
+impl AgentId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl From<&str> for AgentId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+impl From<String> for AgentId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Desired state for one agent — the provider-agnostic spec `ensure_agent` takes.
+/// Generalizes today's `(repo, SpawnRequest)` pair (fleet.rs:618).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskSpec {
+    pub repo: String,
+    pub request: crate::fleet::SpawnRequest,
+}
+
+/// Handle to a provisioned agent, resolved when it is attachable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentHandle {
+    pub id: AgentId,
+    pub repo: String,
+    pub socket: std::path::PathBuf,
+}
+
+/// How to stop an agent. `Kill` preserves today's unconditional behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrainPolicy {
+    #[default]
+    Kill,
+    Graceful {
+        timeout_ms: u64,
+    },
+}
+
+/// A change in the observed fleet — the item type of `watch_fleet`.
+/// Mirrors the poll-diff variants `reconcile` already emits (fleet.rs:811).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FleetChange {
+    Discovered {
+        id: AgentId,
+        repo: String,
+        agent: Agent,
+    },
+    StatusChanged {
+        id: AgentId,
+        repo: String,
+        from: AgentStatus,
+        to: AgentStatus,
+    },
+    Gone {
+        id: AgentId,
+        repo: String,
+    },
+    RepoHealth {
+        repo: String,
+        health: RepoHealth,
+    },
+}
+
+#[cfg(test)]
+mod fleet_provider_types_tests {
+    use super::*;
+
+    #[test]
+    fn agent_id_roundtrips_str() {
+        let id = AgentId::from("agent-abc");
+        assert_eq!(id.as_str(), "agent-abc");
+        assert_eq!(id.to_string(), "agent-abc");
+    }
+    #[test]
+    fn drain_policy_defaults_to_kill() {
+        assert!(matches!(DrainPolicy::default(), DrainPolicy::Kill));
+    }
+    #[test]
+    fn fleet_change_serdes() {
+        let c = FleetChange::StatusChanged {
+            id: AgentId::from("a1"),
+            repo: "r".into(),
+            from: AgentStatus::Spawning,
+            to: AgentStatus::Running,
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        let back: FleetChange = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, c);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
