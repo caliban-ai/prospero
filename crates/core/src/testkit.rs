@@ -26,6 +26,9 @@ struct FakeState {
     scripts: HashMap<String, Vec<serde_json::Value>>,
     /// Every spawn spec the fake has received (for assertions).
     received_specs: Vec<SpawnSpec>,
+    /// Every agent id an `Attach` request has named, in order (for asserting
+    /// that a code path did/didn't take the extra attach round-trip).
+    received_attach_ids: Vec<String>,
     /// Monotonic id counter for spawns.
     next_id: u64,
     /// How many `Shutdown` requests have been received.
@@ -125,6 +128,13 @@ impl FakeCaliband {
         self.state.lock().unwrap().received_specs.clone()
     }
 
+    /// All agent ids named by an `Attach` request so far (in order). Lets a
+    /// test prove a code path did *not* issue a second control round-trip to
+    /// resolve a socket it already had.
+    pub fn received_attach_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().received_attach_ids.clone()
+    }
+
     /// Number of `Shutdown` requests the fake has received.
     pub fn shutdowns(&self) -> u32 {
         self.state.lock().unwrap().shutdowns
@@ -218,20 +228,23 @@ async fn handle_control_conn(
                     Some((socket_path, script)),
                 )
             }
-            CtlRequest::Attach { id } => match st.agents.get(&id) {
-                Some(a) => (
-                    CtlReply::AttachAck {
-                        socket_path: a.socket_path.clone(),
-                    },
-                    None,
-                ),
-                None => (
-                    CtlReply::Error {
-                        error: SupervisorError::NotFound { id },
-                    },
-                    None,
-                ),
-            },
+            CtlRequest::Attach { id } => {
+                st.received_attach_ids.push(id.clone());
+                match st.agents.get(&id) {
+                    Some(a) => (
+                        CtlReply::AttachAck {
+                            socket_path: a.socket_path.clone(),
+                        },
+                        None,
+                    ),
+                    None => (
+                        CtlReply::Error {
+                            error: SupervisorError::NotFound { id },
+                        },
+                        None,
+                    ),
+                }
+            }
             CtlRequest::Kill { id } => {
                 if let Some(a) = st.agents.get_mut(&id) {
                     a.status = AgentStatus::Killed;

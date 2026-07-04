@@ -627,6 +627,18 @@ impl FleetManager {
 
     /// Launch a new agent under `repo`. Returns the new agent id.
     pub async fn spawn_agent(&self, repo: &str, req: SpawnRequest) -> Result<String> {
+        Ok(self.spawn_agent_with_socket(repo, req).await?.0)
+    }
+
+    /// Launch a new agent under `repo`, returning both its id and the
+    /// per-agent socket path `client.spawn` (`client.rs:72`) already handed
+    /// back — so callers that need the socket (e.g. `LocalFleet::ensure_agent`)
+    /// don't have to issue a redundant `Attach` to re-derive it.
+    pub async fn spawn_agent_with_socket(
+        &self,
+        repo: &str,
+        req: SpawnRequest,
+    ) -> Result<(String, PathBuf)> {
         self.validate_provider_env(repo).await?;
         let client = self.client_for(repo).await?;
         let mut spec = req.into_spec();
@@ -635,19 +647,13 @@ impl FleetManager {
         // configured provider through. Base URL / API key still flow via the
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
-        let (id, _socket) = client.spawn(spec).await?;
+        let (id, socket) = client.spawn(spec).await?;
         self.inner
             .emitter
             .emit(repo, &id, EventKind::AgentSpawned)
             .await;
         self.start_attach(repo, &id, client).await;
-        Ok(id)
-    }
-
-    /// Resolve the per-agent socket path for `id` under `repo`, via the cached
-    /// control client's `attach` (`client.rs:80`). Does not open a stream.
-    pub async fn agent_socket(&self, repo: &str, id: &str) -> Result<PathBuf> {
-        self.client_for(repo).await?.attach(id).await
+        Ok((id, socket))
     }
 
     /// Kill an agent (resolving its repo from the snapshot).

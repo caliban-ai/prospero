@@ -103,7 +103,7 @@ pub async fn spawn_agent(
     Ok((
         StatusCode::CREATED,
         Json(SpawnedResponse {
-            agent_id: handle.id.0,
+            agent_id: handle.id.to_string(),
             repo,
             isolated,
         }),

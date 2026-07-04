@@ -50,10 +50,13 @@ impl LocalFleet {
 #[async_trait]
 impl FleetProvider for LocalFleet {
     async fn ensure_agent(&self, spec: TaskSpec) -> Result<AgentHandle> {
-        let id = self.inner.spawn_agent(&spec.repo, spec.request).await?;
-        // Resolve the per-agent socket for the returned id (attach path, no
-        // stream opened).
-        let socket = self.inner.agent_socket(&spec.repo, &id).await?;
+        // `spawn_agent_with_socket` already returns the per-agent socket
+        // `client.spawn` produced, so no follow-up `Attach` round-trip is
+        // needed to resolve it (and no new failure mode on the success path).
+        let (id, socket) = self
+            .inner
+            .spawn_agent_with_socket(&spec.repo, spec.request)
+            .await?;
         Ok(AgentHandle {
             id: AgentId::from(id),
             repo: spec.repo,
@@ -109,6 +112,40 @@ mod local_fleet_tests {
         mgr.add_repo("repo-a", &root).await.unwrap();
 
         (LocalFleet::new(mgr), fake, dir)
+    }
+
+    /// Regression for the whole-branch-review finding: `ensure_agent` used to
+    /// resolve the spawned agent's socket via a second `Attach` round-trip
+    /// (`FleetManager::agent_socket`) even though `client.spawn` already
+    /// returns the socket. That extra round-trip both duplicated a request
+    /// and introduced a new failure mode (a successful spawn could still fail
+    /// `ensure_agent` if the follow-up attach errored). Assert the fake sees a
+    /// `Spawn` but no `Attach`, and that the handle's socket is exactly the one
+    /// the fake's `Spawn` reply advertised.
+    #[tokio::test]
+    async fn ensure_agent_does_not_issue_a_second_attach() {
+        let (provider, fake, _dir) = setup().await;
+
+        let handle = provider
+            .ensure_agent(TaskSpec {
+                repo: "repo-a".into(),
+                request: SpawnRequest::new("task"),
+            })
+            .await
+            .expect("ensure_agent");
+
+        assert!(!fake.received_specs().is_empty(), "spawn reached the fake");
+        assert!(
+            fake.received_attach_ids().is_empty(),
+            "ensure_agent must not issue an Attach to resolve the socket it already has, but saw: {:?}",
+            fake.received_attach_ids()
+        );
+
+        // The socket on the handle must be the one caliband's `Spawned` reply
+        // advertised for this id, proving it came straight from `spawn`'s
+        // return value rather than a (now-absent) follow-up attach.
+        let expected_socket = _dir.path().join(format!("{}.sock", handle.id.as_str()));
+        assert_eq!(handle.socket, expected_socket);
     }
 
     #[tokio::test]
