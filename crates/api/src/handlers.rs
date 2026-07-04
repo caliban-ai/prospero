@@ -4,7 +4,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use prospero_core::AttachInbound;
-use prospero_core::model::{Agent, FleetSnapshot};
+use prospero_core::FleetProvider;
+use prospero_core::model::{Agent, FleetSnapshot, TaskSpec};
 
 use crate::AppState;
 use crate::dto::{
@@ -81,6 +82,10 @@ pub async fn get_repo_agents(
 }
 
 /// `POST /api/repos/{repo}/agents` — spawn an agent (worktree by default).
+///
+/// Routed through the `FleetProvider` seam: `LocalFleet::ensure_agent`
+/// delegates to the same `FleetManager::spawn_agent` this handler called
+/// directly before, so behavior is unchanged.
 pub async fn spawn_agent(
     State(st): State<AppState>,
     Path(repo): Path<String>,
@@ -88,11 +93,17 @@ pub async fn spawn_agent(
 ) -> Result<(StatusCode, Json<SpawnedResponse>), ApiError> {
     let req = body.into_request();
     let isolated = req.isolation_worktree;
-    let agent_id = st.manager.spawn_agent(&repo, req).await?;
+    let handle = st
+        .fleet
+        .ensure_agent(TaskSpec {
+            repo: repo.clone(),
+            request: req,
+        })
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(SpawnedResponse {
-            agent_id,
+            agent_id: handle.id.0,
             repo,
             isolated,
         }),

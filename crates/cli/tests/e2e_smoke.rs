@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prospero_core::LocalFleet;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig, control_socket_path};
 use prospero_core::fleet::{FleetConfig, FleetManager};
 use prospero_core::store::JsonlStore;
@@ -61,7 +62,7 @@ async fn cli_drives_the_full_stack() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
-    let app = prospero_api::router(manager);
+    let app = prospero_api::router(manager.clone(), LocalFleet::new(manager));
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

@@ -14,6 +14,7 @@ use prospero_core::bus::EventBus;
 use prospero_core::config_store::ConfigStore;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig};
 use prospero_core::fleet::{FleetConfig, FleetManager};
+use prospero_core::fleet_provider::LocalFleet;
 use prospero_core::ownership::Ownership;
 use prospero_core::sqlite_store::SqliteStore;
 use prospero_core::store::Store;
@@ -207,6 +208,13 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| "building fleet manager")?
     };
 
+    // Establish the `FleetProvider` seam at the daemon's composition edge.
+    // `LocalFleet` is the only backend in P1 (no config switch yet — that
+    // arrives with `K8sFleet` in P2, mirroring `--database-url` above). It
+    // wraps the same `manager` used everywhere else below, so this is a pure
+    // refactor: no behavior change.
+    let fleet = LocalFleet::new(manager.clone());
+
     // Background poll loop.
     let poll_handle = tokio::spawn(manager.clone().run());
 
@@ -230,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = prospero_api::router(manager.clone());
+    let app = prospero_api::router(manager.clone(), fleet);
     let listener = tokio::net::TcpListener::bind(args.addr)
         .await
         .with_context(|| format!("binding {}", args.addr))?;

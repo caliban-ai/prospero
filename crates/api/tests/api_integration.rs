@@ -15,7 +15,7 @@ use prospero_core::fleet::{FleetConfig, FleetManager};
 use prospero_core::model::AgentStatus;
 use prospero_core::store::{JsonlStore, Store};
 use prospero_core::testkit::{FakeCaliband, test_record};
-use prospero_core::{FleetEvent, Result};
+use prospero_core::{FleetEvent, LocalFleet, Result};
 use tower::ServiceExt;
 
 /// A store that persists normally but reports itself non-writable, to drive the
@@ -77,7 +77,7 @@ async fn setup() -> Harness {
     manager.add_repo("repo", repo_root).await.unwrap();
 
     Harness {
-        router: router(manager.clone()),
+        router: router(manager.clone(), LocalFleet::new(manager.clone())),
         manager,
         fake,
         _repo: repo_dir,
@@ -169,7 +169,7 @@ async fn readyz_returns_503_when_store_unwritable() {
     let store = Arc::new(UnwritableStore(JsonlStore::open(data_dir.path()).unwrap()));
     let config = FleetConfig::new("test-host", data_dir.path());
     let manager = FleetManager::new(config, store).await.unwrap();
-    let app = router(manager);
+    let app = router(manager.clone(), LocalFleet::new(manager));
 
     let resp = app
         .oneshot(
@@ -426,7 +426,7 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
 
     let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
     let manager = FleetManager::new(config, store).await.unwrap();
-    let app = router(manager);
+    let app = router(manager.clone(), LocalFleet::new(manager));
 
     // POST /api/repos with a config object.
     let post_resp = app
