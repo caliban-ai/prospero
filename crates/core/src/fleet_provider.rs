@@ -62,8 +62,6 @@ impl FleetProvider for LocalFleet {
     }
 
     fn watch_fleet(&self) -> BoxStream<'static, FleetChange> {
-        // TODO(T3): real stream — Task 3 replaces this placeholder with the
-        // live poll-diff feed (fleet.rs:811).
         self.inner.watch_changes()
     }
 
@@ -141,7 +139,9 @@ mod local_fleet_tests {
         // manager's own view of the agent's status.
         provider.manager().poll_repo_once("repo-a").await;
         let snap = provider.manager().snapshot().await;
-        let (_, agent) = snap.find_agent(handle.id.as_str()).expect("agent still known");
+        let (_, agent) = snap
+            .find_agent(handle.id.as_str())
+            .expect("agent still known");
         assert_eq!(agent.status, crate::model::AgentStatus::Killed);
     }
 
@@ -165,12 +165,50 @@ mod local_fleet_tests {
         assert_ne!(new_id, handle.id);
     }
 
+    /// Task 3: `watch_fleet` seeds from the current snapshot (here, just
+    /// `repo-a`'s `RepoHealth`, since no agent exists yet) and then surfaces
+    /// live `FleetChange`s translated from the poll-diff events `reconcile`
+    /// emits — driven here by a `FakeCaliband` spawn + one `poll_repo_once`.
     #[tokio::test]
-    async fn watch_fleet_placeholder_is_empty() {
+    async fn watch_fleet_reports_discovered() {
+        use crate::model::FleetChange;
+        use crate::testkit::test_record;
         use futures::StreamExt;
+        use std::time::Duration;
 
-        let (provider, _fake, _dir) = setup().await;
-        let mut stream = provider.watch_fleet();
-        assert!(stream.next().await.is_none());
+        let (provider, mut fake, dir) = setup().await;
+
+        // Subscribe before the agent exists, exactly like a real watcher would:
+        // `watch_fleet` must pick up `a1`'s `Discovered` change even though its
+        // stream key (its own id) is unknowable until after the event fires.
+        let mut changes = provider.watch_fleet();
+
+        fake.add_agent(
+            test_record("a1", dir.path(), crate::model::AgentStatus::Running, false),
+            Vec::new(),
+        )
+        .await;
+        provider.manager().poll_repo_once("repo-a").await;
+
+        // The initial burst carries `repo-a`'s `RepoHealth` (seeded from
+        // `setup()`'s own `add_repo`-triggered poll) ahead of the post-seed
+        // `Discovered` diff; drain up to a few items for it, bounded so a
+        // regression fails fast instead of hanging.
+        let mut discovered = None;
+        for _ in 0..5 {
+            let item = tokio::time::timeout(Duration::from_secs(1), changes.next())
+                .await
+                .expect("timed out waiting for a FleetChange")
+                .expect("watch_fleet stream ended unexpectedly");
+            if matches!(item, FleetChange::Discovered { .. }) {
+                discovered = Some(item);
+                break;
+            }
+        }
+        let ev = discovered.expect("did not observe a Discovered change in time");
+        assert!(
+            matches!(ev, FleetChange::Discovered { ref id, ref repo, .. }
+            if id.as_str() == "a1" && repo == "repo-a")
+        );
     }
 }

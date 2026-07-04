@@ -148,6 +148,61 @@ impl EventBus for DistributedBus {
             }
         })
     }
+
+    fn subscribe_all(&self) -> BusSubscription {
+        let pool = self.pool.clone();
+        let store = self.store.clone();
+        Box::pin(async_stream::stream! {
+            let mut listener = match PgListener::connect_with(&pool).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(target: "prospero_bus", error = %e, "PgListener connect failed");
+                    return;
+                }
+            };
+            if let Err(e) = listener.listen(CHANNEL).await {
+                tracing::warn!(target: "prospero_bus", error = %e, "LISTEN failed");
+                return;
+            }
+
+            // Unlike `subscribe` (one stream, one `last_seq`), an unfiltered
+            // doorbell can arrive for any stream key, so the high-water mark is
+            // tracked per key, seeded at 0 the same way and for the same reason
+            // (see `subscribe`'s comment): correctness over a late-seed race,
+            // at the cost of one deduped re-read per stream on its first
+            // doorbell.
+            let mut last_seq: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+            loop {
+                let notif = match listener.recv().await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(target: "prospero_bus", error = %e, "LISTEN recv failed");
+                        break;
+                    }
+                };
+                let Some((nkey, _seq)) = notif.payload().rsplit_once(':') else {
+                    continue;
+                };
+                let from = last_seq.get(nkey).copied().unwrap_or(0) + 1;
+                match store.replay(nkey, from).await {
+                    Ok(events) => {
+                        for ev in events {
+                            let cur = last_seq.entry(nkey.to_string()).or_insert(0);
+                            if ev.seq <= *cur {
+                                continue;
+                            }
+                            *cur = ev.seq;
+                            yield BusEvent::Event(ev);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "prospero_bus", error = %e, "doorbell replay failed");
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
