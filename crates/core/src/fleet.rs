@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
@@ -23,7 +24,7 @@ use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::model::{Agent, AgentStatus, FleetSnapshot, Repo, RepoHealth};
+use crate::model::{Agent, AgentStatus, FleetChange, FleetSnapshot, Repo, RepoHealth};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
 use crate::store::Store;
@@ -634,6 +635,12 @@ impl FleetManager {
         Ok(id)
     }
 
+    /// Resolve the per-agent socket path for `id` under `repo`, via the cached
+    /// control client's `attach` (`client.rs:80`). Does not open a stream.
+    pub async fn agent_socket(&self, repo: &str, id: &str) -> Result<PathBuf> {
+        self.client_for(repo).await?.attach(id).await
+    }
+
     /// Kill an agent (resolving its repo from the snapshot).
     pub async fn kill_agent(&self, agent_id: &str) -> Result<()> {
         let repo = self.repo_of(agent_id).await?;
@@ -682,6 +689,42 @@ impl FleetManager {
     pub async fn respawn_agent(&self, agent_id: &str) -> Result<String> {
         let repo = self.repo_of(agent_id).await?;
         self.client_for(&repo).await?.respawn(agent_id).await
+    }
+
+    /// Minimal graceful drain (P1): send `EndInput` (`fleet.rs:650`), best-effort
+    /// (the agent may not be interactive, or may already be terminal — either
+    /// way drain still proceeds), then poll [`Self::snapshot`] up to `timeout`
+    /// for the agent to reach a terminal [`AgentStatus`], then unconditionally
+    /// [`Self::kill_agent`]. Full checkpoint-drain is P2/operator territory —
+    /// this just avoids yanking an agent mid-turn when the caller can wait a
+    /// bit.
+    pub async fn drain_agent(&self, agent_id: &str, timeout: Duration) -> Result<()> {
+        let _ = self
+            .send_agent_input(agent_id, AttachInbound::EndInput)
+            .await;
+
+        let poll_interval = Duration::from_millis(20).min(timeout);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            let snap = self.snapshot().await;
+            match snap.find_agent(agent_id) {
+                Some((_, agent)) if agent.status.is_terminal() => break,
+                None => break,
+                _ => tokio::time::sleep(poll_interval).await,
+            }
+        }
+
+        self.kill_agent(agent_id).await
+    }
+
+    /// Observe fleet changes as they happen.
+    ///
+    /// TODO(T3): real stream. Placeholder returning an empty boxed stream so
+    /// `FleetProvider::watch_fleet` compiles ahead of Task 3, which will emit
+    /// the poll-diff variants `reconcile` already computes (fleet.rs:811) as a
+    /// live [`FleetChange`] feed.
+    pub fn watch_changes(&self) -> BoxStream<'static, FleetChange> {
+        Box::pin(futures::stream::empty())
     }
 
     /// Remove an agent from caliban's registry.
