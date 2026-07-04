@@ -211,4 +211,40 @@ mod local_fleet_tests {
             if id.as_str() == "a1" && repo == "repo-a")
         );
     }
+
+    /// Like [`setup`], but also runs `FleetManager::run`'s background poll
+    /// loop on a fast interval. `testkit::fleet_provider_conformance` is
+    /// deliberately generic over `&dyn FleetProvider` and never reaches for
+    /// `LocalFleet`-internal methods like `poll_repo_once`, so it needs a real
+    /// (if accelerated) reconciliation loop driving state forward underneath
+    /// it, the same way production does.
+    async fn setup_with_background_poll() -> (LocalFleet, FakeCaliband, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false; // no real caliband to spawn in tests
+        config.poll_interval = std::time::Duration::from_millis(20);
+        let root = dir.path().join("repo-a");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let fake = FakeCaliband::start_at(&socket).await.unwrap();
+        let store = Arc::new(JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).await.unwrap();
+        mgr.add_repo("repo-a", &root).await.unwrap();
+
+        tokio::spawn(mgr.clone().run());
+
+        (LocalFleet::new(mgr), fake, dir)
+    }
+
+    /// Task 4: `LocalFleet` satisfies the `FleetProvider` conformance suite.
+    #[tokio::test]
+    async fn local_fleet_satisfies_conformance() {
+        let (provider, fake, _dir) = setup_with_background_poll().await;
+        crate::testkit::fleet_provider_conformance(&provider, &fake).await;
+        // Tidy: stop the background poll loop before `_dir` (and its sockets)
+        // get removed on drop.
+        provider.manager().begin_shutdown();
+    }
 }
