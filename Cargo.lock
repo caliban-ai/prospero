@@ -1899,6 +1899,8 @@ dependencies = [
  "kube",
  "prospero-api",
  "prospero-core",
+ "rcgen",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
