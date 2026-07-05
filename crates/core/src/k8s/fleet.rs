@@ -2,24 +2,34 @@
 //! `CalibanTask` custom resources (ADR 0008 §2).
 //!
 //! The kube CRUD calls are behind the small [`CalibanTaskApi`] seam so
-//! `K8sFleet`'s ensure/stop/restart logic is unit-testable against an
-//! in-memory fake with **no real cluster**. `watch_fleet` is Task B3's job;
-//! this module leaves it as an empty stream (see the `FleetProvider` impl
-//! below) so the crate still compiles and existing conformance-style callers
-//! don't panic against a `todo!()`.
+//! `K8sFleet`'s ensure/stop/restart/watch logic is unit-testable against an
+//! in-memory fake with **no real cluster**.
+//!
+//! `watch_fleet` (Task B3) is a **poll-diff over `CalibanTaskApi::list()`**,
+//! not a native `kube::runtime::watcher`: it reuses the same seam B2 already
+//! built (so `MemTaskApi`/B5's `FakeK8s` cover it with no apiserver) and
+//! mirrors how `FleetManager::watch_changes` synthesizes `LocalFleet`'s
+//! `watch_fleet` from its own poll→diff cycle (fleet.rs:799). A native
+//! `kube::runtime::watcher` (server-side watch, no polling latency) is a
+//! plausible future optimization once this ships — not required for
+//! correctness, since Kubernetes' own control loop already tolerates
+//! poll-based reconciliation on this timescale.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{BoxStream, StreamExt};
 use sha2::{Digest, Sha256};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::caliband::wire::Endpoint;
 use crate::error::{CoreError, Result};
 use crate::fleet_provider::FleetProvider;
 use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, Source, TaskSpec as CrdTaskSpec, Workspace};
-use crate::model::{AgentHandle, AgentId, DrainPolicy, FleetChange, TaskSpec};
+use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
 
 /// Deterministic, DNS-1123-safe name for the `CalibanTask` CR backing `spec`.
 ///
@@ -104,6 +114,94 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Option<AgentHandle> {
             addr: endpoint_addr.clone(),
         },
     })
+}
+
+/// Map a `CalibanTask`'s `status.phase` string onto Prospero's `AgentStatus`.
+///
+/// Mirrors the operator's `Phase` enum (`Pending`/`Provisioning`/`Running`/
+/// `Draining`/`Completed`/`Failed` — see `caliban-operator/src/crd.rs`)
+/// without depending on the operator crate (ADR 0008 §1): `status.phase` is
+/// read as a plain `String` (`CalibanTaskStatus::phase`) precisely so a
+/// phase this mirror doesn't know about still deserializes, and this
+/// function is where that string gets a defensive fallback instead of the
+/// deserializer.
+///
+/// Mapping choices:
+/// - `Pending`/`Provisioning` → `Spawning` (not yet attachable).
+/// - `Running` → `Running`.
+/// - `Draining` → `Idle`: the task is mid-teardown, not accepting new work
+///   but not gone yet either; `Idle` ("no compute pending") reads truer than
+///   `Running` for a dashboard, and it isn't `is_terminal()` since the CR is
+///   still present.
+/// - `Completed` → `Done`, `Failed` → `Failed` (direct terminal mapping).
+/// - Anything else (an operator phase this mirror doesn't know about yet, or
+///   a blank/unset phase) → `Spawning`, the safe "not yet ready" default,
+///   logged as a warning rather than silently reported as `Running`.
+#[must_use]
+pub fn phase_to_status(phase: &str) -> AgentStatus {
+    match phase {
+        "Pending" | "Provisioning" => AgentStatus::Spawning,
+        "Running" => AgentStatus::Running,
+        "Draining" => AgentStatus::Idle,
+        "Completed" => AgentStatus::Done,
+        "Failed" => AgentStatus::Failed,
+        other => {
+            tracing::warn!(
+                target: "prospero_k8s_fleet", phase = other,
+                "unrecognized CalibanTask phase; defaulting to AgentStatus::Spawning"
+            );
+            AgentStatus::Spawning
+        }
+    }
+}
+
+/// Project a `CalibanTask` onto Prospero's `model::Agent` view.
+///
+/// k8s-side placeholders (documented, not bugs):
+/// - `isolated`/`interactive` are always `false` — the CR's `isolation`/
+///   `task` fields don't carry either bit today (same MVP simplification
+///   `build_calibantask` already documents for the reverse direction).
+/// - `session_dir` is always an empty `PathBuf` — a k8s-backed agent has no
+///   prosperod-local session directory; `LocalFleet`'s meaning for that
+///   field (a path on the daemon's own disk) doesn't apply here.
+/// - `repo` prefers the first workspace source's name, falling back to the
+///   task's own name if the workspace is somehow sourceless (shouldn't
+///   happen for a `K8sFleet`-applied CR, but `list()` can also observe CRs
+///   this process didn't create).
+/// - `started_at` comes from `metadata.creationTimestamp` (RFC-3339 via
+///   `Display`), or `""` if unset (a CR that hasn't round-tripped through
+///   the apiserver yet, e.g. straight out of `MemTaskApi` in tests).
+#[must_use]
+pub fn agent_from_task(task: &CalibanTask) -> Agent {
+    let name = task.metadata.name.clone().unwrap_or_default();
+    let repo = task
+        .spec
+        .workspace
+        .sources
+        .first()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| name.clone());
+    let phase = task
+        .status
+        .as_ref()
+        .map(|s| s.phase.as_str())
+        .unwrap_or_default();
+    let started_at = task
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| t.0.to_string())
+        .unwrap_or_default();
+    Agent {
+        id: name.clone(),
+        name,
+        repo,
+        status: phase_to_status(phase),
+        started_at,
+        isolated: false,
+        interactive: false,
+        session_dir: std::path::PathBuf::new(),
+    }
 }
 
 /// The kube I/O seam: CRUD over `CalibanTask` custom resources. Abstracted so
@@ -211,30 +309,51 @@ impl Default for PollConfig {
     }
 }
 
-/// A Kubernetes `FleetProvider` backend: drives a fleet by CRUD + (eventually,
-/// Task B3) watch on `CalibanTask` custom resources.
+/// A Kubernetes `FleetProvider` backend: drives a fleet by CRUD + watch on
+/// `CalibanTask` custom resources.
 pub struct K8sFleet<A: CalibanTaskApi> {
-    api: A,
+    // `Arc` (not a bare `A`) so `watch_fleet` can hand a 'static-owned handle
+    // to its background poll-diff task without requiring `A: Clone`.
+    api: Arc<A>,
     poll: PollConfig,
     restart_nonce: AtomicU64,
+    /// How often `watch_fleet`'s background poll-diff loop calls `list()`.
+    /// Production default is ~2s; tests override it much shorter (e.g. 20ms)
+    /// via [`Self::with_watch_poll_interval`] so change assertions don't wait
+    /// on the production cadence.
+    watch_poll_interval: Duration,
 }
 
+/// Default cadence for `watch_fleet`'s poll-diff loop.
+const DEFAULT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 impl<A: CalibanTaskApi> K8sFleet<A> {
-    /// A `K8sFleet` with the default (~30s) `ensure_agent` poll budget.
+    /// A `K8sFleet` with the default (~30s) `ensure_agent` poll budget and
+    /// the default (~2s) `watch_fleet` poll cadence.
     #[must_use]
     pub fn new(api: A) -> Self {
         Self::with_poll_config(api, PollConfig::default())
     }
 
-    /// A `K8sFleet` with an explicit poll budget — tests use a short deadline
-    /// so a never-Running CR fails fast instead of hanging ~30s.
+    /// A `K8sFleet` with an explicit `ensure_agent` poll budget — tests use a
+    /// short deadline so a never-Running CR fails fast instead of hanging
+    /// ~30s.
     #[must_use]
     pub fn with_poll_config(api: A, poll: PollConfig) -> Self {
         Self {
-            api,
+            api: Arc::new(api),
             poll,
             restart_nonce: AtomicU64::new(0),
+            watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL,
         }
+    }
+
+    /// Override `watch_fleet`'s poll cadence. Tests use a short interval
+    /// (e.g. 20ms) so diff assertions don't block on the production default.
+    #[must_use]
+    pub fn with_watch_poll_interval(mut self, interval: Duration) -> Self {
+        self.watch_poll_interval = interval;
+        self
     }
 }
 
@@ -263,12 +382,95 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
     }
 
     fn watch_fleet(&self) -> BoxStream<'static, FleetChange> {
-        // TODO(B3): drive a `kube::runtime::watcher` over `CalibanTask` and
-        // translate Applied/Deleted + phase transitions into `FleetChange`,
-        // seeded by an initial `list`. Left as an empty stream for now so the
-        // crate compiles and callers that merely hold a `BoxStream` (rather
-        // than block on an item from it) don't panic against a `todo!()`.
-        stream::empty().boxed()
+        let api = Arc::clone(&self.api);
+        let poll_interval = self.watch_poll_interval;
+        // Small buffer: one poll cycle rarely produces more than a handful
+        // of changes, and a slow subscriber just backpressures the sender
+        // (no `Lagged`-style drop path exists at this seam, unlike the bus).
+        let (tx, rx) = tokio::sync::mpsc::channel::<FleetChange>(128);
+
+        tokio::spawn(async move {
+            // Last-observed (status, repo) per task name. Starts empty, so
+            // the very first poll naturally treats every currently-present
+            // task as newly `Discovered` — that IS the "seed from the
+            // initial listing" behavior the plan asks for, with no special
+            // first-iteration branch required.
+            let mut known: HashMap<String, (AgentStatus, String)> = HashMap::new();
+
+            loop {
+                let tasks = match api.list().await {
+                    Ok(tasks) => tasks,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "prospero_k8s_fleet", error = %e,
+                            "watch_fleet: list() failed; retrying next poll"
+                        );
+                        tokio::time::sleep(poll_interval).await;
+                        continue;
+                    }
+                };
+
+                let mut seen: HashSet<String> = HashSet::with_capacity(tasks.len());
+                for task in &tasks {
+                    let Some(name) = task.metadata.name.clone() else {
+                        // A CR with no name can't be addressed by later
+                        // get/delete calls; nothing sane to diff against.
+                        continue;
+                    };
+                    seen.insert(name.clone());
+
+                    let agent = agent_from_task(task);
+                    let status = agent.status;
+                    let repo = agent.repo.clone();
+
+                    let change = match known.get(&name) {
+                        None => Some(FleetChange::Discovered {
+                            id: AgentId::from(name.clone()),
+                            repo: repo.clone(),
+                            agent,
+                        }),
+                        Some((prev_status, _)) if *prev_status != status => {
+                            Some(FleetChange::StatusChanged {
+                                id: AgentId::from(name.clone()),
+                                repo: repo.clone(),
+                                from: *prev_status,
+                                to: status,
+                            })
+                        }
+                        Some(_) => None,
+                    };
+                    known.insert(name, (status, repo));
+
+                    if let Some(change) = change
+                        && tx.send(change).await.is_err()
+                    {
+                        // Receiver dropped: stop polling instead of leaking
+                        // this task forever.
+                        return;
+                    }
+                }
+
+                let gone: Vec<(String, String)> = known
+                    .iter()
+                    .filter(|(name, _)| !seen.contains(*name))
+                    .map(|(name, (_, repo))| (name.clone(), repo.clone()))
+                    .collect();
+                for (name, repo) in gone {
+                    known.remove(&name);
+                    let change = FleetChange::Gone {
+                        id: AgentId::from(name),
+                        repo,
+                    };
+                    if tx.send(change).await.is_err() {
+                        return;
+                    }
+                }
+
+                tokio::time::sleep(poll_interval).await;
+            }
+        });
+
+        ReceiverStream::new(rx).boxed()
     }
 
     async fn stop_agent(&self, id: &AgentId, drain: DrainPolicy) -> Result<()> {
@@ -555,5 +757,180 @@ mod tests {
         // ...but status is reset, since a brand-new CR hasn't been
         // reconciled yet.
         assert!(fresh.status.is_none());
+    }
+
+    #[test]
+    fn phase_to_status_maps_known_operator_phases() {
+        let cases = [
+            ("Pending", AgentStatus::Spawning),
+            ("Provisioning", AgentStatus::Spawning),
+            ("Running", AgentStatus::Running),
+            ("Draining", AgentStatus::Idle),
+            ("Completed", AgentStatus::Done),
+            ("Failed", AgentStatus::Failed),
+        ];
+        for (phase, expected) in cases {
+            assert_eq!(
+                phase_to_status(phase),
+                expected,
+                "phase {phase} should map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_to_status_defaults_unknown_phases_to_spawning() {
+        assert_eq!(phase_to_status("SomeFuturePhase"), AgentStatus::Spawning);
+        assert_eq!(phase_to_status(""), AgentStatus::Spawning);
+    }
+
+    #[test]
+    fn agent_from_task_projects_cr_fields_onto_agent() {
+        let s = spec("repo-a", "do the thing", None);
+        let name = task_name(&s);
+        let mut ct = build_calibantask(&s, &name);
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            phase: "Running".to_string(),
+            caliband_endpoint: Some("10.0.0.5:9443".to_string()),
+            sandbox_ref: None,
+        });
+
+        let agent = agent_from_task(&ct);
+
+        assert_eq!(agent.id, name);
+        assert_eq!(agent.name, name);
+        assert_eq!(agent.repo, "repo-a");
+        assert_eq!(agent.status, AgentStatus::Running);
+        assert!(!agent.isolated);
+        assert!(!agent.interactive);
+        assert_eq!(agent.session_dir, std::path::PathBuf::new());
+    }
+
+    #[test]
+    fn agent_from_task_defaults_status_when_no_status_yet() {
+        let s = spec("repo-a", "do the thing", None);
+        let name = task_name(&s);
+        let ct = build_calibantask(&s, &name); // status: None (fresh apply)
+
+        let agent = agent_from_task(&ct);
+        assert_eq!(agent.status, AgentStatus::Spawning);
+        assert_eq!(agent.started_at, "");
+    }
+
+    /// `watch_fleet`'s first poll must seed `Discovered` for every task
+    /// already present — a subscriber that starts after `ensure_agent`
+    /// still learns about the existing agent instead of only seeing it on
+    /// its *next* status transition.
+    #[tokio::test]
+    async fn watch_fleet_seeds_discovered_from_initial_listing() {
+        let api = MemTaskApi::new();
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+        api.apply(&build_calibantask(&s, &name)).await.unwrap();
+        api.set_running(&name, "10.0.0.5:9443");
+
+        let fleet = K8sFleet::new(api).with_watch_poll_interval(Duration::from_millis(20));
+        let mut changes = fleet.watch_fleet();
+
+        let change = tokio::time::timeout(Duration::from_secs(1), changes.next())
+            .await
+            .expect("timed out waiting for the initial Discovered")
+            .expect("watch_fleet stream ended unexpectedly");
+
+        match change {
+            FleetChange::Discovered { id, repo, agent } => {
+                assert_eq!(id, AgentId::from(name.clone()));
+                assert_eq!(repo, "repo-a");
+                assert_eq!(agent.status, AgentStatus::Running);
+            }
+            other => panic!("expected Discovered, got {other:?}"),
+        }
+    }
+
+    /// A task that appears *after* `watch_fleet` is already subscribed must
+    /// still surface as `Discovered`, and a subsequent phase flip on that
+    /// same task must surface as `StatusChanged` (not a second `Discovered`).
+    #[tokio::test]
+    async fn watch_fleet_reports_live_discovered_then_status_changed() {
+        let api = MemTaskApi::new();
+        let fleet = K8sFleet::new(api).with_watch_poll_interval(Duration::from_millis(20));
+        let mut changes = fleet.watch_fleet();
+
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+        fleet
+            .api
+            .apply(&build_calibantask(&s, &name))
+            .await
+            .unwrap();
+
+        let discovered = tokio::time::timeout(Duration::from_secs(1), changes.next())
+            .await
+            .expect("timed out waiting for the live Discovered")
+            .expect("watch_fleet stream ended unexpectedly");
+        match discovered {
+            FleetChange::Discovered { id, repo, agent } => {
+                assert_eq!(id, AgentId::from(name.clone()));
+                assert_eq!(repo, "repo-a");
+                // No status yet (fresh apply, no phase) -> Spawning.
+                assert_eq!(agent.status, AgentStatus::Spawning);
+            }
+            other => panic!("expected Discovered, got {other:?}"),
+        }
+
+        fleet.api.set_running(&name, "10.0.0.5:9443");
+
+        let status_changed = tokio::time::timeout(Duration::from_secs(1), changes.next())
+            .await
+            .expect("timed out waiting for StatusChanged")
+            .expect("watch_fleet stream ended unexpectedly");
+        match status_changed {
+            FleetChange::StatusChanged {
+                id, repo, from, to, ..
+            } => {
+                assert_eq!(id, AgentId::from(name));
+                assert_eq!(repo, "repo-a");
+                assert_eq!(from, AgentStatus::Spawning);
+                assert_eq!(to, AgentStatus::Running);
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    /// Deleting a `CalibanTask` that `watch_fleet` had already seen must
+    /// surface as `Gone`, carrying the same repo the earlier `Discovered`
+    /// reported.
+    #[tokio::test]
+    async fn watch_fleet_reports_gone_after_delete() {
+        let api = MemTaskApi::new();
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+        api.apply(&build_calibantask(&s, &name)).await.unwrap();
+
+        let fleet = K8sFleet::new(api).with_watch_poll_interval(Duration::from_millis(20));
+        let mut changes = fleet.watch_fleet();
+
+        let first = tokio::time::timeout(Duration::from_secs(1), changes.next())
+            .await
+            .expect("timed out waiting for the initial Discovered")
+            .expect("watch_fleet stream ended unexpectedly");
+        assert!(
+            matches!(first, FleetChange::Discovered { .. }),
+            "expected the seed Discovered first, got {first:?}"
+        );
+
+        fleet.api.delete(&name).await.unwrap();
+
+        let gone = tokio::time::timeout(Duration::from_secs(1), changes.next())
+            .await
+            .expect("timed out waiting for Gone")
+            .expect("watch_fleet stream ended unexpectedly");
+        match gone {
+            FleetChange::Gone { id, repo } => {
+                assert_eq!(id, AgentId::from(name));
+                assert_eq!(repo, "repo-a");
+            }
+            other => panic!("expected Gone, got {other:?}"),
+        }
     }
 }
