@@ -8,10 +8,10 @@ name = "prosperod"
 path = "src/main.rs"
 
 [features]
-# Compile in the `K8sFleet` backend library (crates/core, feature "k8s") so
-# `PROSPERO_FLEET=k8s` can be distinguished as "not wired" rather than "not
-# compiled in". Does NOT make the daemon serve via K8sFleet — see main.rs.
-k8s = ["prospero-core/k8s"]
+# Compile in the `K8sFleet` backend library (crates/core, feature "k8s") and
+# wire it into prosperod's `PROSPERO_FLEET=k8s` arm (needs the `kube` client to
+# reach the api-server). See main.rs.
+k8s = ["prospero-core/k8s", "dep:kube"]
 
 [dependencies]
 prospero-core.workspace = true
@@ -22,3 +22,4 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+kube = { workspace = true, optional = true }

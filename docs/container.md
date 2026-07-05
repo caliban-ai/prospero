@@ -40,17 +40,21 @@ fleet (`local` by default):
 | Value | Backend | Status |
 |-------|---------|--------|
 | `local` (default) | `LocalFleet` — caliband-over-Unix-sockets | Fully served; today's behavior, unchanged. |
-| `k8s` | `K8sFleet` — `CalibanTask` CRs + a network session plane (ADR 0008) | Backend library complete and conformance-tested in `crates/core` (feature `k8s`); **not yet servable by prosperod**. |
+| `k8s` | `K8sFleet` — `CalibanTask` CRs + a network session plane (ADR 0008) | Served via the `FleetProvider`/`FleetAdmin` seams (prospero #76). Requires a build with `--features k8s`. |
 
-`PROSPERO_FLEET=k8s` fails fast at startup rather than serving partially.
-The reason: prosperod's HTTP API calls `FleetManager` directly for most
-operations (kill/respawn/steer/snapshot/stream) — only `spawn` goes through
-the `FleetProvider` seam today — and `K8sFleet` does not produce a
-`FleetManager`, so it cannot back those handlers as-is. Serving `K8sFleet`
-requires rerouting the API layer's direct `FleetManager` calls through the
-`FleetProvider` seam, deferred per [ADR 0008](adr/0008-k8s-fleet-backend.md)
-§5 and tracked as a follow-up ("wire K8sFleet into prosperod").
+`PROSPERO_FLEET=k8s` serves the dashboard/API against a cluster of
+`CalibanTask` agents (create/observe/kill/stream). The API's handlers route
+through the backend-agnostic `FleetProvider` (control + snapshot/readiness/
+metrics) and read observability (history/SSE) from the shared event store/bus,
+so both backends serve the same request path (#76). The workspace-registry
+plane (register/config/remove a workspace) is a `LocalFleet`-only concept —
+those routes return **405** under `k8s`, where workspaces are `CalibanTask`/
+namespace-driven rather than a prospero registry.
+
+`PROSPERO_K8S_NAMESPACE` (default `default`) selects the namespace the
+`CalibanTask` client is scoped to; the kube client is resolved from the ambient
+kubeconfig / in-cluster service account.
 
 If prosperod wasn't built with the `k8s` cargo feature (which forwards to
-`prospero-core/k8s`), selecting `k8s` reports that distinctly from the
-"not wired" case, e.g. `cargo build -p prospero-daemon --features k8s`.
+`prospero-core/k8s`), selecting `k8s` fails at startup with a message pointing
+at `cargo build -p prospero-daemon --features k8s`.

@@ -23,11 +23,10 @@ use tokio::task::JoinHandle;
 
 /// Fleet control-plane backend, selected by `--fleet-backend`/`PROSPERO_FLEET`.
 ///
-/// `local` (default) is today's caliband-over-Unix-sockets `LocalFleet`.
+/// `local` (default) is the caliband-over-Unix-sockets `LocalFleet`.
 /// `k8s` selects the `K8sFleet` backend (`CalibanTask` CRs + network session
-/// plane, ADR 0008) — but see the fail-fast check in `main` below: the API
-/// layer's handlers still call `FleetManager` directly (ADR 0006/0008 §5 P1
-/// limitation), so `K8sFleet` cannot yet serve prosperod's request path.
+/// plane, ADR 0008), wired into the request path via the `FleetProvider`/
+/// `FleetAdmin` seams (#76); it needs a build with `--features k8s`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 enum FleetBackend {
@@ -43,10 +42,9 @@ struct Args {
     #[arg(long, env = "PROSPERO_ADDR", default_value = "127.0.0.1:7878")]
     addr: SocketAddr,
 
-    /// Fleet control-plane backend. `k8s` is a library today (crates/core,
-    /// feature "k8s", conformance-tested) but not yet wired into prosperod's
-    /// request path — selecting it fails fast rather than serving partially.
-    /// See docs/container.md "Fleet backends".
+    /// Fleet control-plane backend: `local` (caliband over Unix) or `k8s`
+    /// (CalibanTask CRs; requires a build with `--features k8s`). See
+    /// docs/container.md "Fleet backends".
     #[arg(long, env = "PROSPERO_FLEET", default_value = "local")]
     fleet_backend: FleetBackend,
 
@@ -131,36 +129,6 @@ fn heartbeat_interval(explicit_ms: Option<u64>, lease_ttl_secs: f64) -> Duration
 
 /// Fail fast if `backend` cannot actually be served yet.
 ///
-/// `K8sFleet` (ADR 0008) is a complete, conformance-tested `FleetProvider`
-/// backend in `crates/core` — but `prosperod`'s HTTP API still calls
-/// `FleetManager` directly for kill/respawn/steer/snapshot/stream (only
-/// `spawn` goes through the `FleetProvider` seam today), and `K8sFleet`
-/// doesn't produce a `FleetManager`. So it cannot fully serve the current API
-/// until that rerouting lands (ADR 0006/0008 §5, tracked as a P1 follow-up).
-/// Rather than silently falling back to `LocalFleet` or half-serving
-/// requests, refuse to start with an actionable message.
-fn check_fleet_backend_servable(backend: FleetBackend) -> anyhow::Result<()> {
-    if backend != FleetBackend::K8s {
-        return Ok(());
-    }
-    if cfg!(feature = "k8s") {
-        anyhow::bail!(
-            "PROSPERO_FLEET=k8s selected, but the K8sFleet backend is not yet wired into \
-             prosperod's request path — the API layer still calls FleetManager directly for \
-             most operations (see ADR 0008 §5 / prospero follow-up issue: \"wire K8sFleet into \
-             prosperod\"). The K8sFleet backend library (crates/core, feature \"k8s\") is \
-             complete and conformance-tested; serving it requires rerouting the API layer \
-             through the FleetProvider seam first."
-        );
-    }
-    anyhow::bail!(
-        "PROSPERO_FLEET=k8s selected, but this prosperod binary was not built with the k8s \
-         feature (rebuild with `cargo build -p prospero-daemon --features k8s`, which forwards \
-         to prospero-core/k8s). Note this only compiles the K8sFleet backend in — it is not \
-         yet wired into prosperod's request path; see docs/container.md \"Fleet backends\"."
-    );
-}
-
 /// Default data dir: `$XDG_DATA_HOME/prospero` or `$HOME/.local/share/prospero`.
 fn default_data_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
@@ -181,7 +149,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    check_fleet_backend_servable(args.fleet_backend)?;
     let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
@@ -262,19 +229,39 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| "building fleet manager")?
     };
 
-    // Establish the `FleetProvider` seam at the daemon's composition edge.
-    // `LocalFleet` is the only backend prosperod can actually *serve* today:
-    // `--fleet-backend`/`PROSPERO_FLEET` selects it (checked above, fails
-    // fast for `k8s`). `K8sFleet` (ADR 0008) exists as a complete,
-    // conformance-tested library in crates/core behind the `k8s` feature, but
-    // the API layer's handlers call `FleetManager` directly for
-    // kill/respawn/steer/snapshot/stream (only `spawn` goes through this
-    // seam), so wiring `K8sFleet` in here requires rerouting those handlers
-    // through `FleetProvider` first (ADR 0006/0008 §5 P1 limitation) — that
-    // reroute, not this selection point, is the remaining work.
-    let fleet = LocalFleet::new(manager.clone());
+    // Select the serving `FleetProvider`/`FleetAdmin` at the daemon's
+    // composition edge (#76). Both backends emit to — and the API reads
+    // observability (history/SSE) from — the same `manager.store()`/
+    // `manager.bus()`. The workspace-registry plane (`FleetAdmin`) is a
+    // prospero concept, so it's `Some` for local and `None` for k8s (those
+    // routes then return 405, as k8s workspaces are `CalibanTask`-driven).
+    let local = LocalFleet::new(manager.clone());
+    let (fleet, admin): (
+        Arc<dyn prospero_core::FleetProvider>,
+        Option<Arc<dyn prospero_core::FleetAdmin>>,
+    ) = match args.fleet_backend {
+        FleetBackend::Local => (Arc::new(local.clone()), Some(Arc::new(local))),
+        #[cfg(feature = "k8s")]
+        FleetBackend::K8s => {
+            let client = kube::Client::try_default()
+                .await
+                .with_context(|| "connecting to the Kubernetes API server")?;
+            let ns = std::env::var("PROSPERO_K8S_NAMESPACE")
+                .unwrap_or_else(|_| "default".to_string());
+            let api = prospero_core::KubeTaskApi::new(client, &ns);
+            let k8s = prospero_core::K8sFleet::new(api, manager.bus(), manager.store());
+            tracing::info!(target: "prosperod", backend = "k8s", namespace = %ns, "serving via K8sFleet");
+            (Arc::new(k8s), None)
+        }
+        #[cfg(not(feature = "k8s"))]
+        FleetBackend::K8s => anyhow::bail!(
+            "PROSPERO_FLEET=k8s requires a prosperod built with the k8s feature \
+             (`cargo build -p prospero-daemon --features k8s`)."
+        ),
+    };
 
-    // Background poll loop.
+    // Background poll loop (drives the local caliband-over-Unix backend; a no-op
+    // over an empty registry under k8s).
     let poll_handle = tokio::spawn(manager.clone().run());
 
     if args.retention_days > 0 {
@@ -297,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = prospero_api::router(manager.clone(), fleet);
+    let app = prospero_api::router(fleet, admin, manager.store(), manager.bus());
     let listener = tokio::net::TcpListener::bind(args.addr)
         .await
         .with_context(|| format!("binding {}", args.addr))?;
@@ -352,29 +339,9 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::FleetBackend;
     use super::parse_key_val;
-    use super::{check_fleet_backend_servable, heartbeat_interval, resolve_replica_id};
+    use super::{heartbeat_interval, resolve_replica_id};
     use std::time::Duration;
-
-    #[test]
-    fn local_backend_is_always_servable() {
-        assert!(check_fleet_backend_servable(FleetBackend::Local).is_ok());
-    }
-
-    #[test]
-    fn k8s_backend_fails_fast_with_an_actionable_message() {
-        let err = check_fleet_backend_servable(FleetBackend::K8s)
-            .expect_err("k8s backend is not wired into the API layer yet");
-        let msg = err.to_string();
-        assert!(msg.contains("PROSPERO_FLEET=k8s"));
-        // Whichever branch fires (feature compiled in vs. not), the message
-        // must point at something actionable rather than fail silently.
-        assert!(
-            msg.contains("not yet wired into prosperod's request path"),
-            "expected an actionable message, got: {msg}"
-        );
-    }
 
     #[test]
     fn replica_id_prefers_explicit_then_falls_back() {
