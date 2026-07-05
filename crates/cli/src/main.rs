@@ -404,7 +404,7 @@ mod tests {
     fn repo_config_parses_all_flags() {
         let cli = Cli::parse_from([
             "prospero",
-            "repo",
+            "workspace",
             "config",
             "myrepo",
             "--provider",
@@ -430,7 +430,8 @@ mod tests {
 
     #[test]
     fn repo_config_rejects_bad_env_pair() {
-        let res = Cli::try_parse_from(["prospero", "repo", "config", "r", "--env", "noequals"]);
+        let res =
+            Cli::try_parse_from(["prospero", "workspace", "config", "r", "--env", "noequals"]);
         assert!(res.is_err(), "KEY=VALUE without '=' must be rejected");
     }
 
@@ -484,7 +485,7 @@ mod tests {
 
     #[test]
     fn repo_add_parses_name_and_root() {
-        let cli = Cli::parse_from(["prospero", "repo", "add", "p", "/dev/p"]);
+        let cli = Cli::parse_from(["prospero", "workspace", "add", "p", "/dev/p"]);
         match cli.command {
             Command::Workspace(WorkspaceCmd::Add { name, root }) => {
                 assert_eq!(name, "p");
