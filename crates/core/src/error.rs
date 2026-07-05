@@ -11,11 +11,11 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 /// Errors produced by the orchestration core.
 #[derive(thiserror::Error, Debug)]
 pub enum CoreError {
-    /// A caliban supervisor socket could not be reached.
-    #[error("caliband unreachable at {path}: {source}")]
+    /// A caliban supervisor endpoint could not be reached.
+    #[error("caliband unreachable at {endpoint}: {source}")]
     CalibandUnreachable {
-        /// The control socket path we tried to connect to.
-        path: String,
+        /// The endpoint we tried to connect to (display form).
+        endpoint: String,
         /// Underlying I/O error.
         source: std::io::Error,
     },
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn display_messages() {
         let e = CoreError::CalibandUnreachable {
-            path: "/tmp/x.sock".into(),
+            endpoint: "/tmp/x.sock".into(),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
         };
         assert!(

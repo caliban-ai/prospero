@@ -14,7 +14,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use crate::caliband::wire::{
-    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, SpawnSpec, SupervisorError,
+    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, Endpoint, SpawnSpec,
+    SupervisorError,
 };
 
 /// Shared mutable state inside a running fake.
@@ -90,7 +91,11 @@ impl FakeCaliband {
     /// Pre-register an agent with a stream script, and start its per-agent
     /// stream listener so an attach will replay `script` then close.
     pub async fn add_agent(&mut self, record: AgentRecord, script: Vec<serde_json::Value>) {
-        let socket_path = record.socket_path.clone();
+        let socket_path = record
+            .endpoint
+            .unix_socket_path()
+            .expect("fake uses unix endpoints")
+            .to_path_buf();
         {
             let mut st = self.state.lock().unwrap();
             st.scripts.insert(record.id.clone(), script.clone());
@@ -110,7 +115,11 @@ impl FakeCaliband {
         record: AgentRecord,
         scripts: Vec<Vec<serde_json::Value>>,
     ) {
-        let socket_path = record.socket_path.clone();
+        let socket_path = record
+            .endpoint
+            .unix_socket_path()
+            .expect("fake uses unix endpoints")
+            .to_path_buf();
         {
             let mut st = self.state.lock().unwrap();
             st.scripts.insert(
@@ -215,7 +224,9 @@ async fn handle_control_conn(
                     status: AgentStatus::Running,
                     started_at: "1970-01-01T00:00:00Z".into(),
                     session_dir: dir.join(&id),
-                    socket_path: socket_path.clone(),
+                    endpoint: Endpoint::Unix {
+                        path: socket_path.clone(),
+                    },
                     spec: spec.clone(),
                 };
                 st.scripts.insert(id.clone(), script.clone());
@@ -223,7 +234,9 @@ async fn handle_control_conn(
                 (
                     CtlReply::Spawned {
                         id,
-                        socket_path: socket_path.clone(),
+                        endpoint: Endpoint::Unix {
+                            path: socket_path.clone(),
+                        },
                     },
                     Some((socket_path, script)),
                 )
@@ -233,7 +246,7 @@ async fn handle_control_conn(
                 match st.agents.get(&id) {
                     Some(a) => (
                         CtlReply::AttachAck {
-                            socket_path: a.socket_path.clone(),
+                            endpoint: a.endpoint.clone(),
                         },
                         None,
                     ),
@@ -289,7 +302,9 @@ async fn handle_control_conn(
                     pid: 1234,
                     agents: st.agents.len() as u32,
                     uptime_secs: 0,
-                    socket_path: dir.join("control.sock"),
+                    endpoint: Endpoint::Unix {
+                        path: dir.join("control.sock"),
+                    },
                 }),
                 None,
             ),
@@ -640,7 +655,9 @@ pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) ->
         status,
         started_at: "1970-01-01T00:00:00Z".into(),
         session_dir: dir.join(id),
-        socket_path: dir.join(format!("{id}.sock")),
+        endpoint: Endpoint::Unix {
+            path: dir.join(format!("{id}.sock")),
+        },
         spec: SpawnSpec {
             label: Some(id.into()),
             frontmatter_path: None,

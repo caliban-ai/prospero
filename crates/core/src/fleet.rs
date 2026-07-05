@@ -18,7 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
-use crate::caliband::wire::{AgentRecord, AttachInbound, SpawnSpec};
+use crate::caliband::wire::{AgentRecord, AttachInbound, Endpoint, SpawnSpec};
 use crate::config_store::{ConfigStore, SqliteConfigStore};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
@@ -631,14 +631,14 @@ impl FleetManager {
     }
 
     /// Launch a new agent under `repo`, returning both its id and the
-    /// per-agent socket path `client.spawn` (`client.rs:72`) already handed
-    /// back — so callers that need the socket (e.g. `LocalFleet::ensure_agent`)
-    /// don't have to issue a redundant `Attach` to re-derive it.
+    /// per-agent endpoint `client.spawn` already handed back — so callers that
+    /// need it (e.g. `LocalFleet::ensure_agent`) don't have to issue a redundant
+    /// `Attach` to re-derive it.
     pub async fn spawn_agent_with_socket(
         &self,
         repo: &str,
         req: SpawnRequest,
-    ) -> Result<(String, PathBuf)> {
+    ) -> Result<(String, Endpoint)> {
         self.validate_provider_env(repo).await?;
         let client = self.client_for(repo).await?;
         let mut spec = req.into_spec();
@@ -647,13 +647,13 @@ impl FleetManager {
         // configured provider through. Base URL / API key still flow via the
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
-        let (id, socket) = client.spawn(spec).await?;
+        let (id, endpoint) = client.spawn(spec).await?;
         self.inner
             .emitter
             .emit(repo, &id, EventKind::AgentSpawned)
             .await;
         self.start_attach(repo, &id, client).await;
-        Ok((id, socket))
+        Ok((id, endpoint))
     }
 
     /// Kill an agent (resolving its repo from the snapshot).
@@ -696,8 +696,8 @@ impl FleetManager {
             });
         }
         let client = self.client_for(&repo).await?;
-        let socket = client.attach(agent_id).await?;
-        CalibandClient::send_inbound(&socket, &input).await
+        let endpoint = client.attach(agent_id).await?;
+        client.send_inbound(&endpoint, &input).await
     }
 
     /// Respawn an agent; returns the new id.
@@ -1340,8 +1340,8 @@ async fn attach_once(
     frames_seen: &mut u64,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<StreamOutcome> {
-    let socket = client.attach(agent_id).await?;
-    let mut reader = CalibandClient::open_stream(&socket).await?;
+    let endpoint = client.attach(agent_id).await?;
+    let mut reader = client.open_stream(&endpoint).await?;
     let mut line = String::new();
     let mut idx: u64 = 0;
     let mut saw_terminal = false;

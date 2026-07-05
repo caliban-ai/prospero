@@ -53,14 +53,14 @@ impl FleetProvider for LocalFleet {
         // `spawn_agent_with_socket` already returns the per-agent socket
         // `client.spawn` produced, so no follow-up `Attach` round-trip is
         // needed to resolve it (and no new failure mode on the success path).
-        let (id, socket) = self
+        let (id, endpoint) = self
             .inner
             .spawn_agent_with_socket(&spec.repo, spec.request)
             .await?;
         Ok(AgentHandle {
             id: AgentId::from(id),
             repo: spec.repo,
-            socket,
+            endpoint,
         })
     }
 
@@ -141,11 +141,13 @@ mod local_fleet_tests {
             fake.received_attach_ids()
         );
 
-        // The socket on the handle must be the one caliband's `Spawned` reply
+        // The endpoint on the handle must be the one caliband's `Spawned` reply
         // advertised for this id, proving it came straight from `spawn`'s
         // return value rather than a (now-absent) follow-up attach.
-        let expected_socket = _dir.path().join(format!("{}.sock", handle.id.as_str()));
-        assert_eq!(handle.socket, expected_socket);
+        let expected = crate::caliband::wire::Endpoint::Unix {
+            path: _dir.path().join(format!("{}.sock", handle.id.as_str())),
+        };
+        assert_eq!(handle.endpoint, expected);
     }
 
     #[tokio::test]

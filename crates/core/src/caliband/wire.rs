@@ -52,8 +52,8 @@ pub struct AgentRecord {
     pub started_at: String,
     /// Path to the agent's session directory.
     pub session_dir: PathBuf,
-    /// Path to the agent's per-agent socket (for attach).
-    pub socket_path: PathBuf,
+    /// Endpoint for the agent's per-agent socket (for attach).
+    pub endpoint: Endpoint,
     /// Original spawn spec.
     pub spec: SpawnSpec,
 }
@@ -67,8 +67,8 @@ pub struct DaemonStatus {
     pub agents: u32,
     /// Seconds since the daemon started.
     pub uptime_secs: u64,
-    /// Path to the control socket.
-    pub socket_path: PathBuf,
+    /// Endpoint of the control socket.
+    pub endpoint: Endpoint,
 }
 
 /// Parameters for a new sub-agent spawn (caliband `SpawnSpec`).
@@ -180,13 +180,13 @@ pub enum CtlReply {
     Spawned {
         /// New id.
         id: String,
-        /// Per-agent socket path.
-        socket_path: PathBuf,
+        /// Per-agent endpoint.
+        endpoint: Endpoint,
     },
     /// Successful attach handshake.
     AttachAck {
-        /// Per-agent socket path.
-        socket_path: PathBuf,
+        /// Per-agent endpoint.
+        endpoint: Endpoint,
     },
     /// Successful kill.
     Killed,
@@ -404,13 +404,31 @@ mod tests {
 
     #[test]
     fn spawned_reply_parses() {
-        let json = "{\"kind\":\"spawned\",\"id\":\"a1\",\"socket_path\":\"/tmp/a1.sock\"}";
+        let json = r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"unix","path":"/tmp/a1.sock"}}"#;
         let r: CtlReply = serde_json::from_str(json).unwrap();
         assert_eq!(
             r,
             CtlReply::Spawned {
                 id: "a1".into(),
-                socket_path: "/tmp/a1.sock".into()
+                endpoint: Endpoint::Unix {
+                    path: "/tmp/a1.sock".into()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn spawned_reply_parses_tcp_endpoint() {
+        let json =
+            r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"tcp","addr":"pod.ns.svc:9443"}}"#;
+        let r: CtlReply = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            r,
+            CtlReply::Spawned {
+                id: "a1".into(),
+                endpoint: Endpoint::Tcp {
+                    addr: "pod.ns.svc:9443".into()
+                },
             }
         );
     }
