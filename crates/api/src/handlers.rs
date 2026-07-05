@@ -9,8 +9,8 @@ use prospero_core::model::{Agent, FleetSnapshot, TaskSpec};
 
 use crate::AppState;
 use crate::dto::{
-    AddRepoBody, AgentInputBody, FromSeq, RepoSummary, RespawnedResponse, SetConfigBody, SpawnBody,
-    SpawnedResponse,
+    AddWorkspaceBody, AgentInputBody, FromSeq, RespawnedResponse, SetConfigBody, SpawnBody,
+    SpawnedResponse, WorkspaceSummary,
 };
 use crate::error::ApiError;
 
@@ -19,15 +19,16 @@ pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
     Json(st.manager.snapshot().await)
 }
 
-/// `GET /api/repos` — managed repos with health and agent counts.
-pub async fn get_repos(State(st): State<AppState>) -> Json<Vec<RepoSummary>> {
+/// `GET /api/workspaces` — managed workspaces with health, sources, agent counts.
+pub async fn get_workspaces(State(st): State<AppState>) -> Json<Vec<WorkspaceSummary>> {
     let snap = st.manager.snapshot().await;
     let out = snap
-        .repos
+        .workspaces
         .into_iter()
-        .map(|r| RepoSummary {
+        .map(|r| WorkspaceSummary {
             name: r.name,
             root: r.root.display().to_string(),
+            sources: r.sources,
             health: r.health,
             agent_count: r.agents.len(),
             config: r.config,
@@ -36,19 +37,19 @@ pub async fn get_repos(State(st): State<AppState>) -> Json<Vec<RepoSummary>> {
     Json(out)
 }
 
-/// `POST /api/repos` — register a repo.
-pub async fn add_repo(
+/// `POST /api/workspaces` — register a workspace.
+pub async fn add_workspace(
     State(st): State<AppState>,
-    Json(body): Json<AddRepoBody>,
+    Json(body): Json<AddWorkspaceBody>,
 ) -> Result<StatusCode, ApiError> {
     st.manager
-        .add_repo_with_config(body.name, body.root, body.config)
+        .add_workspace_with_config(body.name, body.root, body.config)
         .await?;
     Ok(StatusCode::CREATED)
 }
 
-/// `PUT /api/repos/{name}/config` — set provider config and restart caliband.
-pub async fn set_repo_config(
+/// `PUT /api/workspaces/{name}/config` — set provider config and restart caliband.
+pub async fn set_workspace_config(
     State(st): State<AppState>,
     Path(name): Path<String>,
     Json(body): Json<SetConfigBody>,
@@ -57,38 +58,38 @@ pub async fn set_repo_config(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /api/repos/{name}` — unregister a repo.
-pub async fn delete_repo(
+/// `DELETE /api/workspaces/{name}` — unregister a workspace.
+pub async fn delete_workspace(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     if st.manager.remove_repo(&name).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(prospero_core::CoreError::RepoNotFound(name).into())
+        Err(prospero_core::CoreError::WorkspaceNotFound(name).into())
     }
 }
 
-/// `GET /api/repos/{repo}/agents` — agents under one repo.
-pub async fn get_repo_agents(
+/// `GET /api/workspaces/{workspace}/agents` — agents under one workspace.
+pub async fn get_workspace_agents(
     State(st): State<AppState>,
-    Path(repo): Path<String>,
+    Path(workspace): Path<String>,
 ) -> Result<Json<Vec<Agent>>, ApiError> {
     let snap = st.manager.snapshot().await;
-    match snap.repos.into_iter().find(|r| r.name == repo) {
+    match snap.workspaces.into_iter().find(|r| r.name == workspace) {
         Some(r) => Ok(Json(r.agents)),
-        None => Err(prospero_core::CoreError::RepoNotFound(repo).into()),
+        None => Err(prospero_core::CoreError::WorkspaceNotFound(workspace).into()),
     }
 }
 
-/// `POST /api/repos/{repo}/agents` — spawn an agent (worktree by default).
+/// `POST /api/workspaces/{workspace}/agents` — spawn an agent (worktree by default).
 ///
 /// Routed through the `FleetProvider` seam: `LocalFleet::ensure_agent`
 /// delegates to the same `FleetManager::spawn_agent` this handler called
 /// directly before, so behavior is unchanged.
 pub async fn spawn_agent(
     State(st): State<AppState>,
-    Path(repo): Path<String>,
+    Path(workspace): Path<String>,
     Json(body): Json<SpawnBody>,
 ) -> Result<(StatusCode, Json<SpawnedResponse>), ApiError> {
     let req = body.into_request();
@@ -96,7 +97,7 @@ pub async fn spawn_agent(
     let handle = st
         .fleet
         .ensure_agent(TaskSpec {
-            repo: repo.clone(),
+            workspace: workspace.clone(),
             request: req,
         })
         .await?;
@@ -104,7 +105,7 @@ pub async fn spawn_agent(
         StatusCode::CREATED,
         Json(SpawnedResponse {
             agent_id: handle.id.to_string(),
-            repo,
+            workspace,
             isolated,
         }),
     ))

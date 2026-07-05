@@ -25,7 +25,7 @@ impl From<CoreError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, kind) = match &self.0 {
-            CoreError::AgentNotFound(_) | CoreError::RepoNotFound(_) => {
+            CoreError::AgentNotFound(_) | CoreError::WorkspaceNotFound(_) => {
                 (StatusCode::NOT_FOUND, "not_found")
             }
             CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state"),
