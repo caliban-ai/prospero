@@ -701,6 +701,33 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         let active = self.attached.lock().unwrap().len() as u64;
         self.emitter.metrics_snapshot(active)
     }
+
+    async fn send_input(
+        &self,
+        id: &AgentId,
+        input: crate::caliband::wire::AttachInbound,
+    ) -> Result<()> {
+        // Resolve the agent's networked caliband endpoint from its CR status,
+        // then deliver the frame over the same TCP+TLS+token session plane
+        // `start_agent_stream` uses (ADR 0008 §3).
+        let task = self
+            .api
+            .get(id.as_str())
+            .await?
+            .ok_or_else(|| CoreError::AgentNotFound(id.as_str().to_string()))?;
+        let handle = handle_from(&task, "k8s".into()).ok_or_else(|| CoreError::InvalidState {
+            op: "send_input".to_string(),
+            id: id.as_str().to_string(),
+            status: "not attachable".to_string(),
+        })?;
+        let Endpoint::Tcp { addr } = &handle.endpoint else {
+            return Err(CoreError::Fleet(
+                "k8s agent endpoint is not Tcp".to_string(),
+            ));
+        };
+        let client = CalibandClient::connect_tcp(addr.clone(), self.tls.clone(), self.token.clone());
+        client.send_inbound(&handle.endpoint, &input).await
+    }
 }
 
 /// An in-memory `CalibanTaskApi` — precursor to Task B5's more general

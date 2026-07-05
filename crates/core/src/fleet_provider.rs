@@ -41,6 +41,12 @@ pub trait FleetProvider: Send + Sync {
 
     /// Backend counters for `/api/metrics`. (#76)
     fn metrics(&self) -> crate::metrics::MetricsSnapshot;
+
+    /// Steer an interactive agent: deliver an inbound frame to its session
+    /// plane (local: over the per-agent Unix socket; k8s: dial the agent's
+    /// caliband endpoint over the network). (#76)
+    async fn send_input(&self, id: &AgentId, input: crate::caliband::wire::AttachInbound)
+    -> Result<()>;
 }
 
 /// caliband-over-Unix-sockets backend — wraps today's `FleetManager` verbatim.
@@ -114,6 +120,14 @@ impl FleetProvider for LocalFleet {
 
     fn metrics(&self) -> crate::metrics::MetricsSnapshot {
         self.inner.metrics()
+    }
+
+    async fn send_input(
+        &self,
+        id: &AgentId,
+        input: crate::caliband::wire::AttachInbound,
+    ) -> Result<()> {
+        self.inner.send_agent_input(id.as_str(), input).await
     }
 }
 
