@@ -30,8 +30,8 @@ pub async fn agent_stream(
     // InProcessBus registers its receiver here (eagerly); DistributedBus replays
     // from seq 0 on its first doorbell. Either way the live tail covers every
     // event after this point, and the `seq` dedup below drops the history overlap.
-    let mut sub = st.manager.subscribe(&id);
-    let history = st.manager.history(&id, q.from).await.unwrap_or_default();
+    let mut sub = st.bus.subscribe(&id);
+    let history = st.store.replay(&id, q.from).await.unwrap_or_default();
 
     let body = stream! {
         // 1) Replay persisted history, stopping if it already contains the
@@ -55,7 +55,7 @@ pub async fn agent_stream(
         //    (`FleetConfig::event_buffer`, default 1024). Exceed it and the
         //    `Tailer` emits a `gap` signal plus replays the missed events from
         //    the durable store, rather than silently skipping them.
-        let mut tailer = Tailer::new(id, last_delivered, st.manager.clone());
+        let mut tailer = Tailer::new(id, last_delivered, st.store.clone());
         loop {
             match tailer.on_recv(sub.next().await).await {
                 Step::Emit(frames) => {

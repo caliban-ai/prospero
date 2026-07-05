@@ -4,8 +4,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use prospero_core::AttachInbound;
-use prospero_core::FleetProvider;
-use prospero_core::model::{Agent, FleetSnapshot, TaskSpec};
+use prospero_core::model::{Agent, AgentId, DrainPolicy, FleetSnapshot, TaskSpec};
 
 use crate::AppState;
 use crate::dto::{
@@ -16,12 +15,12 @@ use crate::error::ApiError;
 
 /// `GET /api/fleet` — the whole fleet snapshot.
 pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
-    Json(st.manager.snapshot().await)
+    Json(st.fleet.snapshot().await)
 }
 
 /// `GET /api/workspaces` — managed workspaces with health, sources, agent counts.
 pub async fn get_workspaces(State(st): State<AppState>) -> Json<Vec<WorkspaceSummary>> {
-    let snap = st.manager.snapshot().await;
+    let snap = st.fleet.snapshot().await;
     let out = snap
         .workspaces
         .into_iter()
@@ -42,8 +41,9 @@ pub async fn add_workspace(
     State(st): State<AppState>,
     Json(body): Json<AddWorkspaceBody>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager
-        .add_workspace_with_config(body.name, body.root, body.config)
+    let admin = st.admin.as_ref().ok_or_else(ApiError::unsupported_on_backend)?;
+    admin
+        .add_workspace(body.name, body.root.into(), body.config)
         .await?;
     Ok(StatusCode::CREATED)
 }
@@ -54,7 +54,8 @@ pub async fn set_workspace_config(
     Path(name): Path<String>,
     Json(body): Json<SetConfigBody>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager.set_repo_config(&name, body.0).await?;
+    let admin = st.admin.as_ref().ok_or_else(ApiError::unsupported_on_backend)?;
+    admin.set_workspace_config(&name, body.0).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -63,7 +64,8 @@ pub async fn delete_workspace(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if st.manager.remove_repo(&name).await? {
+    let admin = st.admin.as_ref().ok_or_else(ApiError::unsupported_on_backend)?;
+    if admin.remove_workspace(&name).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(prospero_core::CoreError::WorkspaceNotFound(name).into())
@@ -75,7 +77,7 @@ pub async fn get_workspace_agents(
     State(st): State<AppState>,
     Path(workspace): Path<String>,
 ) -> Result<Json<Vec<Agent>>, ApiError> {
-    let snap = st.manager.snapshot().await;
+    let snap = st.fleet.snapshot().await;
     match snap.workspaces.into_iter().find(|r| r.name == workspace) {
         Some(r) => Ok(Json(r.agents)),
         None => Err(prospero_core::CoreError::WorkspaceNotFound(workspace).into()),
@@ -116,20 +118,21 @@ pub async fn get_agent(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Agent>, ApiError> {
-    let snap = st.manager.snapshot().await;
+    let snap = st.fleet.snapshot().await;
     match snap.find_agent(&id) {
         Some((_, agent)) => Ok(Json(agent.clone())),
         None => Err(prospero_core::CoreError::AgentNotFound(id).into()),
     }
 }
 
-/// `GET /api/agents/{id}/events?from=N` — replay history from the store.
+/// `GET /api/agents/{id}/events?from=N` — replay history from the shared store.
 pub async fn get_agent_events(
     State(st): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<FromSeq>,
 ) -> Result<Json<Vec<prospero_core::FleetEvent>>, ApiError> {
-    Ok(Json(st.manager.history(&id, q.from).await?))
+    // An agent's stream key is its own id (see `event::stream_key_for`).
+    Ok(Json(st.store.replay(&id, q.from).await?))
 }
 
 /// `POST /api/agents/{id}/kill`.
@@ -137,7 +140,9 @@ pub async fn kill_agent(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager.kill_agent(&id).await?;
+    st.fleet
+        .stop_agent(&AgentId::from(id.as_str()), DrainPolicy::Kill)
+        .await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -146,8 +151,10 @@ pub async fn respawn_agent(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RespawnedResponse>, ApiError> {
-    let agent_id = st.manager.respawn_agent(&id).await?;
-    Ok(Json(RespawnedResponse { agent_id }))
+    let new_id = st.fleet.restart_agent(&AgentId::from(id.as_str())).await?;
+    Ok(Json(RespawnedResponse {
+        agent_id: new_id.to_string(),
+    }))
 }
 
 /// `POST /api/agents/{id}/input` — inject a user message into an interactive agent.
@@ -156,8 +163,11 @@ pub async fn agent_input(
     Path(id): Path<String>,
     Json(body): Json<AgentInputBody>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager
-        .send_agent_input(&id, AttachInbound::UserMessage { text: body.text })
+    st.fleet
+        .send_input(
+            &AgentId::from(id.as_str()),
+            AttachInbound::UserMessage { text: body.text },
+        )
         .await?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -167,24 +177,26 @@ pub async fn agent_end_input(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager
-        .send_agent_input(&id, AttachInbound::EndInput)
+    st.fleet
+        .send_input(&AgentId::from(id.as_str()), AttachInbound::EndInput)
         .await?;
     Ok(StatusCode::ACCEPTED)
 }
 
-/// `DELETE /api/agents/{id}` — remove from caliban's registry.
+/// `DELETE /api/agents/{id}` — forget the agent (local: caliban registry; k8s: CR).
 pub async fn rm_agent(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    st.manager.rm_agent(&id, false).await?;
+    st.fleet
+        .remove_agent(&AgentId::from(id.as_str()), false)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/metrics` — prosperod's operational counters.
 pub async fn get_metrics(State(st): State<AppState>) -> Json<prospero_core::MetricsSnapshot> {
-    Json(st.manager.metrics())
+    Json(st.fleet.metrics())
 }
 
 /// `GET /healthz` — daemon liveness (always 200 while the process is up).
@@ -196,7 +208,7 @@ pub async fn healthz() -> &'static str {
 /// 503 so an orchestrator can gate traffic/restarts. The body carries the
 /// store-writability flag and an aggregate repo-health summary.
 pub async fn readyz(State(st): State<AppState>) -> (StatusCode, Json<prospero_core::Readiness>) {
-    let readiness = st.manager.readiness().await;
+    let readiness = st.fleet.readiness().await;
     let code = if readiness.ready {
         StatusCode::OK
     } else {
