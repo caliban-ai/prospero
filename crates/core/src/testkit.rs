@@ -46,6 +46,11 @@ pub struct FakeCaliband {
     /// Owns the temp dir backing a TCP fake's per-agent sockets, if any, so it
     /// outlives the fake. `None` for the Unix path (caller owns the dir).
     _tempdir: Option<tempfile::TempDir>,
+    /// `(cert_pem, key_pem)` of a TCP+TLS fake's self-signed cert, so
+    /// `add_agent_tcp` can serve per-agent streams over TLS with the *same*
+    /// cert the client already trusts (`CalibandTlsFixture::ca_pem`). `None`
+    /// for the Unix path. (#77 I1)
+    tls_material: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Self-signed localhost TLS material + address a matching
@@ -87,6 +92,7 @@ impl FakeCaliband {
             state,
             tasks: vec![accept_task],
             _tempdir: None,
+            tls_material: None,
         })
     }
 
@@ -101,6 +107,7 @@ impl FakeCaliband {
             .map_err(std::io::Error::other)?;
         let cert_pem = cert.cert.pem().into_bytes();
         let key_pem = cert.key_pair.serialize_pem().into_bytes();
+        let tls_material = Some((cert_pem.clone(), key_pem.clone()));
 
         let tempdir = tempfile::tempdir()?;
         let dir = tempdir.path().to_path_buf();
@@ -128,12 +135,36 @@ impl FakeCaliband {
                 state,
                 tasks: vec![accept_task],
                 _tempdir: Some(tempdir),
+                tls_material,
             },
             CalibandTlsFixture {
                 addr,
                 ca_pem: cert_pem,
             },
         ))
+    }
+
+    /// Register a per-agent stream served over **TCP + TLS** (the leg #77 I1
+    /// proves is network-routable), reusing this TCP fake's own cert so the
+    /// client's `CalibandTlsFixture::ca_pem` trust already covers it. The
+    /// agent's `AttachAck`/`Spawned` reply then advertises an `Endpoint::Tcp`,
+    /// so a client that `attach`es over the network gets a **TCP** stream
+    /// endpoint (not a same-process Unix path). Requires a `start_tcp_tls` fake.
+    /// (#77 I1)
+    pub async fn add_agent_tcp(&mut self, id: &str, script: Vec<serde_json::Value>) {
+        let (cert_pem, key_pem) = self
+            .tls_material
+            .clone()
+            .expect("add_agent_tcp requires a TCP+TLS fake (start_tcp_tls)");
+        let (addr, task) = spawn_tcp_stream_listener(script, &cert_pem, &key_pem).await;
+        let mut record = test_record(id, Path::new("/tmp"), AgentStatus::Running, false);
+        record.endpoint = Endpoint::Tcp { addr };
+        self.state
+            .lock()
+            .unwrap()
+            .agents
+            .insert(id.to_string(), record);
+        self.tasks.push(task);
     }
 
     /// The control socket path the fake is listening on.
@@ -457,6 +488,44 @@ async fn spawn_stream_listener(
             // Drop closes the stream, signalling end-of-stream.
         }
     })
+}
+
+/// Bind a per-agent stream socket over **TCP + TLS** that, on each connection,
+/// writes the scripted frames as NDJSON then closes. Returns the bound
+/// `host:port`. The TLS cert must be the one the dialing client trusts. (#77 I1)
+async fn spawn_tcp_stream_listener(
+    script: Vec<serde_json::Value>,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> (String, JoinHandle<()>) {
+    use crate::caliband::transport::{Listener, tls_server_from_pem};
+    use tokio::io::AsyncWriteExt as _;
+    let listener = Listener::bind(&crate::caliband::transport::BindSpec {
+        endpoint: Endpoint::Tcp {
+            addr: "127.0.0.1:0".into(),
+        },
+        tls: Some(tls_server_from_pem(cert_pem, key_pem).expect("server tls")),
+        // No token check on the stream leg; the client may still send one (its
+        // control token), which this listener simply never reads — it only
+        // writes frames. The bytes sit unread and harmless.
+        token: None,
+    })
+    .await
+    .expect("bind per-agent tcp stream listener");
+    let addr = listener.local_addr().expect("tcp stream addr");
+    let task = tokio::spawn(async move {
+        while let Ok(mut conn) = listener.accept().await {
+            for frame in &script {
+                let mut line = serde_json::to_vec(frame).unwrap();
+                line.push(b'\n');
+                if conn.write_all(&line).await.is_err() {
+                    break;
+                }
+            }
+            let _ = conn.flush().await;
+        }
+    });
+    (addr, task)
 }
 
 /// Bind a per-agent stream socket that serves a distinct script per connection
