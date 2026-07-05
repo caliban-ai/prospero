@@ -161,6 +161,10 @@ mod tests {
     #[tokio::test]
     async fn k8s_fleet_satisfies_conformance() {
         let fake = FakeK8s::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let bus: Arc<dyn crate::bus::EventBus> = Arc::new(crate::bus::InProcessBus::new(64));
         let fleet = K8sFleet::with_poll_config(
             fake.clone(),
             PollConfig {
@@ -170,6 +174,8 @@ mod tests {
                 deadline: Duration::from_secs(2),
                 interval: Duration::from_millis(10),
             },
+            bus,
+            store,
         )
         .with_watch_poll_interval(Duration::from_millis(20));
 

@@ -209,8 +209,14 @@ impl FleetConfig {
 }
 
 /// Stamps and dispatches events; cheaply cloneable into background tasks.
+///
+/// `pub(crate)` (not private) so [`crate::k8s::fleet::K8sFleet`]'s network
+/// session-plane bridge (ADR 0008 §3) can share this exact attach→bus/store
+/// path via [`Emitter::new`] + [`attach_loop`] — the same durable history +
+/// live bus `FleetManager` feeds, so `/stream` SSE and history work unchanged
+/// for a k8s-backed agent.
 #[derive(Clone)]
-struct Emitter {
+pub(crate) struct Emitter {
     store: Arc<dyn Store>,
     bus: Arc<dyn EventBus>,
     /// Next `seq` per stream key, seeded lazily from the store's high-water.
@@ -219,6 +225,22 @@ struct Emitter {
 }
 
 impl Emitter {
+    /// Build a fresh `Emitter` over `bus`/`store` with an empty seq cache and
+    /// its own metrics recorder. `FleetManager::with_seams` builds its
+    /// `Emitter` inline (unchanged, to avoid touching its construction); this
+    /// constructor exists for other callers in-crate — currently `K8sFleet`
+    /// (Task B4) — that need the identical bus/store plumbing. `cfg`-gated on
+    /// `k8s` (its only caller) so a `LocalFleet`-only build stays warning-free.
+    #[cfg(feature = "k8s")]
+    pub(crate) fn new(bus: Arc<dyn EventBus>, store: Arc<dyn Store>) -> Self {
+        Self {
+            store,
+            bus,
+            seqs: Arc::new(AsyncMutex::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+        }
+    }
+
     async fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
         let stream_key = crate::event::stream_key_for(repo, agent_id);
         let seq = self.next_seq(&stream_key).await;
@@ -1317,7 +1339,13 @@ enum StreamOutcome {
 /// replay carries it). A clean finish (terminal `result` → `AgentFinished`)
 /// exits without retrying; a drop or read error backs off and reconnects until
 /// the budget is spent, after which the poll loop remains the re-attach net.
-async fn attach_loop(
+///
+/// `pub(crate)`: `K8sFleet::start_agent_stream` (Task B4, ADR 0008 §3) calls
+/// this same loop directly over a network `CalibandClient` so a k8s-backed
+/// agent's session plane lands in the identical bus/store path this module's
+/// own `start_attach` (Unix-attached, `FleetManager`) uses. `FleetManager`'s
+/// own call site and behavior are unchanged.
+pub(crate) async fn attach_loop(
     client: &CalibandClient,
     repo: &str,
     agent_id: &str,

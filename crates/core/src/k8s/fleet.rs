@@ -16,8 +16,8 @@
 //! poll-based reconciliation on this timescale.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,11 +25,17 @@ use futures::stream::{BoxStream, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::bus::EventBus;
+use crate::caliband::client::CalibandClient;
+use crate::caliband::stream::NormalizeOptions;
+use crate::caliband::transport::TlsClient;
 use crate::caliband::wire::Endpoint;
 use crate::error::{CoreError, Result};
+use crate::fleet::{AttachBackoff, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
 use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, Source, TaskSpec as CrdTaskSpec, Workspace};
 use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
+use crate::store::Store;
 
 /// Deterministic, DNS-1123-safe name for the `CalibanTask` CR backing `spec`.
 ///
@@ -310,7 +316,10 @@ impl Default for PollConfig {
 }
 
 /// A Kubernetes `FleetProvider` backend: drives a fleet by CRUD + watch on
-/// `CalibanTask` custom resources.
+/// `CalibanTask` custom resources, and (Task B4, ADR 0008 §3) bridges each
+/// Running agent's live session over the network into the same event
+/// bus + `Store` the API's SSE/history reads — so `/stream` works for a
+/// k8s-backed agent unchanged.
 pub struct K8sFleet<A: CalibanTaskApi> {
     // `Arc` (not a bare `A`) so `watch_fleet` can hand a 'static-owned handle
     // to its background poll-diff task without requiring `A: Clone`.
@@ -322,6 +331,23 @@ pub struct K8sFleet<A: CalibanTaskApi> {
     /// via [`Self::with_watch_poll_interval`] so change assertions don't wait
     /// on the production cadence.
     watch_poll_interval: Duration,
+    /// Session-plane emitter: shares the exact bus/store `FleetManager`'s own
+    /// attach loop feeds (`crate::fleet::Emitter`).
+    emitter: Emitter,
+    /// TLS trust material for dialing each agent's caliband control endpoint,
+    /// operator-injected (env/Secret; see [`Self::with_network`]). `None` in
+    /// the fake/test plaintext path.
+    tls: Option<TlsClient>,
+    /// Bearer token presented after the TLS handshake (ADR 0051). `None` in
+    /// the fake/test no-auth path.
+    token: Option<String>,
+    /// CalibanTask names (== the `AgentId` `ensure_agent` hands back) with an
+    /// already-running session-plane attach task, guarding
+    /// [`Self::start_agent_stream`] against double-starting one when
+    /// `ensure_agent` is called again for an already-`Running` agent
+    /// (`ensure_agent`'s CR name is spec-deterministic, so this is a real
+    /// case, not just theoretical).
+    attached: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Default cadence for `watch_fleet`'s poll-diff loop.
@@ -329,22 +355,34 @@ const DEFAULT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 impl<A: CalibanTaskApi> K8sFleet<A> {
     /// A `K8sFleet` with the default (~30s) `ensure_agent` poll budget and
-    /// the default (~2s) `watch_fleet` poll cadence.
+    /// the default (~2s) `watch_fleet` poll cadence, feeding session-plane
+    /// events into `bus`/`store` (in-process defaults for the fake/test
+    /// wiring; production threads through the daemon's real seams — Task
+    /// B6).
     #[must_use]
-    pub fn new(api: A) -> Self {
-        Self::with_poll_config(api, PollConfig::default())
+    pub fn new(api: A, bus: Arc<dyn EventBus>, store: Arc<dyn Store>) -> Self {
+        Self::with_poll_config(api, PollConfig::default(), bus, store)
     }
 
     /// A `K8sFleet` with an explicit `ensure_agent` poll budget — tests use a
     /// short deadline so a never-Running CR fails fast instead of hanging
     /// ~30s.
     #[must_use]
-    pub fn with_poll_config(api: A, poll: PollConfig) -> Self {
+    pub fn with_poll_config(
+        api: A,
+        poll: PollConfig,
+        bus: Arc<dyn EventBus>,
+        store: Arc<dyn Store>,
+    ) -> Self {
         Self {
             api: Arc::new(api),
             poll,
             restart_nonce: AtomicU64::new(0),
             watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL,
+            emitter: Emitter::new(bus, store),
+            tls: None,
+            token: None,
+            attached: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -354,6 +392,101 @@ impl<A: CalibanTaskApi> K8sFleet<A> {
     pub fn with_watch_poll_interval(mut self, interval: Duration) -> Self {
         self.watch_poll_interval = interval;
         self
+    }
+
+    /// Configure the TLS trust root + bearer token [`Self::start_agent_stream`]
+    /// uses to dial each agent's caliband control endpoint (ADR 0008 §3).
+    /// Defaults to `(None, None)` — plaintext/no-auth, the fake/test path.
+    #[must_use]
+    pub fn with_network(mut self, tls: Option<TlsClient>, token: Option<String>) -> Self {
+        self.tls = tls;
+        self.token = token;
+        self
+    }
+}
+
+impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
+    /// Dial `endpoint` (the agent's pod-caliband **control** endpoint) over
+    /// #75's transport, attach to `agent_id`'s per-agent stream, and feed
+    /// normalized frames into the same bus + `Store` `FleetManager`'s own
+    /// attach loop feeds (ADR 0008 §3) — reusing `crate::fleet::attach_loop`
+    /// verbatim rather than a k8s-local duplicate.
+    ///
+    /// A no-op (idempotent) if a stream for `agent_id` is already running,
+    /// and a logged no-op if `endpoint` isn't `Endpoint::Tcp` (a k8s-backed
+    /// agent is always network-attached; a Unix endpoint here would mean a
+    /// misconfigured `CalibanTaskApi` implementation).
+    ///
+    /// ## Agent-id simplification (documented, MVP)
+    /// `agent_id` is used both as the bus/store stream key — so it must
+    /// match the `AgentId` `ensure_agent` returned, for `/stream` to find
+    /// these events — **and** as the id sent in the pod caliband's `Attach`
+    /// request (`attach_loop` calls `client.attach(agent_id)` internally,
+    /// mirroring the Unix path's single-id design). Those only coincide if
+    /// the pod caliband registers its (single) agent under this same name;
+    /// plausible in production since the operator, having created the
+    /// `CalibanTask`, can tell the pod's caliband to use the CR's name as
+    /// the agent id. The plan's alternative — discover the real id via
+    /// `client.list()`'s first entry when a direct `attach` 404s — is a
+    /// documented follow-up, not implemented here (kept to the narrowest
+    /// version that proves network streaming into a `Store`).
+    ///
+    /// ## Where this is called from (MVP scope)
+    /// Wired from [`FleetProvider::ensure_agent`] once a handle resolves.
+    /// A production implementation would also (re)attach on a `Running`
+    /// transition observed via `watch_fleet` (e.g. after an operator-driven
+    /// restart that bypasses `ensure_agent`) — not implemented here.
+    pub fn start_agent_stream(&self, repo: &str, agent_id: &str, endpoint: &Endpoint) {
+        let addr = match endpoint {
+            Endpoint::Tcp { addr } => addr.clone(),
+            Endpoint::Unix { .. } => {
+                tracing::warn!(
+                    target: "prospero_k8s_fleet", %agent_id,
+                    "start_agent_stream: k8s agent handle carries a Unix endpoint; \
+                     skipping session-plane attach (expected Tcp)"
+                );
+                return;
+            }
+        };
+        {
+            let mut attached = self.attached.lock().unwrap();
+            if !attached.insert(agent_id.to_string()) {
+                // Already streaming this agent (e.g. a repeat `ensure_agent`
+                // for the same spec-deterministic CR name).
+                return;
+            }
+        }
+
+        let client = CalibandClient::connect_tcp(addr, self.tls.clone(), self.token.clone());
+        let repo = repo.to_string();
+        let agent_id = agent_id.to_string();
+        let emitter = self.emitter.clone();
+        let attached = Arc::clone(&self.attached);
+
+        tokio::spawn(async move {
+            // No graceful-drain wiring at this seam yet (MVP) — an inert
+            // shutdown channel whose sender is kept alive in this task's own
+            // scope (never signalled) so `attach_loop`'s `shutdown.changed()`
+            // branch never fires spuriously from a dropped sender.
+            let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let result = attach_loop(
+                &client,
+                &repo,
+                &agent_id,
+                &emitter,
+                NormalizeOptions::default(),
+                AttachBackoff::default(),
+                &mut shutdown_rx,
+            )
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(
+                    target: "prospero_k8s_fleet", %repo, %agent_id, error = %e,
+                    "k8s session-plane attach task ended with error"
+                );
+            }
+            attached.lock().unwrap().remove(&agent_id);
+        });
     }
 }
 
@@ -370,6 +503,11 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             if let Some(task) = self.api.get(&name).await?
                 && let Some(handle) = handle_from(&task, repo.clone())
             {
+                // Session-plane bridge (Task B4, ADR 0008 §3): as soon as the
+                // agent is attachable, start feeding its live output into the
+                // same bus/store `/stream` reads. See `start_agent_stream`'s
+                // doc comment for the MVP-only-from-`ensure_agent` scope note.
+                self.start_agent_stream(&repo, handle.id.as_str(), &handle.endpoint);
                 return Ok(handle);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -593,6 +731,18 @@ mod tests {
         }
     }
 
+    /// In-process bus + a fresh `JsonlStore` for tests that don't care about
+    /// the session-plane bridge's bus/store wiring, just need `K8sFleet`'s
+    /// constructor satisfied. The backing tempdir is intentionally leaked
+    /// (`mem::forget`) so the store's file outlives the test.
+    fn test_seams() -> (Arc<dyn EventBus>, Arc<dyn Store>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn Store> = Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        std::mem::forget(dir);
+        let bus: Arc<dyn EventBus> = Arc::new(crate::bus::InProcessBus::new(64));
+        (bus, store)
+    }
+
     #[test]
     fn task_name_is_deterministic() {
         let a = spec("repo-a", "do the thing", None);
@@ -649,12 +799,15 @@ mod tests {
     #[tokio::test]
     async fn ensure_agent_returns_handle_once_running() {
         let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
         let fleet = K8sFleet::with_poll_config(
             api,
             PollConfig {
                 deadline: Duration::from_secs(5),
                 interval: Duration::from_millis(10),
             },
+            bus,
+            store,
         );
 
         let s = spec("repo-a", "task", None);
@@ -688,12 +841,15 @@ mod tests {
     #[tokio::test]
     async fn ensure_agent_times_out_if_never_running() {
         let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
         let fleet = K8sFleet::with_poll_config(
             api,
             PollConfig {
                 deadline: Duration::from_millis(50),
                 interval: Duration::from_millis(10),
             },
+            bus,
+            store,
         );
 
         let err = fleet
@@ -706,7 +862,8 @@ mod tests {
     #[tokio::test]
     async fn stop_agent_kill_deletes_the_cr() {
         let api = MemTaskApi::new();
-        let fleet = K8sFleet::new(api);
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
 
         let s = spec("repo-a", "task", None);
         let name = task_name(&s);
@@ -728,7 +885,8 @@ mod tests {
     #[tokio::test]
     async fn restart_agent_yields_a_new_id_and_a_fresh_cr() {
         let api = MemTaskApi::new();
-        let fleet = K8sFleet::new(api);
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
 
         let s = spec("repo-a", "task", None);
         let old_name = task_name(&s);
@@ -829,7 +987,9 @@ mod tests {
         api.apply(&build_calibantask(&s, &name)).await.unwrap();
         api.set_running(&name, "10.0.0.5:9443");
 
-        let fleet = K8sFleet::new(api).with_watch_poll_interval(Duration::from_millis(20));
+        let (bus, store) = test_seams();
+        let fleet =
+            K8sFleet::new(api, bus, store).with_watch_poll_interval(Duration::from_millis(20));
         let mut changes = fleet.watch_fleet();
 
         let change = tokio::time::timeout(Duration::from_secs(1), changes.next())
@@ -853,7 +1013,9 @@ mod tests {
     #[tokio::test]
     async fn watch_fleet_reports_live_discovered_then_status_changed() {
         let api = MemTaskApi::new();
-        let fleet = K8sFleet::new(api).with_watch_poll_interval(Duration::from_millis(20));
+        let (bus, store) = test_seams();
+        let fleet =
+            K8sFleet::new(api, bus, store).with_watch_poll_interval(Duration::from_millis(20));
         let mut changes = fleet.watch_fleet();
 
         let s = spec("repo-a", "task", None);
@@ -907,7 +1069,9 @@ mod tests {
         let name = task_name(&s);
         api.apply(&build_calibantask(&s, &name)).await.unwrap();
 
-        let fleet = K8sFleet::new(api).with_watch_poll_interval(Duration::from_millis(20));
+        let (bus, store) = test_seams();
+        let fleet =
+            K8sFleet::new(api, bus, store).with_watch_poll_interval(Duration::from_millis(20));
         let mut changes = fleet.watch_fleet();
 
         let first = tokio::time::timeout(Duration::from_secs(1), changes.next())
