@@ -4,7 +4,7 @@
 //! background poll loop, and serves until interrupted.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +47,29 @@ struct Args {
     /// docs/container.md "Fleet backends".
     #[arg(long, env = "PROSPERO_FLEET", default_value = "local")]
     fleet_backend: FleetBackend,
+
+    /// k8s only: PEM CA bundle trusting caliband's session-plane serving cert.
+    /// When set, per-agent dials use TLS; unset ⇒ plaintext (unchanged).
+    #[arg(long, env = "PROSPERO_K8S_CALIBAND_CA_FILE")]
+    k8s_caliband_ca_file: Option<PathBuf>,
+
+    /// k8s only: file holding the session-plane bearer token (contents trimmed).
+    /// When set, per-agent dials present the token; unset ⇒ no token.
+    #[arg(long, env = "PROSPERO_K8S_CALIBAND_TOKEN_FILE")]
+    k8s_caliband_token_file: Option<PathBuf>,
+
+    /// k8s only: SNI / cert-validation name for the session-plane TLS check.
+    #[arg(
+        long,
+        env = "PROSPERO_K8S_CALIBAND_SERVER_NAME",
+        default_value = "caliband"
+    )]
+    k8s_caliband_server_name: String,
+
+    /// k8s only: explicit kubeconfig file. Unset ⇒ infer (in-cluster, then
+    /// ambient kubeconfig).
+    #[arg(long, env = "KUBECONFIG")]
+    kubeconfig: Option<PathBuf>,
 
     /// Directory for the registry and event store.
     #[arg(long, env = "PROSPERO_DATA_DIR")]
@@ -103,6 +126,61 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
         _ => Err(format!("expected KEY=VALUE, got '{s}'")),
+    }
+}
+
+/// Read a bearer token from a mounted-Secret file, trimming the trailing
+/// whitespace/newline that Secret files commonly carry. A missing or
+/// unreadable path is fatal — a silently-empty token would defeat auth.
+///
+/// Not feature-gated (its tests run in every build), but only *called* from the
+/// k8s arm — so a bin-only build without `k8s` sees it as dead. Allow that.
+#[cfg_attr(not(feature = "k8s"), allow(dead_code))]
+fn read_token_file(path: &Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading session-plane token file {}", path.display()))?;
+    Ok(raw.trim_end().to_string())
+}
+
+/// Build client-side session-plane TLS from a CA file, when one is configured.
+/// `None` ⇒ TLS stays off (plaintext, unchanged). A good PEM ⇒ `Some(client)`
+/// trusting that CA and validating the server presents `server_name`. An
+/// unreadable file or unparseable PEM is fatal (fail fast — no silent plaintext
+/// fall-back).
+#[cfg(feature = "k8s")]
+fn load_session_plane_tls(
+    ca_file: Option<&Path>,
+    server_name: &str,
+) -> anyhow::Result<Option<prospero_core::caliband::transport::TlsClient>> {
+    let Some(ca_file) = ca_file else {
+        return Ok(None);
+    };
+    let ca_pem = std::fs::read(ca_file)
+        .with_context(|| format!("reading session-plane CA file {}", ca_file.display()))?;
+    let client = prospero_core::caliband::transport::tls_client_from_pem(&ca_pem, server_name)
+        .with_context(|| format!("building session-plane TLS from {}", ca_file.display()))?;
+    Ok(Some(client))
+}
+
+/// Build a `kube::Client`: from an explicit kubeconfig file when `kubeconfig`
+/// is set, else `try_default()` (infers in-cluster then ambient kubeconfig).
+#[cfg(feature = "k8s")]
+async fn build_kube_client(kubeconfig: Option<&Path>) -> anyhow::Result<kube::Client> {
+    match kubeconfig {
+        Some(path) => {
+            let kc = kube::config::Kubeconfig::read_from(path)
+                .with_context(|| format!("reading kubeconfig {}", path.display()))?;
+            let cfg = kube::Config::from_custom_kubeconfig(
+                kc,
+                &kube::config::KubeConfigOptions::default(),
+            )
+            .await
+            .with_context(|| format!("loading kubeconfig {}", path.display()))?;
+            kube::Client::try_from(cfg).with_context(|| "building kube client from kubeconfig")
+        }
+        None => kube::Client::try_default()
+            .await
+            .with_context(|| "connecting to the Kubernetes API server"),
     }
 }
 
@@ -241,14 +319,32 @@ async fn main() -> anyhow::Result<()> {
         FleetBackend::Local => (Arc::new(local.clone()), Some(Arc::new(local))),
         #[cfg(feature = "k8s")]
         FleetBackend::K8s => {
-            let client = kube::Client::try_default()
-                .await
-                .with_context(|| "connecting to the Kubernetes API server")?;
+            let client = build_kube_client(args.kubeconfig.as_deref()).await?;
             let ns =
                 std::env::var("PROSPERO_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
             let api = prospero_core::KubeTaskApi::new(client, &ns);
-            let k8s = prospero_core::K8sFleet::new(api, manager.bus(), manager.store());
-            tracing::info!(target: "prosperod", backend = "k8s", namespace = %ns, "serving via K8sFleet");
+
+            // Session-plane security (ADR 0051): trust caliband's serving cert
+            // via the mounted-Secret CA, and present the shared bearer token.
+            // Both are Option — unset ⇒ with_network(None, None), i.e. today's
+            // plaintext behavior, so existing deployments are unaffected.
+            let tls = load_session_plane_tls(
+                args.k8s_caliband_ca_file.as_deref(),
+                &args.k8s_caliband_server_name,
+            )?;
+            let token = args
+                .k8s_caliband_token_file
+                .as_deref()
+                .map(read_token_file)
+                .transpose()?;
+
+            let k8s = prospero_core::K8sFleet::new(api, manager.bus(), manager.store())
+                .with_network(tls.clone(), token.clone());
+            tracing::info!(
+                target: "prosperod", backend = "k8s", namespace = %ns,
+                session_tls = tls.is_some(), session_token = token.is_some(),
+                "serving via K8sFleet"
+            );
             (Arc::new(k8s), None)
         }
         #[cfg(not(feature = "k8s"))]
@@ -338,8 +434,66 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::parse_key_val;
+    use super::read_token_file;
     use super::{heartbeat_interval, resolve_replica_id};
     use std::time::Duration;
+
+    #[test]
+    fn read_token_file_trims_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("token");
+        std::fs::write(&p, "s3cr3t\n").unwrap();
+        assert_eq!(read_token_file(&p).unwrap(), "s3cr3t");
+    }
+
+    #[test]
+    fn read_token_file_missing_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_token_file(&dir.path().join("nope")).is_err());
+    }
+
+    #[cfg(feature = "k8s")]
+    mod k8s_tls {
+        use super::super::load_session_plane_tls;
+
+        fn write_ca(dir: &std::path::Path) -> std::path::PathBuf {
+            // A self-signed cert doubles as its own CA for trust-store loading.
+            let cert = rcgen::generate_simple_self_signed(vec!["caliband".into()]).unwrap();
+            let p = dir.join("ca.crt");
+            std::fs::write(&p, cert.cert.pem()).unwrap();
+            p
+        }
+
+        #[test]
+        fn none_ca_means_tls_off() {
+            assert!(load_session_plane_tls(None, "caliband").unwrap().is_none());
+        }
+
+        #[test]
+        fn good_ca_builds_a_client() {
+            let dir = tempfile::tempdir().unwrap();
+            let ca = write_ca(dir.path());
+            assert!(
+                load_session_plane_tls(Some(&ca), "caliband")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn unparseable_pem_is_err() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("bad.crt");
+            std::fs::write(&p, "not a pem").unwrap();
+            assert!(load_session_plane_tls(Some(&p), "caliband").is_err());
+        }
+
+        #[test]
+        fn missing_ca_file_is_err() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(load_session_plane_tls(Some(&dir.path().join("nope")), "caliband").is_err());
+        }
+    }
 
     #[test]
     fn replica_id_prefers_explicit_then_falls_back() {

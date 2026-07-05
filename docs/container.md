@@ -52,8 +52,26 @@ those routes return **405** under `k8s`, where workspaces are `CalibanTask`/
 namespace-driven rather than a prospero registry.
 
 `PROSPERO_K8S_NAMESPACE` (default `default`) selects the namespace the
-`CalibanTask` client is scoped to; the kube client is resolved from the ambient
-kubeconfig / in-cluster service account.
+`CalibanTask` client is scoped to. The kube API-server connection defaults to
+the ambient kubeconfig / in-cluster service account; pass `--kubeconfig <path>`
+(or `KUBECONFIG`) to select an explicit kubeconfig file instead.
+
+### k8s session-plane security
+
+The per-agent session plane (prosperod → each caliband pod: live output stream
+and input) supports TLS + a bearer token (ADR 0051). Both are **off by
+default** (plaintext), and each turns on only when its file is provided —
+typically from a mounted Kubernetes `Secret` volume:
+
+| Flag | Env | Purpose |
+|------|-----|---------|
+| `--k8s-caliband-ca-file` | `PROSPERO_K8S_CALIBAND_CA_FILE` | PEM CA bundle trusting caliband's serving cert. When set, dials use TLS. |
+| `--k8s-caliband-token-file` | `PROSPERO_K8S_CALIBAND_TOKEN_FILE` | File holding the shared bearer token (contents trimmed). When set, dials present it. |
+| `--k8s-caliband-server-name` | `PROSPERO_K8S_CALIBAND_SERVER_NAME` | SNI / cert-validation name (default `caliband`). |
+
+An unreadable or malformed CA/token file is a **fatal startup error** — there
+is no silent fall-back to plaintext. Secret rotation takes effect on the next
+pod restart (files are read once at startup).
 
 If prosperod wasn't built with the `k8s` cargo feature (which forwards to
 `prospero-core/k8s`), selecting `k8s` fails at startup with a message pointing
