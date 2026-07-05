@@ -173,7 +173,8 @@ pub struct TaskSpec {
 pub struct AgentHandle {
     pub id: AgentId,
     pub repo: String,
-    pub socket: std::path::PathBuf,
+    /// Endpoint the agent's per-agent socket is reachable at.
+    pub endpoint: crate::caliband::wire::Endpoint,
 }
 
 /// How to stop an agent. `Kill` preserves today's unconditional behavior.

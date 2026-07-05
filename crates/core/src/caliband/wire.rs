@@ -11,6 +11,34 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::model::AgentStatus;
 
+/// Where a caliband socket lives, independent of transport family. Mirrors
+/// `caliban-supervisor::transport::Endpoint` byte-for-byte on the wire (ADR 0051).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scheme", rename_all = "snake_case")]
+pub enum Endpoint {
+    /// Local Unix-domain socket at this filesystem path.
+    Unix {
+        /// Socket file path.
+        path: PathBuf,
+    },
+    /// TCP endpoint as a `host:port` string (host may be a DNS name).
+    Tcp {
+        /// `host:port`.
+        addr: String,
+    },
+}
+
+impl Endpoint {
+    /// The Unix socket path, when this endpoint is Unix-domain.
+    #[must_use]
+    pub fn unix_socket_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Endpoint::Unix { path } => Some(path.as_path()),
+            Endpoint::Tcp { .. } => None,
+        }
+    }
+}
+
 /// Snapshot describing a registered sub-agent (caliband `AgentRecord`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -24,8 +52,8 @@ pub struct AgentRecord {
     pub started_at: String,
     /// Path to the agent's session directory.
     pub session_dir: PathBuf,
-    /// Path to the agent's per-agent socket (for attach).
-    pub socket_path: PathBuf,
+    /// Endpoint for the agent's per-agent socket (for attach).
+    pub endpoint: Endpoint,
     /// Original spawn spec.
     pub spec: SpawnSpec,
 }
@@ -39,8 +67,8 @@ pub struct DaemonStatus {
     pub agents: u32,
     /// Seconds since the daemon started.
     pub uptime_secs: u64,
-    /// Path to the control socket.
-    pub socket_path: PathBuf,
+    /// Endpoint of the control socket.
+    pub endpoint: Endpoint,
 }
 
 /// Parameters for a new sub-agent spawn (caliband `SpawnSpec`).
@@ -152,13 +180,13 @@ pub enum CtlReply {
     Spawned {
         /// New id.
         id: String,
-        /// Per-agent socket path.
-        socket_path: PathBuf,
+        /// Per-agent endpoint.
+        endpoint: Endpoint,
     },
     /// Successful attach handshake.
     AttachAck {
-        /// Per-agent socket path.
-        socket_path: PathBuf,
+        /// Per-agent endpoint.
+        endpoint: Endpoint,
     },
     /// Successful kill.
     Killed,
@@ -211,6 +239,45 @@ pub enum SupervisorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_matches_caliban_wire_shape() {
+        // Byte-for-byte parity with caliban's transport::Endpoint.
+        let unix = Endpoint::Unix {
+            path: "/tmp/a1.sock".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&unix).unwrap(),
+            r#"{"scheme":"unix","path":"/tmp/a1.sock"}"#
+        );
+        let tcp = Endpoint::Tcp {
+            addr: "host.ns.svc:9443".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&tcp).unwrap(),
+            r#"{"scheme":"tcp","addr":"host.ns.svc:9443"}"#
+        );
+        // Round-trips both ways.
+        for e in [unix, tcp] {
+            let s = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<Endpoint>(&s).unwrap(), e);
+        }
+    }
+
+    #[test]
+    fn endpoint_unix_socket_path_accessor() {
+        assert_eq!(
+            Endpoint::Unix {
+                path: "/x.sock".into()
+            }
+            .unix_socket_path(),
+            Some(std::path::Path::new("/x.sock"))
+        );
+        assert_eq!(
+            Endpoint::Tcp { addr: "h:1".into() }.unix_socket_path(),
+            None
+        );
+    }
 
     #[test]
     fn ctl_request_list_is_tagged() {
@@ -334,13 +401,32 @@ mod tests {
 
     #[test]
     fn spawned_reply_parses() {
-        let json = "{\"kind\":\"spawned\",\"id\":\"a1\",\"socket_path\":\"/tmp/a1.sock\"}";
+        let json =
+            r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"unix","path":"/tmp/a1.sock"}}"#;
         let r: CtlReply = serde_json::from_str(json).unwrap();
         assert_eq!(
             r,
             CtlReply::Spawned {
                 id: "a1".into(),
-                socket_path: "/tmp/a1.sock".into()
+                endpoint: Endpoint::Unix {
+                    path: "/tmp/a1.sock".into()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn spawned_reply_parses_tcp_endpoint() {
+        let json =
+            r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"tcp","addr":"pod.ns.svc:9443"}}"#;
+        let r: CtlReply = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            r,
+            CtlReply::Spawned {
+                id: "a1".into(),
+                endpoint: Endpoint::Tcp {
+                    addr: "pod.ns.svc:9443".into()
+                },
             }
         );
     }

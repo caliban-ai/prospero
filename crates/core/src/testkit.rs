@@ -10,11 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 use crate::caliband::wire::{
-    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, SpawnSpec, SupervisorError,
+    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, Endpoint, SpawnSpec,
+    SupervisorError,
 };
 
 /// Shared mutable state inside a running fake.
@@ -42,6 +43,18 @@ pub struct FakeCaliband {
     control_socket: PathBuf,
     state: Arc<Mutex<FakeState>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Owns the temp dir backing a TCP fake's per-agent sockets, if any, so it
+    /// outlives the fake. `None` for the Unix path (caller owns the dir).
+    _tempdir: Option<tempfile::TempDir>,
+}
+
+/// Self-signed localhost TLS material + address a matching
+/// `CalibandClient::connect_tcp` needs to reach a TCP+TLS [`FakeCaliband`].
+pub struct CalibandTlsFixture {
+    /// `host:port` the fake bound (resolved from `:0`).
+    pub addr: String,
+    /// CA/cert PEM the client trusts (self-signed for "localhost").
+    pub ca_pem: Vec<u8>,
 }
 
 impl FakeCaliband {
@@ -57,29 +70,70 @@ impl FakeCaliband {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let listener = UnixListener::bind(&control_socket)?;
+        let listener =
+            crate::caliband::transport::Listener::bind(&crate::caliband::transport::BindSpec {
+                endpoint: Endpoint::Unix {
+                    path: control_socket.clone(),
+                },
+                tls: None,
+                token: None,
+            })
+            .await?;
         let state = Arc::new(Mutex::new(FakeState::default()));
-
-        let st = state.clone();
-        let dir2 = dir.clone();
-        let socket2 = control_socket.clone();
-        let accept_task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let conn_st = st.clone();
-                let dir = dir2.clone();
-                handle_control_conn(stream, conn_st, dir).await.ok();
-                if st.lock().unwrap().should_stop {
-                    let _ = std::fs::remove_file(&socket2);
-                    break;
-                }
-            }
-        });
+        let accept_task = serve_control(listener, state.clone(), dir, Some(control_socket.clone()));
 
         Ok(Self {
             control_socket,
             state,
             tasks: vec![accept_task],
+            _tempdir: None,
         })
+    }
+
+    /// Start a fake serving the control protocol over **TCP + TLS + bearer
+    /// token** (ADR 0051). Per-agent stream sockets remain Unix in a temp dir —
+    /// the control plane (list/spawn/attach/kill/status/shutdown) is what this
+    /// path proves over the network; full per-agent-stream-over-TCP is a
+    /// K8sFleet concern (prospero #64). Returns the fixture a matching
+    /// [`crate::caliband::client::CalibandClient::connect_tcp`] needs.
+    pub async fn start_tcp_tls(token: &str) -> std::io::Result<(Self, CalibandTlsFixture)> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .map_err(std::io::Error::other)?;
+        let cert_pem = cert.cert.pem().into_bytes();
+        let key_pem = cert.key_pair.serialize_pem().into_bytes();
+
+        let tempdir = tempfile::tempdir()?;
+        let dir = tempdir.path().to_path_buf();
+
+        let listener =
+            crate::caliband::transport::Listener::bind(&crate::caliband::transport::BindSpec {
+                endpoint: Endpoint::Tcp {
+                    addr: "127.0.0.1:0".into(),
+                },
+                tls: Some(crate::caliband::transport::tls_server_from_pem(
+                    &cert_pem, &key_pem,
+                )?),
+                token: Some(token.to_string()),
+            })
+            .await?;
+        let addr = listener.local_addr().expect("tcp listener has an address");
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let accept_task = serve_control(listener, state.clone(), dir, None);
+
+        Ok((
+            Self {
+                // No control socket file for TCP; a non-existent path keeps the
+                // Drop cleanup a harmless no-op.
+                control_socket: PathBuf::from("<tcp>"),
+                state,
+                tasks: vec![accept_task],
+                _tempdir: Some(tempdir),
+            },
+            CalibandTlsFixture {
+                addr,
+                ca_pem: cert_pem,
+            },
+        ))
     }
 
     /// The control socket path the fake is listening on.
@@ -90,7 +144,11 @@ impl FakeCaliband {
     /// Pre-register an agent with a stream script, and start its per-agent
     /// stream listener so an attach will replay `script` then close.
     pub async fn add_agent(&mut self, record: AgentRecord, script: Vec<serde_json::Value>) {
-        let socket_path = record.socket_path.clone();
+        let socket_path = record
+            .endpoint
+            .unix_socket_path()
+            .expect("fake uses unix endpoints")
+            .to_path_buf();
         {
             let mut st = self.state.lock().unwrap();
             st.scripts.insert(record.id.clone(), script.clone());
@@ -110,7 +168,11 @@ impl FakeCaliband {
         record: AgentRecord,
         scripts: Vec<Vec<serde_json::Value>>,
     ) {
-        let socket_path = record.socket_path.clone();
+        let socket_path = record
+            .endpoint
+            .unix_socket_path()
+            .expect("fake uses unix endpoints")
+            .to_path_buf();
         {
             let mut st = self.state.lock().unwrap();
             st.scripts.insert(
@@ -162,12 +224,36 @@ impl Drop for FakeCaliband {
     }
 }
 
+/// Drive one control listener: accept connections, handle each request, and
+/// stop once a `Shutdown` set `should_stop`. Works over any transport family
+/// (Unix or TCP+TLS). `cleanup_socket`, when set, is removed on stop.
+fn serve_control(
+    listener: crate::caliband::transport::Listener,
+    state: Arc<Mutex<FakeState>>,
+    dir: PathBuf,
+    cleanup_socket: Option<PathBuf>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok(conn) = listener.accept().await {
+            handle_control_conn(conn, state.clone(), dir.clone())
+                .await
+                .ok();
+            if state.lock().unwrap().should_stop {
+                if let Some(sock) = &cleanup_socket {
+                    let _ = std::fs::remove_file(sock);
+                }
+                break;
+            }
+        }
+    })
+}
+
 async fn handle_control_conn(
-    stream: UnixStream,
+    conn: crate::caliband::transport::BoxConn,
     state: Arc<Mutex<FakeState>>,
     dir: PathBuf,
 ) -> std::io::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = tokio::io::split(conn);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     if reader.read_line(&mut line).await? == 0 {
@@ -215,7 +301,9 @@ async fn handle_control_conn(
                     status: AgentStatus::Running,
                     started_at: "1970-01-01T00:00:00Z".into(),
                     session_dir: dir.join(&id),
-                    socket_path: socket_path.clone(),
+                    endpoint: Endpoint::Unix {
+                        path: socket_path.clone(),
+                    },
                     spec: spec.clone(),
                 };
                 st.scripts.insert(id.clone(), script.clone());
@@ -223,7 +311,9 @@ async fn handle_control_conn(
                 (
                     CtlReply::Spawned {
                         id,
-                        socket_path: socket_path.clone(),
+                        endpoint: Endpoint::Unix {
+                            path: socket_path.clone(),
+                        },
                     },
                     Some((socket_path, script)),
                 )
@@ -233,7 +323,7 @@ async fn handle_control_conn(
                 match st.agents.get(&id) {
                     Some(a) => (
                         CtlReply::AttachAck {
-                            socket_path: a.socket_path.clone(),
+                            endpoint: a.endpoint.clone(),
                         },
                         None,
                     ),
@@ -289,7 +379,9 @@ async fn handle_control_conn(
                     pid: 1234,
                     agents: st.agents.len() as u32,
                     uptime_secs: 0,
-                    socket_path: dir.join("control.sock"),
+                    endpoint: Endpoint::Unix {
+                        path: dir.join("control.sock"),
+                    },
                 }),
                 None,
             ),
@@ -640,7 +732,9 @@ pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) ->
         status,
         started_at: "1970-01-01T00:00:00Z".into(),
         session_dir: dir.join(id),
-        socket_path: dir.join(format!("{id}.sock")),
+        endpoint: Endpoint::Unix {
+            path: dir.join(format!("{id}.sock")),
+        },
         spec: SpawnSpec {
             label: Some(id.into()),
             frontmatter_path: None,

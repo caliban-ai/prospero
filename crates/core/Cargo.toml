@@ -5,7 +5,9 @@ edition.workspace = true
 
 [features]
 # Test/integration harness reused by other crates' tests (FakeCaliband).
-testkit = ["dep:tempfile"]
+# `rcgen` backs the TCP+TLS fake's self-signed cert; `tempfile` its per-agent
+# socket dir.
+testkit = ["dep:tempfile", "dep:rcgen"]
 
 [dependencies]
 tokio.workspace = true
@@ -17,13 +19,16 @@ sha2.workspace = true
 hex.workspace = true
 chrono.workspace = true
 tempfile = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
 async-trait.workspace = true
 sqlx = { workspace = true }
 tokio-stream.workspace = true
 async-stream = { workspace = true }
 futures.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 serde_json.workspace = true
+rcgen.workspace = true

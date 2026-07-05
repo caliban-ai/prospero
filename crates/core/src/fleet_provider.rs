@@ -53,14 +53,14 @@ impl FleetProvider for LocalFleet {
         // `spawn_agent_with_socket` already returns the per-agent socket
         // `client.spawn` produced, so no follow-up `Attach` round-trip is
         // needed to resolve it (and no new failure mode on the success path).
-        let (id, socket) = self
+        let (id, endpoint) = self
             .inner
             .spawn_agent_with_socket(&spec.repo, spec.request)
             .await?;
         Ok(AgentHandle {
             id: AgentId::from(id),
             repo: spec.repo,
-            socket,
+            endpoint,
         })
     }
 
@@ -141,11 +141,13 @@ mod local_fleet_tests {
             fake.received_attach_ids()
         );
 
-        // The socket on the handle must be the one caliband's `Spawned` reply
+        // The endpoint on the handle must be the one caliband's `Spawned` reply
         // advertised for this id, proving it came straight from `spawn`'s
         // return value rather than a (now-absent) follow-up attach.
-        let expected_socket = _dir.path().join(format!("{}.sock", handle.id.as_str()));
-        assert_eq!(handle.socket, expected_socket);
+        let expected = crate::caliband::wire::Endpoint::Unix {
+            path: _dir.path().join(format!("{}.sock", handle.id.as_str())),
+        };
+        assert_eq!(handle.endpoint, expected);
     }
 
     #[tokio::test]
@@ -283,5 +285,69 @@ mod local_fleet_tests {
         // Tidy: stop the background poll loop before `_dir` (and its sockets)
         // get removed on drop.
         provider.manager().begin_shutdown();
+    }
+
+    /// #71 acceptance: `LocalFleet` drives caliband over **TCP + TLS + bearer
+    /// token** (ADR 0051) through the same `FleetProvider` trait — ensure /
+    /// observe / stop all cross the network control plane. Per-agent stream
+    /// sockets stay Unix in the fake's temp dir (same-process); full
+    /// per-agent-stream-over-TCP is prospero #64.
+    #[tokio::test]
+    async fn local_fleet_drives_control_plane_over_tcp_tls() {
+        use crate::testkit::FakeCaliband;
+
+        let (fake, fixture) = FakeCaliband::start_tcp_tls("s3cr3t").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.ensure.autostart = false;
+        config.poll_interval = std::time::Duration::from_millis(20);
+        config.caliband_network = Some(crate::fleet::CalibandNetworkConfig {
+            addr: fixture.addr.clone(),
+            ca_pem: fixture.ca_pem.clone(),
+            server_name: "localhost".into(),
+            token: Some("s3cr3t".into()),
+        });
+        let root = dir.path().join("repo-a");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).await.unwrap();
+        mgr.add_repo("repo-a", &root).await.unwrap();
+        let provider = LocalFleet::new(mgr);
+
+        // ensure_agent issues Spawn over TCP+TLS+token.
+        let handle = provider
+            .ensure_agent(TaskSpec {
+                repo: "repo-a".into(),
+                request: SpawnRequest::new("task"),
+            })
+            .await
+            .expect("ensure_agent over tcp+tls");
+        assert_eq!(handle.repo, "repo-a");
+        assert!(!fake.received_specs().is_empty(), "spawn reached the fake");
+
+        // observe: a poll (List over TCP) surfaces the agent in the snapshot.
+        provider.manager().poll_repo_once("repo-a").await;
+        {
+            let snap = provider.manager().snapshot().await;
+            assert!(
+                snap.find_agent(handle.id.as_str()).is_some(),
+                "agent observed over the tcp control plane"
+            );
+        }
+
+        // stop: Kill over TCP.
+        provider
+            .stop_agent(&handle.id, DrainPolicy::Kill)
+            .await
+            .expect("kill over tcp+tls");
+        provider.manager().poll_repo_once("repo-a").await;
+        let snap = provider.manager().snapshot().await;
+        let (_, agent) = snap
+            .find_agent(handle.id.as_str())
+            .expect("agent still known");
+        assert_eq!(agent.status, crate::model::AgentStatus::Killed);
+
+        provider.manager().begin_shutdown();
+        let _ = fake;
     }
 }
