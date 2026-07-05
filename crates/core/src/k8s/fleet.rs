@@ -20,9 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::BoxStream;
 use sha2::{Digest, Sha256};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bus::EventBus;
 use crate::caliband::client::CalibandClient;
@@ -334,12 +333,111 @@ pub struct K8sFleet<A: CalibanTaskApi> {
     /// (`ensure_agent`'s CR name is spec-deterministic, so this is a real
     /// case, not just theoretical).
     attached: Arc<Mutex<HashSet<String>>>,
+    /// Canonical last-observed agents, maintained by the shared poll loop and
+    /// read by `watch_fleet` to seed new subscribers consistently. (#77 M2)
+    known: KnownAgents,
+    /// Broadcast of fleet changes from the single shared poll-diff loop. Every
+    /// `watch_fleet` subscriber seeds from `known` then tails this, so all
+    /// subscribers share one `list()` cadence and see `Gone` exactly once.
+    /// (#77 M2)
+    changes: tokio::sync::broadcast::Sender<FleetChange>,
+    /// The shared poll-diff loop's task, aborted on drop so a dropped fleet
+    /// (e.g. between tests) doesn't leak a forever-polling task.
+    poll_task: tokio::task::JoinHandle<()>,
+}
+
+impl<A: CalibanTaskApi> Drop for K8sFleet<A> {
+    fn drop(&mut self) {
+        self.poll_task.abort();
+    }
 }
 
 /// Default cadence for `watch_fleet`'s poll-diff loop.
 const DEFAULT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-impl<A: CalibanTaskApi> K8sFleet<A> {
+/// The canonical last-observed agent per CR name, shared between the poll loop
+/// (which maintains it) and `watch_fleet` (which seeds new subscribers from it).
+/// Sharing this — rather than each seeding via its own `list()` — keeps a
+/// subscriber's seed and the loop's diff stream consistent, so an agent the
+/// loop never observed can't be seed-`Discovered` without a matching `Gone`.
+type KnownAgents = Arc<Mutex<HashMap<String, Agent>>>;
+
+/// Spawn the single shared poll-diff loop: `list()` on `interval`, diff against
+/// the shared `known` state, update it, and broadcast each `FleetChange` once.
+/// Runs for the fleet's lifetime (aborted by `K8sFleet::drop`). (#77 M2)
+fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
+    api: Arc<A>,
+    known: KnownAgents,
+    tx: tokio::sync::broadcast::Sender<FleetChange>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let tasks = match api.list().await {
+                Ok(tasks) => tasks,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "prospero_k8s_fleet", error = %e,
+                        "watch loop: list() failed; retrying next poll"
+                    );
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
+            // Diff under the lock so a concurrent `watch_fleet` seed sees a
+            // consistent snapshot, then broadcast after releasing it.
+            let mut changes: Vec<FleetChange> = Vec::new();
+            {
+                let mut known = known.lock().unwrap();
+                let mut seen: HashSet<String> = HashSet::with_capacity(tasks.len());
+                for task in &tasks {
+                    let Some(name) = task.metadata.name.clone() else {
+                        continue;
+                    };
+                    seen.insert(name.clone());
+                    let agent = agent_from_task(task);
+                    match known.get(&name) {
+                        None => changes.push(FleetChange::Discovered {
+                            id: AgentId::from(name.clone()),
+                            workspace: agent.workspace.clone(),
+                            agent: agent.clone(),
+                        }),
+                        Some(prev) if prev.status != agent.status => {
+                            changes.push(FleetChange::StatusChanged {
+                                id: AgentId::from(name.clone()),
+                                workspace: agent.workspace.clone(),
+                                from: prev.status,
+                                to: agent.status,
+                            })
+                        }
+                        Some(_) => {}
+                    }
+                    known.insert(name, agent);
+                }
+                let gone: Vec<String> = known
+                    .keys()
+                    .filter(|name| !seen.contains(*name))
+                    .cloned()
+                    .collect();
+                for name in gone {
+                    let agent = known.remove(&name).expect("present");
+                    changes.push(FleetChange::Gone {
+                        id: AgentId::from(name),
+                        workspace: agent.workspace,
+                    });
+                }
+            }
+            // A send error just means no live subscribers right now; `known`
+            // stays canonical for later subscribers.
+            for change in changes {
+                let _ = tx.send(change);
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// A `K8sFleet` with the default (~30s) `ensure_agent` poll budget and
     /// the default (~2s) `watch_fleet` poll cadence, feeding session-plane
     /// events into `bus`/`store` (in-process defaults for the fake/test
@@ -360,22 +458,42 @@ impl<A: CalibanTaskApi> K8sFleet<A> {
         bus: Arc<dyn EventBus>,
         store: Arc<dyn Store>,
     ) -> Self {
+        let api = Arc::new(api);
+        let known: KnownAgents = Arc::new(Mutex::new(HashMap::new()));
+        let (changes, _) = tokio::sync::broadcast::channel::<FleetChange>(256);
+        let poll_task = spawn_watch_loop(
+            Arc::clone(&api),
+            Arc::clone(&known),
+            changes.clone(),
+            DEFAULT_WATCH_POLL_INTERVAL,
+        );
         Self {
-            api: Arc::new(api),
+            api,
             poll,
             watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL,
             emitter: Emitter::new(bus, store),
             tls: None,
             token: None,
             attached: Arc::new(Mutex::new(HashSet::new())),
+            known,
+            changes,
+            poll_task,
         }
     }
 
     /// Override `watch_fleet`'s poll cadence. Tests use a short interval
     /// (e.g. 20ms) so diff assertions don't block on the production default.
+    /// Restarts the shared poll loop at the new cadence.
     #[must_use]
     pub fn with_watch_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_task.abort();
         self.watch_poll_interval = interval;
+        self.poll_task = spawn_watch_loop(
+            Arc::clone(&self.api),
+            Arc::clone(&self.known),
+            self.changes.clone(),
+            interval,
+        );
         self
     }
 
@@ -505,95 +623,59 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
     }
 
     fn watch_fleet(&self) -> BoxStream<'static, FleetChange> {
-        let api = Arc::clone(&self.api);
-        let poll_interval = self.watch_poll_interval;
-        // Small buffer: one poll cycle rarely produces more than a handful
-        // of changes, and a slow subscriber just backpressures the sender
-        // (no `Lagged`-style drop path exists at this seam, unlike the bus).
-        let (tx, rx) = tokio::sync::mpsc::channel::<FleetChange>(128);
+        // Subscribe BEFORE reading `known` so no diff is missed in the gap, then
+        // seed from the shared canonical `known` (Discovered per present agent)
+        // and tail the broadcast — deduping the seed/tail overlap by id. Seeding
+        // from the *same* state the loop maintains (not an independent `list()`)
+        // guarantees an agent the loop never observed can't be seed-Discovered
+        // without a matching Gone. One `list()` cadence for all subscribers;
+        // `Gone` delivered exactly once per live subscriber. (#77 M2)
+        let mut rx = self.changes.subscribe();
+        let known = Arc::clone(&self.known);
 
-        tokio::spawn(async move {
-            // Last-observed (status, repo) per task name. Starts empty, so
-            // the very first poll naturally treats every currently-present
-            // task as newly `Discovered` — that IS the "seed from the
-            // initial listing" behavior the plan asks for, with no special
-            // first-iteration branch required.
-            let mut known: HashMap<String, (AgentStatus, String)> = HashMap::new();
+        let stream = async_stream::stream! {
+            let seed: Vec<(String, Agent)> = {
+                let known = known.lock().unwrap();
+                known.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
+            };
+            let mut seen: HashSet<String> = HashSet::with_capacity(seed.len());
+            for (name, agent) in seed {
+                let workspace = agent.workspace.clone();
+                seen.insert(name.clone());
+                yield FleetChange::Discovered { id: AgentId::from(name), workspace, agent };
+            }
 
             loop {
-                let tasks = match api.list().await {
-                    Ok(tasks) => tasks,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "prospero_k8s_fleet", error = %e,
-                            "watch_fleet: list() failed; retrying next poll"
-                        );
-                        tokio::time::sleep(poll_interval).await;
-                        continue;
-                    }
-                };
-
-                let mut seen: HashSet<String> = HashSet::with_capacity(tasks.len());
-                for task in &tasks {
-                    let Some(name) = task.metadata.name.clone() else {
-                        // A CR with no name can't be addressed by later
-                        // get/delete calls; nothing sane to diff against.
-                        continue;
-                    };
-                    seen.insert(name.clone());
-
-                    let agent = agent_from_task(task);
-                    let status = agent.status;
-                    let repo = agent.workspace.clone();
-
-                    let change = match known.get(&name) {
-                        None => Some(FleetChange::Discovered {
-                            id: AgentId::from(name.clone()),
-                            workspace: repo.clone(),
-                            agent,
-                        }),
-                        Some((prev_status, _)) if *prev_status != status => {
-                            Some(FleetChange::StatusChanged {
-                                id: AgentId::from(name.clone()),
-                                workspace: repo.clone(),
-                                from: *prev_status,
-                                to: status,
-                            })
+                match rx.recv().await {
+                    Ok(change) => {
+                        // Drop a Discovered already emitted by the seed (the
+                        // seed and the broadcast overlap by up to one cycle).
+                        if let FleetChange::Discovered { ref id, .. } = change
+                            && seen.remove(id.as_str())
+                        {
+                            continue;
                         }
-                        Some(_) => None,
-                    };
-                    known.insert(name, (status, repo));
-
-                    if let Some(change) = change
-                        && tx.send(change).await.is_err()
-                    {
-                        // Receiver dropped: stop polling instead of leaking
-                        // this task forever.
-                        return;
+                        yield change;
                     }
-                }
-
-                let gone: Vec<(String, String)> = known
-                    .iter()
-                    .filter(|(name, _)| !seen.contains(*name))
-                    .map(|(name, (_, repo))| (name.clone(), repo.clone()))
-                    .collect();
-                for (name, repo) in gone {
-                    known.remove(&name);
-                    let change = FleetChange::Gone {
-                        id: AgentId::from(name),
-                        workspace: repo,
-                    };
-                    if tx.send(change).await.is_err() {
-                        return;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Slow subscriber fell behind: re-seed from the shared
+                        // `known` rather than silently dropping changes.
+                        let reseed: Vec<(String, Agent)> = {
+                            let known = known.lock().unwrap();
+                            known.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
+                        };
+                        seen.clear();
+                        for (name, agent) in reseed {
+                            let workspace = agent.workspace.clone();
+                            seen.insert(name.clone());
+                            yield FleetChange::Discovered { id: AgentId::from(name), workspace, agent };
+                        }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-
-                tokio::time::sleep(poll_interval).await;
             }
-        });
-
-        ReceiverStream::new(rx).boxed()
+        };
+        Box::pin(stream)
     }
 
     async fn stop_agent(&self, id: &AgentId, drain: DrainPolicy) -> Result<()> {
@@ -792,6 +874,7 @@ impl CalibanTaskApi for MemTaskApi {
 mod tests {
     use super::*;
     use crate::fleet::SpawnRequest;
+    use futures::StreamExt as _;
 
     fn spec(repo: &str, prompt: &str, label: Option<&str>) -> TaskSpec {
         let mut request = SpawnRequest::new(prompt);
@@ -1238,5 +1321,48 @@ mod tests {
         assert!(r.store_writable);
         assert!(r.ready);
         assert_eq!(r.repos_healthy, 1);
+    }
+
+    // ---- #77 M2: single shared poll loop ----
+
+    #[tokio::test]
+    async fn watch_fleet_shared_loop_seeds_and_gones_once_per_subscriber() {
+        use std::time::Duration;
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), "a1"))
+            .await
+            .unwrap();
+        let (bus, store) = test_seams();
+        let fleet =
+            K8sFleet::new(api, bus, store).with_watch_poll_interval(Duration::from_millis(20));
+
+        // Two independent subscribers both seed the present agent as Discovered.
+        let mut w1 = fleet.watch_fleet();
+        let mut w2 = fleet.watch_fleet();
+        for w in [&mut w1, &mut w2] {
+            let ev = tokio::time::timeout(Duration::from_secs(1), w.next())
+                .await
+                .expect("seed Discovered timed out")
+                .expect("stream ended");
+            assert!(
+                matches!(ev, FleetChange::Discovered { ref id, .. } if id.as_str() == "a1"),
+                "each subscriber seeds the present agent: {ev:?}"
+            );
+        }
+
+        // Delete → the shared loop broadcasts Gone once; every live subscriber
+        // receives exactly one Gone for a1.
+        fleet.api.delete("a1").await.unwrap();
+        for w in [&mut w1, &mut w2] {
+            let ev = tokio::time::timeout(Duration::from_secs(1), w.next())
+                .await
+                .expect("Gone timed out")
+                .expect("stream ended");
+            assert!(
+                matches!(ev, FleetChange::Gone { ref id, .. } if id.as_str() == "a1"),
+                "each live subscriber sees Gone once: {ev:?}"
+            );
+        }
     }
 }
