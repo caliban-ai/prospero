@@ -33,3 +33,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = "0.13"
 async-trait = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
+kube = { version = "4.0.0", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
+schemars = "1.2.1"
+serde_yaml = "0.9.34"

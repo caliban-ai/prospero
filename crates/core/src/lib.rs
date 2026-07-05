@@ -14,6 +14,8 @@ pub mod error;
 pub mod event;
 pub mod fleet;
 pub mod fleet_provider;
+#[cfg(feature = "k8s")]
+pub mod k8s;
 pub mod leased_ownership;
 pub mod metrics;
 pub mod model;
