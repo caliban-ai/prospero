@@ -132,6 +132,10 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 /// Read a bearer token from a mounted-Secret file, trimming the trailing
 /// whitespace/newline that Secret files commonly carry. A missing or
 /// unreadable path is fatal — a silently-empty token would defeat auth.
+///
+/// Not feature-gated (its tests run in every build), but only *called* from the
+/// k8s arm — so a bin-only build without `k8s` sees it as dead. Allow that.
+#[cfg_attr(not(feature = "k8s"), allow(dead_code))]
 fn read_token_file(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading session-plane token file {}", path.display()))?;
