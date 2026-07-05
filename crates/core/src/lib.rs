@@ -44,11 +44,11 @@ pub use fleet_provider::{FleetProvider, LocalFleet};
 pub use k8s::fleet::{CalibanTaskApi, K8sFleet, KubeTaskApi};
 pub use leased_ownership::LeasedOwnership;
 pub use metrics::{Metrics, MetricsSnapshot};
-pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Repo, RepoHealth};
+pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Workspace, WorkspaceHealth};
 pub use ownership::{Lease, Ownership, SelfOwnsAll};
 pub use postgres_config_store::PostgresConfigStore;
 pub use postgres_store::PostgresStore;
-pub use registry::{RegisteredRepo, Registry, RepoProviderConfig};
+pub use registry::{RegisteredWorkspace, Registry, RepoProviderConfig};
 pub use sqlite_store::SqliteStore;
 pub use store::{JsonlStore, Store};
 

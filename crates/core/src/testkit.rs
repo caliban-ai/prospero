@@ -576,11 +576,11 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
 /// insert-or-update by name, list returns all repos (name-ordered), delete is
 /// idempotent. Backends call this to prove identical config semantics.
 pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigStore) {
-    use crate::registry::{RegisteredRepo, RepoProviderConfig};
+    use crate::registry::{RegisteredWorkspace, RepoProviderConfig};
 
     assert!(store.list_repos().await.unwrap().is_empty());
 
-    let r = RegisteredRepo {
+    let r = RegisteredWorkspace {
         name: "p".into(),
         root: "/r".into(),
         config: RepoProviderConfig {
@@ -609,7 +609,7 @@ pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigSto
     // `list_repos` is name-ordered: insert out of order, expect sorted output.
     for name in ["z", "a"] {
         store
-            .upsert_repo(&RegisteredRepo {
+            .upsert_repo(&RegisteredWorkspace {
                 name: name.into(),
                 root: format!("/{name}").into(),
                 config: RepoProviderConfig::default(),
@@ -686,12 +686,12 @@ pub async fn fleet_provider_conformance(
     // reached caliband.
     let h = provider
         .ensure_agent(TaskSpec {
-            repo: "repo-a".into(),
+            workspace: "repo-a".into(),
             request: SpawnRequest::new("task"),
         })
         .await
         .expect("ensure_agent");
-    assert_eq!(h.repo, "repo-a");
+    assert_eq!(h.workspace, "repo-a");
     assert!(backend.received_any_spec(), "provision reached backend");
 
     // 2. `watch_fleet` observes it. `ensure_agent` attaches the agent as part
@@ -740,7 +740,7 @@ pub async fn fleet_provider_conformance(
     // rather than exercise the "restart a live agent" contract.
     let h2 = provider
         .ensure_agent(TaskSpec {
-            repo: "repo-a".into(),
+            workspace: "repo-a".into(),
             request: SpawnRequest::new("task-2"),
         })
         .await

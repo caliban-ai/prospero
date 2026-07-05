@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AgentStatus, RepoHealth};
+use crate::model::{AgentStatus, WorkspaceHealth};
 
 /// Which textual stream a chunk of output came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,10 +84,12 @@ pub enum EventKind {
         /// Rendered append error, for diagnosis.
         detail: String,
     },
-    /// A repo's caliband health changed.
+    /// A workspace's caliband health changed. (Variant name kept as `RepoHealth`
+    /// for event-store wire compatibility; the payload type is the renamed
+    /// `WorkspaceHealth`, whose serialization is unchanged.)
     RepoHealth {
         /// The new health state.
-        state: RepoHealth,
+        state: WorkspaceHealth,
     },
 }
 

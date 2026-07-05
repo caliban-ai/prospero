@@ -1,7 +1,9 @@
-//! The persisted set of repos Prospero manages.
+//! The persisted set of workspaces Prospero manages.
 //!
 //! The fleet is intentional, not guessed: a blind socket scan can't map a
-//! `hash16` socket name back to a repo, so operators register repos by name.
+//! `hash16` socket name back to a workspace, so operators register workspaces by
+//! name. A workspace is a root directory holding 1..N source checkouts
+//! (caliban #281 / ADR 0052); its caliband is keyed on `hash16(root)`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,23 +34,27 @@ pub struct RepoProviderConfig {
     pub env: BTreeMap<String, String>,
 }
 
-/// A single managed repository.
+/// A single managed workspace's *persisted* identity: name + root + config.
+/// Sources are discovered from the filesystem at snapshot-build time (they are
+/// not persisted), so they live on the runtime [`crate::model::Workspace`] view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegisteredRepo {
+pub struct RegisteredWorkspace {
     /// Operator-chosen short name (registry key).
     pub name: String,
-    /// Canonical repo root path.
+    /// Canonical workspace root path (the caliband is keyed on `hash16(root)`).
     pub root: PathBuf,
-    /// Provider/environment config for this repo's caliband daemon.
+    /// Provider/environment config for this workspace's caliband daemon.
     #[serde(default)]
     pub config: RepoProviderConfig,
 }
 
-/// The persisted registry of managed repos.
+/// The persisted registry of managed workspaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registry {
-    /// Registered repos, keyed by unique `name`.
-    pub repos: Vec<RegisteredRepo>,
+    /// Registered workspaces, keyed by unique `name`. The `repos` alias lets a
+    /// legacy on-disk registry (`{"repos":[...]}`, pre-#72) load unchanged.
+    #[serde(alias = "repos")]
+    pub workspaces: Vec<RegisteredWorkspace>,
 }
 
 impl Registry {
@@ -72,12 +78,12 @@ impl Registry {
         Ok(())
     }
 
-    /// Look up a repo by name.
-    pub fn get(&self, name: &str) -> Option<&RegisteredRepo> {
-        self.repos.iter().find(|r| r.name == name)
+    /// Look up a workspace by name.
+    pub fn get(&self, name: &str) -> Option<&RegisteredWorkspace> {
+        self.workspaces.iter().find(|r| r.name == name)
     }
 
-    /// Register a repo. Errors if the name is already taken (idempotent only
+    /// Register a workspace. Errors if the name is already taken (idempotent only
     /// when the existing entry has the same root).
     pub fn add(&mut self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
         let name = name.into();
@@ -87,22 +93,22 @@ impl Registry {
                 return Ok(());
             }
             return Err(CoreError::Discovery(format!(
-                "repo name '{name}' already registered with a different root"
+                "workspace name '{name}' already registered with a different root"
             )));
         }
         // Reject a *different* name occupying the same root: two names for one
         // root alias a single caliband daemon, so both poll the same agents and
         // double-emit into the same event stream. Roots are canonicalized
-        // before they reach here (see `FleetManager::add_repo_with_config`), so
-        // this also catches symlink aliases like `/tmp` vs `/private/tmp`. (#47)
-        if let Some(other) = self.repos.iter().find(|r| r.root == root) {
+        // before they reach here (see `FleetManager::add_workspace_with_config`),
+        // so this also catches symlink aliases like `/tmp` vs `/private/tmp`. (#47)
+        if let Some(other) = self.workspaces.iter().find(|r| r.root == root) {
             return Err(CoreError::Discovery(format!(
-                "root {} is already registered as repo '{}'",
+                "root {} is already registered as workspace '{}'",
                 root.display(),
                 other.name
             )));
         }
-        self.repos.push(RegisteredRepo {
+        self.workspaces.push(RegisteredWorkspace {
             name,
             root,
             config: RepoProviderConfig::default(),
@@ -110,16 +116,16 @@ impl Registry {
         Ok(())
     }
 
-    /// Remove a repo by name. Returns whether an entry was removed.
+    /// Remove a workspace by name. Returns whether an entry was removed.
     pub fn remove(&mut self, name: &str) -> bool {
-        let before = self.repos.len();
-        self.repos.retain(|r| r.name != name);
-        self.repos.len() != before
+        let before = self.workspaces.len();
+        self.workspaces.retain(|r| r.name != name);
+        self.workspaces.len() != before
     }
 
-    /// Replace a repo's provider config. Returns whether the repo existed.
+    /// Replace a workspace's provider config. Returns whether it existed.
     pub fn set_config(&mut self, name: &str, config: RepoProviderConfig) -> bool {
-        if let Some(r) = self.repos.iter_mut().find(|r| r.name == name) {
+        if let Some(r) = self.workspaces.iter_mut().find(|r| r.name == name) {
             r.config = config;
             true
         } else {
@@ -150,7 +156,7 @@ mod tests {
         let mut reg = Registry::default();
         reg.add("p", "/r").unwrap();
         reg.add("p", "/r").unwrap();
-        assert_eq!(reg.repos.len(), 1);
+        assert_eq!(reg.workspaces.len(), 1);
     }
 
     #[test]
@@ -167,8 +173,20 @@ mod tests {
         let mut reg = Registry::default();
         reg.add("a", "/r").unwrap();
         let err = reg.add("b", "/r").unwrap_err().to_string();
-        assert!(err.contains("repo 'a'"), "names the holder: {err}");
-        assert_eq!(reg.repos.len(), 1, "the alias must not be registered");
+        assert!(err.contains("workspace 'a'"), "names the holder: {err}");
+        assert_eq!(reg.workspaces.len(), 1, "the alias must not be registered");
+    }
+
+    #[test]
+    fn legacy_repos_json_loads_via_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        // Old on-disk shape used the "repos" key; the alias loads it unchanged.
+        std::fs::write(&path, r#"{"repos":[{"name":"p","root":"/r"}]}"#).unwrap();
+        let reg = Registry::load(&path).unwrap();
+        let ws = reg.get("p").expect("legacy entry loads");
+        assert_eq!(ws.root, PathBuf::from("/r"));
+        assert_eq!(ws.config, RepoProviderConfig::default());
     }
 
     #[test]
@@ -176,7 +194,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.json");
         let reg = Registry::load(&path).unwrap();
-        assert!(reg.repos.is_empty());
+        assert!(reg.workspaces.is_empty());
     }
 
     #[test]

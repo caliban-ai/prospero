@@ -10,7 +10,7 @@ use std::time::Duration;
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig, control_socket_path};
 use prospero_core::event::EventKind;
 use prospero_core::fleet::{AttachBackoff, FleetConfig, FleetManager, SpawnRequest};
-use prospero_core::model::{AgentStatus, RepoHealth};
+use prospero_core::model::{AgentStatus, WorkspaceHealth};
 use prospero_core::store::JsonlStore;
 use prospero_core::testkit::{FakeCaliband, test_record};
 use prospero_core::{BusEvent, BusSubscription, CoreError, RepoProviderConfig};
@@ -367,8 +367,8 @@ async fn unreachable_repo_degrades_without_failing() {
 
     manager.poll_repo_once("repo").await;
     let snap = manager.snapshot().await;
-    let repo = snap.repos.iter().find(|r| r.name == "repo").unwrap();
-    assert!(matches!(repo.health, RepoHealth::Unreachable { .. }));
+    let repo = snap.workspaces.iter().find(|r| r.name == "repo").unwrap();
+    assert!(matches!(repo.health, WorkspaceHealth::Unreachable { .. }));
 }
 
 #[tokio::test]
@@ -430,14 +430,14 @@ async fn poll_refreshes_registry_from_shared_config_store() {
 
     // B loaded its registry at startup (before the add) so it can't see it yet.
     assert!(
-        b.snapshot().await.repos.iter().all(|r| r.name != "shared"),
+        b.snapshot().await.workspaces.iter().all(|r| r.name != "shared"),
         "B should not see the peer's repo before refreshing"
     );
 
     // A poll refreshes B's registry from the shared store, surfacing the repo.
     b.poll_all_once().await;
     assert!(
-        b.snapshot().await.repos.iter().any(|r| r.name == "shared"),
+        b.snapshot().await.workspaces.iter().any(|r| r.name == "shared"),
         "B must pick up the peer-registered repo after a poll, without a restart"
     );
 }
@@ -505,7 +505,7 @@ async fn add_repo_rejects_a_symlink_alias_of_an_existing_root() {
 
     let err = h.manager.add_repo("alias", &link).await.unwrap_err();
     assert!(
-        err.to_string().contains("repo 'real'"),
+        err.to_string().contains("workspace 'real'"),
         "the alias must be rejected naming the holder, got: {err}"
     );
 }
@@ -666,7 +666,7 @@ async fn non_owner_suppresses_agent_lifecycle_events() {
 #[tokio::test]
 async fn non_owner_suppresses_repo_health_events() {
     // A repo-blind replica polling an unreachable repo updates its own snapshot
-    // health but emits no RepoHealth event. (#59)
+    // health but emits no WorkspaceHealth event. (#59)
     use prospero_core::bus::InProcessBus;
     use prospero_core::config_store::SqliteConfigStore;
     use prospero_core::store::Store;
@@ -700,13 +700,13 @@ async fn non_owner_suppresses_repo_health_events() {
     mgr.poll_repo_once("repo").await;
 
     let snap = mgr.snapshot().await;
-    let repo = snap.repos.iter().find(|r| r.name == "repo").unwrap();
-    assert!(matches!(repo.health, RepoHealth::Unreachable { .. }));
+    let repo = snap.workspaces.iter().find(|r| r.name == "repo").unwrap();
+    assert!(matches!(repo.health, WorkspaceHealth::Unreachable { .. }));
     let events = store.replay("repo:repo", 0).await.unwrap();
     assert!(
         !events
             .iter()
             .any(|e| matches!(e.kind, EventKind::RepoHealth { .. })),
-        "non-owner must not emit RepoHealth"
+        "non-owner must not emit WorkspaceHealth"
     );
 }

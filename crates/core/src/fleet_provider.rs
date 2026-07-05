@@ -55,11 +55,11 @@ impl FleetProvider for LocalFleet {
         // needed to resolve it (and no new failure mode on the success path).
         let (id, endpoint) = self
             .inner
-            .spawn_agent_with_socket(&spec.repo, spec.request)
+            .spawn_agent_with_socket(&spec.workspace, spec.request)
             .await?;
         Ok(AgentHandle {
             id: AgentId::from(id),
-            repo: spec.repo,
+            workspace: spec.workspace,
             endpoint,
         })
     }
@@ -128,7 +128,7 @@ mod local_fleet_tests {
 
         let handle = provider
             .ensure_agent(TaskSpec {
-                repo: "repo-a".into(),
+                workspace: "repo-a".into(),
                 request: SpawnRequest::new("task"),
             })
             .await
@@ -156,12 +156,12 @@ mod local_fleet_tests {
 
         let handle = provider
             .ensure_agent(TaskSpec {
-                repo: "repo-a".into(),
+                workspace: "repo-a".into(),
                 request: SpawnRequest::new("task"),
             })
             .await
             .expect("ensure_agent");
-        assert_eq!(handle.repo, "repo-a");
+        assert_eq!(handle.workspace, "repo-a");
         assert!(!fake.received_specs().is_empty());
 
         // Populate the manager's snapshot so `stop_agent` (via `kill_agent` ->
@@ -190,7 +190,7 @@ mod local_fleet_tests {
 
         let handle = provider
             .ensure_agent(TaskSpec {
-                repo: "repo-a".into(),
+                workspace: "repo-a".into(),
                 request: SpawnRequest::new("task"),
             })
             .await
@@ -205,7 +205,7 @@ mod local_fleet_tests {
     }
 
     /// Task 3: `watch_fleet` seeds from the current snapshot (here, just
-    /// `repo-a`'s `RepoHealth`, since no agent exists yet) and then surfaces
+    /// `repo-a`'s `WorkspaceHealth`, since no agent exists yet) and then surfaces
     /// live `FleetChange`s translated from the poll-diff events `reconcile`
     /// emits — driven here by a `FakeCaliband` spawn + one `poll_repo_once`.
     #[tokio::test]
@@ -229,7 +229,7 @@ mod local_fleet_tests {
         .await;
         provider.manager().poll_repo_once("repo-a").await;
 
-        // The initial burst carries `repo-a`'s `RepoHealth` (seeded from
+        // The initial burst carries `repo-a`'s `WorkspaceHealth` (seeded from
         // `setup()`'s own `add_repo`-triggered poll) ahead of the post-seed
         // `Discovered` diff; drain up to a few items for it, bounded so a
         // regression fails fast instead of hanging.
@@ -246,7 +246,7 @@ mod local_fleet_tests {
         }
         let ev = discovered.expect("did not observe a Discovered change in time");
         assert!(
-            matches!(ev, FleetChange::Discovered { ref id, ref repo, .. }
+            matches!(ev, FleetChange::Discovered { ref id, workspace: ref repo, .. }
             if id.as_str() == "a1" && repo == "repo-a")
         );
     }
@@ -317,12 +317,12 @@ mod local_fleet_tests {
         // ensure_agent issues Spawn over TCP+TLS+token.
         let handle = provider
             .ensure_agent(TaskSpec {
-                repo: "repo-a".into(),
+                workspace: "repo-a".into(),
                 request: SpawnRequest::new("task"),
             })
             .await
             .expect("ensure_agent over tcp+tls");
-        assert_eq!(handle.repo, "repo-a");
+        assert_eq!(handle.workspace, "repo-a");
         assert!(!fake.received_specs().is_empty(), "spawn reached the fake");
 
         // observe: a poll (List over TCP) surfaces the agent in the snapshot.
