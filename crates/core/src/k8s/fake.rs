@@ -7,11 +7,11 @@
 //!
 //! ## Why reads are instant but writes aren't
 //!
-//! `K8sFleet::watch_fleet()` spawns a *new* poll-diff task per subscription,
-//! starting from an empty "known" map (Task B3) — so a late subscriber only
-//! learns an agent ever existed if its background task's first `list()` call
-//! happens to observe it before some other caller deletes it. The
-//! conformance suite's `stop_agent` step subscribes and then, with no
+//! `K8sFleet` runs a *single shared* poll-diff loop that maintains a canonical
+//! `known` map (prospero #77 M2); each `watch_fleet()` subscriber seeds from
+//! that shared state then tails a broadcast, so every subscriber sees the same
+//! diff stream and `Gone` exactly once. The conformance suite's `stop_agent`
+//! step subscribes and then, with no
 //! synchronizing wait in between, immediately deletes — so this fake's
 //! *scheduling* behavior, not just its data, has to make that first `list()`
 //! win the race deterministically instead of by luck.
@@ -151,11 +151,10 @@ mod tests {
     /// (`fleet_provider.rs::local_fleet_satisfies_conformance`), driven here
     /// against `FakeK8s` instead of a real cluster.
     ///
-    /// `K8sFleet::watch_fleet` (Task B3) spawns its own poll-diff loop per
-    /// subscription, reading straight off the shared `CalibanTaskApi::list()`
-    /// seam — unlike `LocalFleet`, which needs a *separate* background
-    /// `FleetManager::run` task started before the suite runs, there's no
-    /// extra reconciliation loop to wire up here: every `watch_fleet()` call
+    /// `K8sFleet` runs one shared poll-diff loop off the `CalibanTaskApi::list()`
+    /// seam (prospero #77 M2) — unlike `LocalFleet`, which needs a *separate*
+    /// background `FleetManager::run` task started before the suite runs, there's
+    /// no extra reconciliation loop to wire up here: every `watch_fleet()` call
     /// the suite makes (including its repeated re-subscriptions in
     /// `wait_for_discovered`) starts its own loop against the live store.
     #[tokio::test]

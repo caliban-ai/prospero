@@ -46,6 +46,11 @@ pub struct FakeCaliband {
     /// Owns the temp dir backing a TCP fake's per-agent sockets, if any, so it
     /// outlives the fake. `None` for the Unix path (caller owns the dir).
     _tempdir: Option<tempfile::TempDir>,
+    /// `(cert_pem, key_pem)` of a TCP+TLS fake's self-signed cert, so
+    /// `add_agent_tcp` can serve per-agent streams over TLS with the *same*
+    /// cert the client already trusts (`CalibandTlsFixture::ca_pem`). `None`
+    /// for the Unix path. (#77 I1)
+    tls_material: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Self-signed localhost TLS material + address a matching
@@ -87,6 +92,7 @@ impl FakeCaliband {
             state,
             tasks: vec![accept_task],
             _tempdir: None,
+            tls_material: None,
         })
     }
 
@@ -101,6 +107,7 @@ impl FakeCaliband {
             .map_err(std::io::Error::other)?;
         let cert_pem = cert.cert.pem().into_bytes();
         let key_pem = cert.key_pair.serialize_pem().into_bytes();
+        let tls_material = Some((cert_pem.clone(), key_pem.clone()));
 
         let tempdir = tempfile::tempdir()?;
         let dir = tempdir.path().to_path_buf();
@@ -128,12 +135,36 @@ impl FakeCaliband {
                 state,
                 tasks: vec![accept_task],
                 _tempdir: Some(tempdir),
+                tls_material,
             },
             CalibandTlsFixture {
                 addr,
                 ca_pem: cert_pem,
             },
         ))
+    }
+
+    /// Register a per-agent stream served over **TCP + TLS** (the leg #77 I1
+    /// proves is network-routable), reusing this TCP fake's own cert so the
+    /// client's `CalibandTlsFixture::ca_pem` trust already covers it. The
+    /// agent's `AttachAck`/`Spawned` reply then advertises an `Endpoint::Tcp`,
+    /// so a client that `attach`es over the network gets a **TCP** stream
+    /// endpoint (not a same-process Unix path). Requires a `start_tcp_tls` fake.
+    /// (#77 I1)
+    pub async fn add_agent_tcp(&mut self, id: &str, script: Vec<serde_json::Value>) {
+        let (cert_pem, key_pem) = self
+            .tls_material
+            .clone()
+            .expect("add_agent_tcp requires a TCP+TLS fake (start_tcp_tls)");
+        let (addr, task) = spawn_tcp_stream_listener(script, &cert_pem, &key_pem).await;
+        let mut record = test_record(id, Path::new("/tmp"), AgentStatus::Running, false);
+        record.endpoint = Endpoint::Tcp { addr };
+        self.state
+            .lock()
+            .unwrap()
+            .agents
+            .insert(id.to_string(), record);
+        self.tasks.push(task);
     }
 
     /// The control socket path the fake is listening on.
@@ -459,6 +490,72 @@ async fn spawn_stream_listener(
     })
 }
 
+/// Bind a per-agent stream socket over **TCP + TLS** that, on each connection,
+/// writes the scripted frames as NDJSON then closes. Returns the bound
+/// `host:port`. The TLS cert must be the one the dialing client trusts. (#77 I1)
+async fn spawn_tcp_stream_listener(
+    script: Vec<serde_json::Value>,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> (String, JoinHandle<()>) {
+    use crate::caliband::transport::{Listener, tls_server_from_pem};
+    use tokio::io::AsyncWriteExt as _;
+    let listener = Listener::bind(&crate::caliband::transport::BindSpec {
+        endpoint: Endpoint::Tcp {
+            addr: "127.0.0.1:0".into(),
+        },
+        tls: Some(tls_server_from_pem(cert_pem, key_pem).expect("server tls")),
+        // No token check on the stream leg; the client may still send one (its
+        // control token). The accept loop below drains those inbound bytes
+        // concurrently so they don't linger unread in the receive buffer — an
+        // unread buffer would make a Linux `close()` emit a RST that truncates
+        // the frames we're writing (see the accept loop's drain comment).
+        token: None,
+    })
+    .await
+    .expect("bind per-agent tcp stream listener");
+    let addr = listener.local_addr().expect("tcp stream addr");
+    let task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        while let Ok(conn) = listener.accept().await {
+            // Split so we can DRAIN the client's inbound bytes concurrently
+            // with writing frames. The client's `open_stream` sends a bearer
+            // preamble (`client_send_token`) that this listener declares no
+            // token for and so never reads. If those bytes sat unread in the
+            // socket's receive buffer when we close, Linux answers `close()`
+            // with a TCP **RST** instead of a FIN, which discards the frames
+            // still in flight to the client — truncating the stream and
+            // hanging the reader (macOS closes gracefully, hiding this). A
+            // concurrent drain keeps the receive buffer empty so the close is
+            // a clean FIN on every platform.
+            let (mut rd, mut wr) = tokio::io::split(conn);
+            let drain = tokio::spawn(async move {
+                let mut scratch = [0u8; 256];
+                while let Ok(n) = rd.read(&mut scratch).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                rd // hold the read half open until writing is done
+            });
+            for frame in &script {
+                let mut line = serde_json::to_vec(frame).unwrap();
+                line.push(b'\n');
+                if wr.write_all(&line).await.is_err() {
+                    break;
+                }
+            }
+            let _ = wr.flush().await;
+            // Clean half-close: FIN/close_notify so the client reads a proper
+            // end-of-stream, then release the drain so the connection drops
+            // with nothing unread.
+            let _ = wr.shutdown().await;
+            drain.abort();
+        }
+    });
+    (addr, task)
+}
+
 /// Bind a per-agent stream socket that serves a distinct script per connection
 /// (connection `i` gets `scripts[i]`, with the last script repeating). Each
 /// connection writes its frames then closes, so a short script simulates a
@@ -747,16 +844,19 @@ pub async fn fleet_provider_conformance(
         .expect("ensure_agent (2nd agent, for restart)");
     wait_for_discovered(provider, &h2.id).await;
 
-    // `FakeCaliband`'s `Respawn` handler (this file, `handle_control_conn`)
-    // removes the old agent record but does not register a new one for the
-    // id it returns (no `AgentRecord`, no stream listener) — a known fake
-    // limitation, not a provider one. So this only asserts what's actually
-    // observable through the trait: the call succeeds and hands back an id
-    // distinct from the one it replaced. It deliberately does NOT assert the
-    // new id later shows up in a `watch_fleet` listing, since the fake never
-    // makes that true.
+    // The trait contract is that `restart_agent` succeeds and returns *an* id
+    // for the restarted agent — "the (possibly new) id". Backends differ on
+    // whether it changes: `LocalFleet`/`FakeCaliband`'s `Respawn` assigns a
+    // fresh caliban id, while `K8sFleet` keeps the spec-deterministic CR name
+    // as a stable identity (prospero #77 M1). So the conformance bar is a
+    // non-empty id, not a *different* one. (It deliberately does NOT assert the
+    // id later shows up in a `watch_fleet` listing — the fake never makes that
+    // true for the returned id.)
     let new_id = provider.restart_agent(&h2.id).await.expect("restart_agent");
-    assert_ne!(new_id, h2.id, "restart_agent must yield a fresh id");
+    assert!(
+        !new_id.as_str().is_empty(),
+        "restart_agent must return an id for the restarted agent"
+    );
 }
 
 /// Build a minimal `AgentRecord` for tests.
