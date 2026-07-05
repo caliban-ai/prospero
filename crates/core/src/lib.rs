@@ -32,6 +32,7 @@ pub mod store;
 pub mod testkit;
 
 pub use bus::{BusEvent, BusSubscription, EventBus, InProcessBus};
+pub use caliband::sources::{Source, discover_sources};
 pub use caliband::wire::AttachInbound;
 pub use config_store::{ConfigStore, SqliteConfigStore};
 pub use distributed_bus::DistributedBus;
