@@ -4,7 +4,7 @@
 //! Mirrors caliban's socket-path rule:
 //! `${CALIBAN_DAEMON_RUNTIME_DIR:-$XDG_RUNTIME_DIR/caliban}/<hash16>.sock`,
 //! falling back to `${TMPDIR}/caliban-daemon/<hash16>.sock`, where `hash16` is
-//! the first 16 hex chars of `SHA-256(canonical_repo_root)`.
+//! the first 16 hex chars of `SHA-256(canonical_workspace_root)`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -62,33 +62,36 @@ impl DiscoveryEnv {
 }
 
 /// Compute the control socket path for a (already canonical) repo root.
-pub fn control_socket_path(repo_root_canonical: &Path, env: &DiscoveryEnv) -> PathBuf {
+pub fn control_socket_path(workspace_root_canonical: &Path, env: &DiscoveryEnv) -> PathBuf {
     env.socket_base_dir()
-        .join(format!("{}.sock", hash16(repo_root_canonical)))
+        .join(format!("{}.sock", hash16(workspace_root_canonical)))
 }
 
 /// Canonicalize a repo root, mapping the IO error to a discovery error.
 ///
-/// caliband derives its control-socket name by hashing the raw `--repo-root`
+/// caliband derives its control-socket name by hashing the raw `--workspace-root`
 /// argument it is given, so prospero must hand caliband the *same* canonical
 /// form it hashes for socket lookup — otherwise a symlinked path (e.g. macOS
 /// `/tmp` → `/private/tmp`) yields two different socket names and discovery
 /// waits forever. (#45)
-pub fn canonical_root(repo_root: &Path) -> Result<PathBuf> {
-    repo_root.canonicalize().map_err(|e| {
-        CoreError::Discovery(format!("cannot canonicalize {}: {e}", repo_root.display()))
+pub fn canonical_root(workspace_root: &Path) -> Result<PathBuf> {
+    workspace_root.canonicalize().map_err(|e| {
+        CoreError::Discovery(format!(
+            "cannot canonicalize {}: {e}",
+            workspace_root.display()
+        ))
     })
 }
 
 /// Canonicalize a repo root and compute its control socket path.
-pub fn resolve_socket(repo_root: &Path, env: &DiscoveryEnv) -> Result<PathBuf> {
-    Ok(control_socket_path(&canonical_root(repo_root)?, env))
+pub fn resolve_socket(workspace_root: &Path, env: &DiscoveryEnv) -> Result<PathBuf> {
+    Ok(control_socket_path(&canonical_root(workspace_root)?, env))
 }
 
 /// Configuration for [`ensure_caliband`].
 #[derive(Debug, Clone)]
 pub struct EnsureConfig {
-    /// Spawn `caliband --repo-root <root>` if no daemon is reachable.
+    /// Spawn `caliband --workspace-root <root>` if no daemon is reachable.
     pub autostart: bool,
     /// The caliban daemon binary name/path.
     pub caliband_bin: String,
@@ -109,18 +112,18 @@ impl Default for EnsureConfig {
     }
 }
 
-/// Ensure a caliband daemon is reachable for `repo_root`, returning a client
+/// Ensure a caliband daemon is reachable for `workspace_root`, returning a client
 /// bound to its control socket. If none is reachable and `autostart` is set,
 /// spawns the daemon and waits for the socket.
 pub async fn ensure_caliband(
-    repo_root: &Path,
+    workspace_root: &Path,
     env: &DiscoveryEnv,
     cfg: &EnsureConfig,
 ) -> Result<CalibandClient> {
-    // Canonicalize ONCE: the socket we wait on and the `--repo-root` we hand
+    // Canonicalize ONCE: the socket we wait on and the `--workspace-root` we hand
     // caliband must derive from the same path, or their socket names diverge on
     // symlinked roots and we wait forever. (#45)
-    let canonical = canonical_root(repo_root)?;
+    let canonical = canonical_root(workspace_root)?;
     let socket = control_socket_path(&canonical, env);
 
     if UnixStream::connect(&socket).await.is_ok() {
@@ -135,7 +138,7 @@ pub async fn ensure_caliband(
     }
 
     tokio::process::Command::new(&cfg.caliband_bin)
-        .arg("--repo-root")
+        .arg("--workspace-root")
         .arg(&canonical)
         .envs(&cfg.env)
         .spawn()
@@ -251,7 +254,7 @@ mod tests {
     async fn ensure_caliband_spawns_caliband_with_the_canonical_root() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         // prospero waits on the socket derived from the CANONICAL root, but
-        // caliband hashes the raw `--repo-root` it is handed. If we spawn it
+        // caliband hashes the raw `--workspace-root` it is handed. If we spawn it
         // with a symlinked path, the two socket names diverge and discovery
         // hangs. This pins the spawn arg to the canonical form. (#45)
         let real = tempfile::tempdir().unwrap();
@@ -261,7 +264,7 @@ mod tests {
         symlink(&real_canon, &link).unwrap();
         assert_ne!(link, real_canon);
 
-        // A stand-in caliband that records the `--repo-root` it received, then
+        // A stand-in caliband that records the `--workspace-root` it received, then
         // exits without ever creating a socket.
         let recorded = scratch.path().join("recorded-root");
         let script = scratch.path().join("fake-caliband.sh");

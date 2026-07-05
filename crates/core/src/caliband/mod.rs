@@ -2,6 +2,7 @@
 //! the stream-json normalizer. The wire format is the only coupling to caliban.
 
 pub mod client;
+pub mod sources;
 pub mod stream;
 pub mod transport;
 pub mod wire;

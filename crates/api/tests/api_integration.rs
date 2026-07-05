@@ -203,7 +203,7 @@ async fn get_fleet_returns_registered_repo() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     assert_eq!(v["host"], "test-host");
-    assert_eq!(v["repos"][0]["name"], "repo");
+    assert_eq!(v["workspaces"][0]["name"], "repo");
 }
 
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn spawn_defaults_to_worktree_and_returns_isolated_true() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/repos/repo/agents")
+                .uri("/api/workspaces/repo/agents")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"prompt":"do it"}"#))
                 .unwrap(),
@@ -225,7 +225,7 @@ async fn spawn_defaults_to_worktree_and_returns_isolated_true() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let v = json_body(resp).await;
     assert_eq!(v["isolated"], true);
-    assert_eq!(v["repo"], "repo");
+    assert_eq!(v["workspace"], "repo");
     // And caliban actually received a worktree-isolated spec.
     assert!(h.fake.received_specs()[0].isolation_worktree);
 }
@@ -250,7 +250,7 @@ async fn spawn_with_unset_provider_key_returns_400() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/repos/repo/agents")
+                .uri("/api/workspaces/repo/agents")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"prompt":"doomed"}"#))
                 .unwrap(),
@@ -278,7 +278,7 @@ async fn spawn_shared_opt_out_returns_isolated_false() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/repos/repo/agents")
+                .uri("/api/workspaces/repo/agents")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"prompt":"x","isolation":"shared"}"#))
                 .unwrap(),
@@ -428,13 +428,13 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
     let manager = FleetManager::new(config, store).await.unwrap();
     let app = router(manager.clone(), LocalFleet::new(manager));
 
-    // POST /api/repos with a config object.
+    // POST /api/workspaces with a config object.
     let post_resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/repos")
+                .uri("/api/workspaces")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"name":"p","root":"/tmp/p","config":{"provider":"ollama","base_url":"http://h:11434"}}"#,
@@ -445,12 +445,12 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
         .unwrap();
     assert_eq!(post_resp.status(), StatusCode::CREATED);
 
-    // GET /api/repos should include the config fields.
+    // GET /api/workspaces should include the config fields.
     let get_resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/repos")
+                .uri("/api/workspaces")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -479,7 +479,7 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
         .unwrap();
     assert_eq!(fleet_resp.status(), StatusCode::OK);
     let fleet = json_body(fleet_resp).await;
-    let fp = fleet["repos"]
+    let fp = fleet["workspaces"]
         .as_array()
         .unwrap()
         .iter()
@@ -501,7 +501,7 @@ async fn put_config_updates_and_returns_204() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/repos/repo/config")
+                .uri("/api/workspaces/repo/config")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"provider":"ollama","base_url":"http://h:11434"}"#,
@@ -517,7 +517,7 @@ async fn put_config_updates_and_returns_204() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/repos")
+                .uri("/api/workspaces")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -543,7 +543,7 @@ async fn put_config_unknown_repo_returns_404() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/repos/nope/config")
+                .uri("/api/workspaces/nope/config")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"provider":"ollama"}"#))
                 .unwrap(),

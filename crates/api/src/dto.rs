@@ -4,23 +4,23 @@ use prospero_core::fleet::SpawnRequest;
 use prospero_core::registry::RepoProviderConfig;
 use serde::{Deserialize, Serialize};
 
-/// Body for `POST /api/repos`.
+/// Body for `POST /api/workspaces`.
 #[derive(Debug, Deserialize)]
-pub struct AddRepoBody {
+pub struct AddWorkspaceBody {
     /// Operator-chosen short name.
     pub name: String,
-    /// Repo root path.
+    /// Workspace root path.
     pub root: String,
     /// Optional initial provider config.
     #[serde(default)]
     pub config: RepoProviderConfig,
 }
 
-/// Body for `PUT /api/repos/{name}/config`.
+/// Body for `PUT /api/workspaces/{name}/config`.
 #[derive(Debug, Deserialize)]
 pub struct SetConfigBody(pub RepoProviderConfig);
 
-/// Body for `POST /api/repos/{repo}/agents`.
+/// Body for `POST /api/workspaces/{repo}/agents`.
 #[derive(Debug, Deserialize)]
 pub struct SpawnBody {
     /// Initial prompt / task.
@@ -63,8 +63,8 @@ impl SpawnBody {
 pub struct SpawnedResponse {
     /// New agent id.
     pub agent_id: String,
-    /// Owning repo.
-    pub repo: String,
+    /// Owning workspace.
+    pub workspace: String,
     /// Whether the agent runs in an isolated worktree.
     pub isolated: bool,
 }
@@ -91,18 +91,20 @@ pub struct RespawnedResponse {
     pub agent_id: String,
 }
 
-/// A repo summary (no agents) for `GET /api/repos`.
+/// A workspace summary (no agents) for `GET /api/workspaces`.
 #[derive(Debug, Serialize)]
-pub struct RepoSummary {
+pub struct WorkspaceSummary {
     /// Registry name.
     pub name: String,
-    /// Repo root.
+    /// Workspace root.
     pub root: String,
+    /// The source checkouts under the workspace root (1..N).
+    pub sources: Vec<prospero_core::Source>,
     /// Caliband health.
-    pub health: prospero_core::RepoHealth,
+    pub health: prospero_core::WorkspaceHealth,
     /// Number of known agents.
     pub agent_count: usize,
-    /// Provider/environment config for this repo.
+    /// Provider/environment config for this workspace.
     pub config: RepoProviderConfig,
 }
 
@@ -116,5 +118,22 @@ mod tests {
         assert!(with.into_request().interactive);
         let without: SpawnBody = serde_json::from_str(r#"{"prompt":"p"}"#).unwrap();
         assert!(!without.into_request().interactive);
+    }
+
+    #[test]
+    fn workspace_summary_exposes_sources() {
+        let s = WorkspaceSummary {
+            name: "ws".into(),
+            root: "/ws".into(),
+            sources: vec![prospero_core::Source {
+                name: "a".into(),
+                path: "/ws/a".into(),
+            }],
+            health: prospero_core::WorkspaceHealth::Healthy,
+            agent_count: 0,
+            config: RepoProviderConfig::default(),
+        };
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["sources"][0]["name"], "a");
     }
 }

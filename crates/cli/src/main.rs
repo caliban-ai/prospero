@@ -23,12 +23,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Manage the set of repos Prospero supervises.
+    /// Manage the set of workspaces Prospero supervises.
     #[command(subcommand)]
-    Repo(RepoCmd),
-    /// Launch a new agent under a repo (worktree-isolated by default).
+    Workspace(WorkspaceCmd),
+    /// Launch a new agent under a workspace (worktree-isolated by default).
     Spawn(SpawnArgs),
-    /// List the fleet (all repos and their agents).
+    /// List the fleet (all workspaces and their agents).
     Ls,
     /// Show daemon + fleet status.
     Status,
@@ -47,28 +47,28 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-enum RepoCmd {
-    /// Register a repo by name and root path.
+enum WorkspaceCmd {
+    /// Register a workspace by name and root path.
     Add {
         /// Short name (registry key).
         name: String,
-        /// Repo root path.
+        /// Workspace root path.
         root: String,
     },
-    /// List managed repos.
+    /// List managed workspaces.
     List,
-    /// Set a repo's provider config and restart its caliband.
-    Config(RepoConfigArgs),
-    /// Unregister a repo.
+    /// Set a workspace's provider config and restart its caliband.
+    Config(WorkspaceConfigArgs),
+    /// Unregister a workspace.
     Rm {
-        /// Repo name.
+        /// Workspace name.
         name: String,
     },
 }
 
 #[derive(Debug, Args)]
-struct RepoConfigArgs {
-    /// Repo name (registry key).
+struct WorkspaceConfigArgs {
+    /// Workspace name (registry key).
     name: String,
     /// Provider id (e.g. anthropic, openai, google, ollama). Omit to clear.
     #[arg(long)]
@@ -95,8 +95,8 @@ fn parse_key_val(s: &str) -> std::result::Result<(String, String), String> {
 
 #[derive(Debug, Args)]
 struct SpawnArgs {
-    /// Repo to spawn the agent under.
-    repo: String,
+    /// Workspace to spawn the agent under.
+    workspace: String,
     /// The prompt / task for the agent.
     prompt: String,
     /// Optional human-readable label.
@@ -144,16 +144,16 @@ fn main() -> Result<()> {
     let client = DaemonClient::new(&cli.addr);
 
     match cli.command {
-        Command::Repo(RepoCmd::Add { name, root }) => {
+        Command::Workspace(WorkspaceCmd::Add { name, root }) => {
             let body = serde_json::json!({ "name": name, "root": root });
-            client.post_json("/api/repos", body)?;
-            println!("registered repo '{name}' at {root}");
+            client.post_json("/api/workspaces", body)?;
+            println!("registered workspace '{name}' at {root}");
         }
-        Command::Repo(RepoCmd::List) => {
-            let repos = client.get_json("/api/repos")?;
-            print_repos(&repos);
+        Command::Workspace(WorkspaceCmd::List) => {
+            let repos = client.get_json("/api/workspaces")?;
+            print_workspaces(&repos);
         }
-        Command::Repo(RepoCmd::Config(a)) => {
+        Command::Workspace(WorkspaceCmd::Config(a)) => {
             let mut config = serde_json::Map::new();
             if let Some(provider) = &a.provider {
                 config.insert("provider".into(), provider.clone().into());
@@ -173,14 +173,14 @@ fn main() -> Result<()> {
                 config.insert("env".into(), serde_json::Value::Object(env));
             }
             client.put_json(
-                &format!("/api/repos/{}/config", a.name),
+                &format!("/api/workspaces/{}/config", a.name),
                 serde_json::Value::Object(config),
             )?;
-            println!("updated provider config for repo '{}'", a.name);
+            println!("updated provider config for workspace '{}'", a.name);
         }
-        Command::Repo(RepoCmd::Rm { name }) => {
-            client.delete(&format!("/api/repos/{name}"))?;
-            println!("unregistered repo '{name}'");
+        Command::Workspace(WorkspaceCmd::Rm { name }) => {
+            client.delete(&format!("/api/workspaces/{name}"))?;
+            println!("unregistered workspace '{name}'");
         }
         Command::Spawn(a) => {
             let mut body = serde_json::json!({ "prompt": a.prompt });
@@ -197,15 +197,16 @@ fn main() -> Result<()> {
             if !a.tool_allowlist.is_empty() {
                 body["tool_allowlist"] = a.tool_allowlist.into();
             }
-            let resp = client.post_json(&format!("/api/repos/{}/agents", a.repo), body)?;
+            let resp =
+                client.post_json(&format!("/api/workspaces/{}/agents", a.workspace), body)?;
             let id = resp.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
             let isolated = resp
                 .get("isolated")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             println!(
-                "spawned agent {id} in repo '{}' ({})",
-                a.repo,
+                "spawned agent {id} in workspace '{}' ({})",
+                a.workspace,
                 if isolated { "worktree" } else { "shared tree" }
             );
         }
@@ -267,12 +268,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_repos(repos: &serde_json::Value) {
-    let Some(arr) = repos.as_array() else {
+fn print_workspaces(workspaces: &serde_json::Value) {
+    let Some(arr) = workspaces.as_array() else {
         return;
     };
     if arr.is_empty() {
-        println!("(no repos registered)");
+        println!("(no workspaces registered)");
         return;
     }
     for r in arr {
@@ -285,17 +286,24 @@ fn print_repos(repos: &serde_json::Value) {
             .map(|p| format!("  {p}"))
             .unwrap_or_default();
         println!("{name:<16} {health:<12} {count} agents   {root}{provider}");
+        let sources: Vec<&str> = r["sources"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s["name"].as_str()).collect())
+            .unwrap_or_default();
+        if !sources.is_empty() {
+            println!("{:<16} sources: {}", "", sources.join(", "));
+        }
     }
 }
 
 fn print_fleet(fleet: &serde_json::Value) {
     let host = fleet["host"].as_str().unwrap_or("?");
     println!("host: {host}");
-    let Some(repos) = fleet["repos"].as_array() else {
+    let Some(repos) = fleet["workspaces"].as_array() else {
         return;
     };
     if repos.is_empty() {
-        println!("(no repos registered)");
+        println!("(no workspaces registered)");
         return;
     }
     for repo in repos {
@@ -381,7 +389,7 @@ mod tests {
         let cli = Cli::parse_from(["prospero", "spawn", "myrepo", "do the thing"]);
         match cli.command {
             Command::Spawn(a) => {
-                assert_eq!(a.repo, "myrepo");
+                assert_eq!(a.workspace, "myrepo");
                 assert_eq!(a.prompt, "do the thing");
                 assert!(
                     !a.shared_tree,
@@ -396,7 +404,7 @@ mod tests {
     fn repo_config_parses_all_flags() {
         let cli = Cli::parse_from([
             "prospero",
-            "repo",
+            "workspace",
             "config",
             "myrepo",
             "--provider",
@@ -409,7 +417,7 @@ mod tests {
             "FOO=bar",
         ]);
         match cli.command {
-            Command::Repo(RepoCmd::Config(a)) => {
+            Command::Workspace(WorkspaceCmd::Config(a)) => {
                 assert_eq!(a.name, "myrepo");
                 assert_eq!(a.provider.as_deref(), Some("ollama"));
                 assert_eq!(a.base_url.as_deref(), Some("http://h:11434"));
@@ -422,7 +430,8 @@ mod tests {
 
     #[test]
     fn repo_config_rejects_bad_env_pair() {
-        let res = Cli::try_parse_from(["prospero", "repo", "config", "r", "--env", "noequals"]);
+        let res =
+            Cli::try_parse_from(["prospero", "workspace", "config", "r", "--env", "noequals"]);
         assert!(res.is_err(), "KEY=VALUE without '=' must be rejected");
     }
 
@@ -476,9 +485,9 @@ mod tests {
 
     #[test]
     fn repo_add_parses_name_and_root() {
-        let cli = Cli::parse_from(["prospero", "repo", "add", "p", "/dev/p"]);
+        let cli = Cli::parse_from(["prospero", "workspace", "add", "p", "/dev/p"]);
         match cli.command {
-            Command::Repo(RepoCmd::Add { name, root }) => {
+            Command::Workspace(WorkspaceCmd::Add { name, root }) => {
                 assert_eq!(name, "p");
                 assert_eq!(root, "/dev/p");
             }

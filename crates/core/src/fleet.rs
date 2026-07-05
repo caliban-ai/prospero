@@ -24,7 +24,9 @@ use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::model::{Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, Repo, RepoHealth};
+use crate::model::{
+    Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, Workspace, WorkspaceHealth,
+};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
 use crate::store::Store;
@@ -419,7 +421,7 @@ impl FleetManager {
         ownership: Arc<dyn Ownership>,
     ) -> Result<Self> {
         let registry = Registry {
-            repos: config_store.list_repos().await?,
+            workspaces: config_store.list_repos().await?,
         };
         let emitter = Emitter {
             store,
@@ -429,13 +431,14 @@ impl FleetManager {
         };
         let snapshot = FleetSnapshot {
             host: config.host.clone(),
-            repos: registry
-                .repos
+            workspaces: registry
+                .workspaces
                 .iter()
-                .map(|r| Repo {
+                .map(|r| Workspace {
                     name: r.name.clone(),
                     root: r.root.clone(),
-                    health: RepoHealth::Healthy,
+                    sources: crate::caliband::sources::discover_sources(&r.root),
+                    health: WorkspaceHealth::Healthy,
                     config: r.config.clone(),
                     agents: Vec::new(),
                 })
@@ -486,7 +489,7 @@ impl FleetManager {
     pub async fn snapshot(&self) -> FleetSnapshot {
         let mut snap = self.inner.snapshot.read().await.clone();
         let reg = self.inner.registry.read().await;
-        for repo in &mut snap.repos {
+        for repo in &mut snap.workspaces {
             if let Some(r) = reg.get(&repo.name) {
                 repo.config = r.config.clone();
             }
@@ -507,11 +510,11 @@ impl FleetManager {
     pub async fn readiness(&self) -> crate::model::Readiness {
         let store_writable = self.inner.emitter.store.writable().await;
         let snap = self.inner.snapshot.read().await;
-        let repos_total = snap.repos.len();
+        let repos_total = snap.workspaces.len();
         let repos_healthy = snap
-            .repos
+            .workspaces
             .iter()
-            .filter(|r| matches!(r.health, RepoHealth::Healthy))
+            .filter(|r| matches!(r.health, WorkspaceHealth::Healthy))
             .count();
         crate::model::Readiness {
             ready: store_writable,
@@ -538,14 +541,33 @@ impl FleetManager {
         self.inner.emitter.store.prune(&before).await
     }
 
-    /// Register a repo and persist the registry. Triggers an immediate poll.
-    pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
-        self.add_repo_with_config(name, root, Default::default())
+    /// Register a workspace and persist the registry. Triggers an immediate poll.
+    pub async fn add_workspace(
+        &self,
+        name: impl Into<String>,
+        root: impl Into<PathBuf>,
+    ) -> Result<()> {
+        self.add_workspace_with_config(name, root, Default::default())
             .await
     }
 
-    /// Register a repo with an initial provider config.
+    /// Back-compat alias for [`Self::add_workspace`]: a single-repo workspace.
+    pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
+        self.add_workspace(name, root).await
+    }
+
+    /// Back-compat alias for [`Self::add_workspace_with_config`].
     pub async fn add_repo_with_config(
+        &self,
+        name: impl Into<String>,
+        root: impl Into<PathBuf>,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        self.add_workspace_with_config(name, root, config).await
+    }
+
+    /// Register a workspace with an initial provider config.
+    pub async fn add_workspace_with_config(
         &self,
         name: impl Into<String>,
         root: impl Into<PathBuf>,
@@ -570,11 +592,12 @@ impl FleetManager {
         self.inner.config_store.upsert_repo(&repo).await?;
         {
             let mut snap = self.inner.snapshot.write().await;
-            if !snap.repos.iter().any(|r| r.name == name) {
-                snap.repos.push(Repo {
+            if !snap.workspaces.iter().any(|r| r.name == name) {
+                snap.workspaces.push(Workspace {
                     name: name.clone(),
                     root: root.clone(),
-                    health: RepoHealth::Healthy,
+                    sources: crate::caliband::sources::discover_sources(&root),
+                    health: WorkspaceHealth::Healthy,
                     config: repo.config.clone(),
                     agents: Vec::new(),
                 });
@@ -607,7 +630,7 @@ impl FleetManager {
                 .snapshot
                 .write()
                 .await
-                .repos
+                .workspaces
                 .retain(|r| r.name != name);
             self.inner.clients.lock().unwrap().remove(name);
         }
@@ -621,7 +644,7 @@ impl FleetManager {
             let reg = self.inner.registry.read().await;
             reg.get(repo)
                 .map(|r| r.config.clone())
-                .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
+                .ok_or_else(|| CoreError::WorkspaceNotFound(repo.to_string()))?
         };
         let env = crate::provider_env::resolve_env(&self.inner.config.default_env, &cfg, &|k| {
             std::env::var(k).ok()
@@ -640,7 +663,7 @@ impl FleetManager {
         let record = {
             let mut reg = self.inner.registry.write().await;
             if !reg.set_config(repo, config) {
-                return Err(CoreError::RepoNotFound(repo.to_string()));
+                return Err(CoreError::WorkspaceNotFound(repo.to_string()));
             }
             reg.get(repo)
                 .cloned()
@@ -670,7 +693,7 @@ impl FleetManager {
             let reg = self.inner.registry.read().await;
             reg.get(repo)
                 .map(|r| r.root.clone())
-                .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
+                .ok_or_else(|| CoreError::WorkspaceNotFound(repo.to_string()))?
         };
         let ensure = self.ensure_config_for(repo).await?;
         let client = ensure_caliband(&root, &self.inner.config.discovery_env, &ensure).await?;
@@ -691,7 +714,7 @@ impl FleetManager {
             let reg = self.inner.registry.read().await;
             reg.get(repo)
                 .map(|r| r.config.clone())
-                .ok_or_else(|| CoreError::RepoNotFound(repo.to_string()))?
+                .ok_or_else(|| CoreError::WorkspaceNotFound(repo.to_string()))?
         };
         let env = crate::provider_env::resolve_env(&self.inner.config.default_env, &cfg, &|k| {
             std::env::var(k).ok()
@@ -808,7 +831,7 @@ impl FleetManager {
     }
 
     /// Observe fleet changes as they happen: an initial burst of `Discovered`
-    /// (one per currently-known agent) and `RepoHealth` (one per repo) built
+    /// (one per currently-known agent) and `WorkspaceHealth` (one per repo) built
     /// from the current [`Self::snapshot`], followed by a live [`FleetChange`]
     /// feed translated from the bus's `EventKind` diffs — the same ones
     /// `reconcile` already computes (fleet.rs:811); `reconcile` itself is
@@ -825,15 +848,15 @@ impl FleetManager {
         let seed = futures::stream::once(async move {
             let snap = seed_mgr.snapshot().await;
             let mut items = Vec::new();
-            for repo in snap.repos {
-                items.push(FleetChange::RepoHealth {
-                    repo: repo.name.clone(),
+            for repo in snap.workspaces {
+                items.push(FleetChange::WorkspaceHealth {
+                    workspace: repo.name.clone(),
                     health: repo.health.clone(),
                 });
                 for agent in repo.agents {
                     items.push(FleetChange::Discovered {
                         id: AgentId::from(agent.id.clone()),
-                        repo: repo.name.clone(),
+                        workspace: repo.name.clone(),
                         agent,
                     });
                 }
@@ -889,7 +912,7 @@ impl FleetManager {
         self.refresh_registry_from_store().await;
         let names: Vec<String> = {
             let reg = self.inner.registry.read().await;
-            reg.repos.iter().map(|r| r.name.clone()).collect()
+            reg.workspaces.iter().map(|r| r.name.clone()).collect()
         };
         for name in names {
             self.poll_repo_once(&name).await;
@@ -915,18 +938,19 @@ impl FleetManager {
         };
         {
             let mut reg = self.inner.registry.write().await;
-            reg.repos = durable.clone();
+            reg.workspaces = durable.clone();
         }
         let mut snap = self.inner.snapshot.write().await;
-        snap.repos
+        snap.workspaces
             .retain(|r| durable.iter().any(|d| d.name == r.name));
         for d in &durable {
-            if !snap.repos.iter().any(|r| r.name == d.name) {
+            if !snap.workspaces.iter().any(|r| r.name == d.name) {
                 // New to this replica — the imminent poll sets real health.
-                snap.repos.push(Repo {
+                snap.workspaces.push(Workspace {
                     name: d.name.clone(),
                     root: d.root.clone(),
-                    health: RepoHealth::Healthy,
+                    sources: crate::caliband::sources::discover_sources(&d.root),
+                    health: WorkspaceHealth::Healthy,
                     config: d.config.clone(),
                     agents: Vec::new(),
                 });
@@ -972,8 +996,8 @@ impl FleetManager {
 
     async fn mark_unreachable(&self, repo: &str, reason: String, own_lifecycle: bool) {
         let mut snap = self.inner.snapshot.write().await;
-        if let Some(r) = snap.repos.iter_mut().find(|r| r.name == repo) {
-            let new_health = RepoHealth::Unreachable {
+        if let Some(r) = snap.workspaces.iter_mut().find(|r| r.name == repo) {
+            let new_health = WorkspaceHealth::Unreachable {
                 reason: reason.clone(),
             };
             if r.health != new_health {
@@ -1001,7 +1025,7 @@ impl FleetManager {
         // Snapshot prior agent statuses for diffing.
         let prior: HashMap<String, AgentStatus> = {
             let snap = self.inner.snapshot.read().await;
-            snap.repos
+            snap.workspaces
                 .iter()
                 .find(|r| r.name == repo)
                 .map(|r| r.agents.iter().map(|a| (a.id.clone(), a.status)).collect())
@@ -1016,7 +1040,7 @@ impl FleetManager {
             let agent = Agent {
                 id: rec.id.clone(),
                 name: rec.name.clone(),
-                repo: repo.to_string(),
+                workspace: repo.to_string(),
                 status: rec.status,
                 started_at: rec.started_at.clone(),
                 isolated: rec.spec.isolation_worktree,
@@ -1075,9 +1099,9 @@ impl FleetManager {
 
         {
             let mut snap = self.inner.snapshot.write().await;
-            if let Some(r) = snap.repos.iter_mut().find(|r| r.name == repo) {
-                let was_unreachable = matches!(r.health, RepoHealth::Unreachable { .. });
-                r.health = RepoHealth::Healthy;
+            if let Some(r) = snap.workspaces.iter_mut().find(|r| r.name == repo) {
+                let was_unreachable = matches!(r.health, WorkspaceHealth::Unreachable { .. });
+                r.health = WorkspaceHealth::Healthy;
                 r.agents = new_agents;
                 if was_unreachable {
                     drop(snap);
@@ -1090,7 +1114,7 @@ impl FleetManager {
                                 repo,
                                 "",
                                 EventKind::RepoHealth {
-                                    state: RepoHealth::Healthy,
+                                    state: WorkspaceHealth::Healthy,
                                 },
                             )
                             .await;
@@ -1276,7 +1300,7 @@ async fn event_to_change(mgr: &FleetManager, ev: FleetEvent) -> Option<FleetChan
                     if let Some((_, agent)) = snap.find_agent(&ev.agent_id) {
                         return Some(FleetChange::Discovered {
                             id: AgentId::from(ev.agent_id.clone()),
-                            repo: ev.repo.clone(),
+                            workspace: ev.repo.clone(),
                             agent: agent.clone(),
                         });
                     }
@@ -1296,16 +1320,16 @@ async fn event_to_change(mgr: &FleetManager, ev: FleetEvent) -> Option<FleetChan
         }
         EventKind::StatusChanged { from, to } => Some(FleetChange::StatusChanged {
             id: AgentId::from(ev.agent_id.clone()),
-            repo: ev.repo.clone(),
+            workspace: ev.repo.clone(),
             from,
             to,
         }),
         EventKind::AgentGone => Some(FleetChange::Gone {
             id: AgentId::from(ev.agent_id.clone()),
-            repo: ev.repo.clone(),
+            workspace: ev.repo.clone(),
         }),
-        EventKind::RepoHealth { state } => Some(FleetChange::RepoHealth {
-            repo: ev.repo.clone(),
+        EventKind::RepoHealth { state } => Some(FleetChange::WorkspaceHealth {
+            workspace: ev.repo.clone(),
             health: state,
         }),
         // Fleet-membership/health view only; per-agent output/tool/lifecycle

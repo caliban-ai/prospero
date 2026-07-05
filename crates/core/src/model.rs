@@ -1,6 +1,6 @@
-//! Prospero's fleet domain model: `Host -> Repo -> [Agent]`.
+//! Prospero's fleet domain model: `Host -> Workspace -> [Agent]`.
 //!
-//! `Agent` is the primary unit; `Repo` is a grouping that can host many
+//! `Agent` is the primary unit; `Workspace` is a grouping that can host many
 //! concurrent agents (parallel streams of work on one codebase).
 
 use std::path::PathBuf;
@@ -12,15 +12,15 @@ use serde::{Deserialize, Serialize};
 /// Aggregate readiness of prosperod, distinct from mere liveness.
 ///
 /// `ready` gates traffic/restarts: it is `true` only when the durable store can
-/// accept writes. The repo-health counts are an informational summary
-/// (per-repo reachability is already surfaced in `/api/repos` and `/api/fleet`).
+/// accept writes. The workspace-health counts are an informational summary
+/// (per-workspace reachability is already surfaced in `/api/workspaces` and `/api/fleet`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Readiness {
     /// Overall ready signal — currently equivalent to `store_writable`.
     pub ready: bool,
     /// Whether the durable event store can accept writes.
     pub store_writable: bool,
-    /// Total managed repos.
+    /// Total managed workspaces.
     pub repos_total: usize,
     /// Repos whose caliband responded to the last poll.
     pub repos_healthy: usize,
@@ -62,10 +62,10 @@ impl AgentStatus {
     }
 }
 
-/// Connectivity of a managed repo's caliband daemon.
+/// Connectivity of a managed workspace's caliband daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum RepoHealth {
+pub enum WorkspaceHealth {
     /// The control socket responded to the last poll.
     Healthy,
     /// The control socket could not be reached; carries the reason.
@@ -82,8 +82,8 @@ pub struct Agent {
     pub id: String,
     /// Human-readable label.
     pub name: String,
-    /// Owning repo name (Prospero registry key).
-    pub repo: String,
+    /// Owning workspace name (Prospero registry key).
+    pub workspace: String,
     /// Current lifecycle state.
     pub status: AgentStatus,
     /// RFC-3339 timestamp when the agent was registered.
@@ -96,20 +96,25 @@ pub struct Agent {
     pub session_dir: PathBuf,
 }
 
-/// A managed repository and the agents running under its caliband.
+/// A managed workspace (root + its source checkouts) and the agents running
+/// under its single caliband.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Repo {
+pub struct Workspace {
     /// Registry key (operator-chosen short name).
     pub name: String,
-    /// Canonical repo root path.
+    /// Canonical workspace root path.
     pub root: PathBuf,
-    /// Health of the repo's caliband daemon.
-    pub health: RepoHealth,
-    /// The repo's provider config (so operators can read back what a repo is
-    /// configured with). Defaults to empty for repos with no config set.
+    /// The source checkouts discovered under `root` (1..N). Filesystem-derived
+    /// at snapshot-build time, not persisted.
+    #[serde(default)]
+    pub sources: Vec<crate::caliband::sources::Source>,
+    /// Health of the workspace's caliband daemon.
+    pub health: WorkspaceHealth,
+    /// The workspace's provider config (so operators can read back what a workspace is
+    /// configured with). Defaults to empty for workspaces with no config set.
     #[serde(default)]
     pub config: crate::registry::RepoProviderConfig,
-    /// Agents currently known under this repo.
+    /// Agents currently known under this workspace.
     pub agents: Vec<Agent>,
 }
 
@@ -118,14 +123,14 @@ pub struct Repo {
 pub struct FleetSnapshot {
     /// Host identity (single host in the first stab).
     pub host: String,
-    /// Managed repos and their agents.
-    pub repos: Vec<Repo>,
+    /// Managed workspaces and their agents.
+    pub workspaces: Vec<Workspace>,
 }
 
 impl FleetSnapshot {
-    /// Find an agent by id across all repos, returning `(repo_name, &Agent)`.
+    /// Find an agent by id across all workspaces, returning `(repo_name, &Agent)`.
     pub fn find_agent(&self, id: &str) -> Option<(&str, &Agent)> {
-        self.repos.iter().find_map(|r| {
+        self.workspaces.iter().find_map(|r| {
             r.agents
                 .iter()
                 .find(|a| a.id == id)
@@ -161,10 +166,10 @@ impl std::fmt::Display for AgentId {
 }
 
 /// Desired state for one agent — the provider-agnostic spec `ensure_agent` takes.
-/// Generalizes today's `(repo, SpawnRequest)` pair (fleet.rs:618).
+/// Generalizes today's `(workspace, SpawnRequest)` pair (fleet.rs:618).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSpec {
-    pub repo: String,
+    pub workspace: String,
     pub request: crate::fleet::SpawnRequest,
 }
 
@@ -172,7 +177,7 @@ pub struct TaskSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentHandle {
     pub id: AgentId,
-    pub repo: String,
+    pub workspace: String,
     /// Endpoint the agent's per-agent socket is reachable at.
     pub endpoint: crate::caliband::wire::Endpoint,
 }
@@ -195,22 +200,22 @@ pub enum DrainPolicy {
 pub enum FleetChange {
     Discovered {
         id: AgentId,
-        repo: String,
+        workspace: String,
         agent: Agent,
     },
     StatusChanged {
         id: AgentId,
-        repo: String,
+        workspace: String,
         from: AgentStatus,
         to: AgentStatus,
     },
     Gone {
         id: AgentId,
-        repo: String,
+        workspace: String,
     },
-    RepoHealth {
-        repo: String,
-        health: RepoHealth,
+    WorkspaceHealth {
+        workspace: String,
+        health: WorkspaceHealth,
     },
 }
 
@@ -232,7 +237,7 @@ mod fleet_provider_types_tests {
     fn fleet_change_serdes() {
         let c = FleetChange::StatusChanged {
             id: AgentId::from("a1"),
-            repo: "r".into(),
+            workspace: "r".into(),
             from: AgentStatus::Spawning,
             to: AgentStatus::Running,
         };
@@ -271,9 +276,9 @@ mod tests {
 
     #[test]
     fn repo_health_tags_state() {
-        let j = serde_json::to_string(&RepoHealth::Healthy).unwrap();
+        let j = serde_json::to_string(&WorkspaceHealth::Healthy).unwrap();
         assert_eq!(j, "{\"state\":\"healthy\"}");
-        let j = serde_json::to_string(&RepoHealth::Unreachable {
+        let j = serde_json::to_string(&WorkspaceHealth::Unreachable {
             reason: "no socket".into(),
         })
         .unwrap();
@@ -284,15 +289,16 @@ mod tests {
     fn find_agent_searches_across_repos() {
         let snap = FleetSnapshot {
             host: "local".into(),
-            repos: vec![Repo {
+            workspaces: vec![Workspace {
                 name: "prospero".into(),
                 root: "/r".into(),
-                health: RepoHealth::Healthy,
+                sources: vec![],
+                health: WorkspaceHealth::Healthy,
                 config: crate::registry::RepoProviderConfig::default(),
                 agents: vec![Agent {
                     id: "a1".into(),
                     name: "x".into(),
-                    repo: "prospero".into(),
+                    workspace: "prospero".into(),
                     status: AgentStatus::Running,
                     started_at: "t".into(),
                     isolated: true,
@@ -301,8 +307,8 @@ mod tests {
                 }],
             }],
         };
-        let (repo, agent) = snap.find_agent("a1").unwrap();
-        assert_eq!(repo, "prospero");
+        let (workspace, agent) = snap.find_agent("a1").unwrap();
+        assert_eq!(workspace, "prospero");
         assert_eq!(agent.id, "a1");
         assert!(snap.find_agent("nope").is_none());
     }

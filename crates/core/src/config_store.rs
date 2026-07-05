@@ -13,15 +13,15 @@ use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
 use crate::error::{CoreError, Result};
-use crate::registry::RegisteredRepo;
+use crate::registry::RegisteredWorkspace;
 
 /// Durable, mutable store for the managed-repo registry.
 #[async_trait]
 pub trait ConfigStore: Send + Sync {
     /// All registered repos, ordered by name.
-    async fn list_repos(&self) -> Result<Vec<RegisteredRepo>>;
+    async fn list_repos(&self) -> Result<Vec<RegisteredWorkspace>>;
     /// Insert or update a repo (keyed by `name`).
-    async fn upsert_repo(&self, repo: &RegisteredRepo) -> Result<()>;
+    async fn upsert_repo(&self, repo: &RegisteredWorkspace) -> Result<()>;
     /// Remove a repo by name. Returns whether a row was deleted.
     async fn delete_repo(&self, name: &str) -> Result<bool>;
 }
@@ -62,7 +62,7 @@ impl SqliteConfigStore {
 
 #[async_trait]
 impl ConfigStore for SqliteConfigStore {
-    async fn list_repos(&self) -> Result<Vec<RegisteredRepo>> {
+    async fn list_repos(&self) -> Result<Vec<RegisteredWorkspace>> {
         let rows = sqlx::query("SELECT name, root, config FROM repos ORDER BY name")
             .fetch_all(&self.pool)
             .await
@@ -73,7 +73,7 @@ impl ConfigStore for SqliteConfigStore {
             let name: String = row.try_get("name").map_err(decode)?;
             let root: String = row.try_get("root").map_err(decode)?;
             let config_json: String = row.try_get("config").map_err(decode)?;
-            repos.push(RegisteredRepo {
+            repos.push(RegisteredWorkspace {
                 name,
                 root: root.into(),
                 config: serde_json::from_str(&config_json)?,
@@ -82,7 +82,7 @@ impl ConfigStore for SqliteConfigStore {
         Ok(repos)
     }
 
-    async fn upsert_repo(&self, repo: &RegisteredRepo) -> Result<()> {
+    async fn upsert_repo(&self, repo: &RegisteredWorkspace) -> Result<()> {
         let config = serde_json::to_string(&repo.config)?;
         // Surface a non-UTF8 root explicitly rather than silently lossy-mangling it.
         let root = repo

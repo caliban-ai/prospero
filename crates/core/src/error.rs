@@ -55,7 +55,7 @@ pub enum CoreError {
 
     /// A repo name was not registered.
     #[error("repo not registered: {0}")]
-    RepoNotFound(String),
+    WorkspaceNotFound(String),
 
     /// The repo's selected provider is missing a required credential, so a
     /// spawn would produce a doomed agent. Caught before the spawn is issued.
@@ -129,7 +129,7 @@ mod tests {
         );
         assert_eq!(CoreError::Store("s".into()).to_string(), "store error: s");
         assert_eq!(
-            CoreError::RepoNotFound("r".into()).to_string(),
+            CoreError::WorkspaceNotFound("r".into()).to_string(),
             "repo not registered: r"
         );
         assert_eq!(

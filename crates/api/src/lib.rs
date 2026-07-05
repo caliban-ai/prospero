@@ -40,17 +40,20 @@ pub fn router(manager: FleetManager, fleet: LocalFleet) -> Router {
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/api/metrics", get(handlers::get_metrics))
-        // Fleet + repos.
+        // Fleet + workspaces.
         .route("/api/fleet", get(handlers::get_fleet))
         .route(
-            "/api/repos",
-            get(handlers::get_repos).post(handlers::add_repo),
+            "/api/workspaces",
+            get(handlers::get_workspaces).post(handlers::add_workspace),
         )
-        .route("/api/repos/{name}", delete(handlers::delete_repo))
-        .route("/api/repos/{name}/config", put(handlers::set_repo_config))
+        .route("/api/workspaces/{name}", delete(handlers::delete_workspace))
         .route(
-            "/api/repos/{repo}/agents",
-            get(handlers::get_repo_agents).post(handlers::spawn_agent),
+            "/api/workspaces/{name}/config",
+            put(handlers::set_workspace_config),
+        )
+        .route(
+            "/api/workspaces/{workspace}/agents",
+            get(handlers::get_workspace_agents).post(handlers::spawn_agent),
         )
         // Agents.
         .route(

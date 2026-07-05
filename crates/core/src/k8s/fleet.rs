@@ -47,7 +47,7 @@ use crate::store::Store;
 #[must_use]
 pub fn task_name(spec: &TaskSpec) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(spec.repo.as_bytes());
+    hasher.update(spec.workspace.as_bytes());
     hasher.update([0u8]);
     hasher.update(spec.request.prompt.as_bytes());
     hasher.update([0u8]);
@@ -73,17 +73,17 @@ fn restart_name(old_name: &str, nonce: u64) -> String {
 /// Map a `TaskSpec` onto the `CalibanTask` CR that expresses it.
 ///
 /// MVP simplification (documented per the plan): the workspace gets exactly
-/// **one** [`Source`] built from `spec.repo`, checked out at `main` and
+/// **one** [`Source`] built from `spec.workspace`, checked out at `main` and
 /// mounted at `/work/<repo>`. Multi-source workspaces, non-`main` refs, and
 /// isolation-from-request mapping are out of scope until a later task widens
 /// `TaskSpec`/`SpawnRequest` to carry that information explicitly.
 #[must_use]
 pub fn build_calibantask(spec: &TaskSpec, name: &str) -> CalibanTask {
     let source = Source {
-        name: spec.repo.clone(),
-        repo: spec.repo.clone(),
+        name: spec.workspace.clone(),
+        repo: spec.workspace.clone(),
         r#ref: "main".to_string(),
-        path: format!("/work/{}", spec.repo),
+        path: format!("/work/{}", spec.workspace),
     };
     let crd_spec = CalibanTaskSpec {
         workspace: Workspace {
@@ -115,7 +115,7 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Option<AgentHandle> {
     let name = task.metadata.name.clone()?;
     Some(AgentHandle {
         id: AgentId::from(name),
-        repo,
+        workspace: repo,
         endpoint: Endpoint::Tcp {
             addr: endpoint_addr.clone(),
         },
@@ -201,7 +201,7 @@ pub fn agent_from_task(task: &CalibanTask) -> Agent {
     Agent {
         id: name.clone(),
         name,
-        repo,
+        workspace: repo,
         status: phase_to_status(phase),
         started_at,
         isolated: false,
@@ -494,7 +494,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
 impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
     async fn ensure_agent(&self, spec: TaskSpec) -> Result<AgentHandle> {
         let name = task_name(&spec);
-        let repo = spec.repo.clone();
+        let repo = spec.workspace.clone();
         let ct = build_calibantask(&spec, &name);
         self.api.apply(&ct).await?;
 
@@ -559,18 +559,18 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 
                     let agent = agent_from_task(task);
                     let status = agent.status;
-                    let repo = agent.repo.clone();
+                    let repo = agent.workspace.clone();
 
                     let change = match known.get(&name) {
                         None => Some(FleetChange::Discovered {
                             id: AgentId::from(name.clone()),
-                            repo: repo.clone(),
+                            workspace: repo.clone(),
                             agent,
                         }),
                         Some((prev_status, _)) if *prev_status != status => {
                             Some(FleetChange::StatusChanged {
                                 id: AgentId::from(name.clone()),
-                                repo: repo.clone(),
+                                workspace: repo.clone(),
                                 from: *prev_status,
                                 to: status,
                             })
@@ -597,7 +597,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
                     known.remove(&name);
                     let change = FleetChange::Gone {
                         id: AgentId::from(name),
-                        repo,
+                        workspace: repo,
                     };
                     if tx.send(change).await.is_err() {
                         return;
@@ -726,7 +726,7 @@ mod tests {
         let mut request = SpawnRequest::new(prompt);
         request.label = label.map(str::to_string);
         TaskSpec {
-            repo: repo.to_string(),
+            workspace: repo.to_string(),
             request,
         }
     }
@@ -829,7 +829,7 @@ mod tests {
         let handle = handle.expect("ensure_agent");
 
         assert_eq!(handle.id, AgentId::from(expected_name));
-        assert_eq!(handle.repo, "repo-a");
+        assert_eq!(handle.workspace, "repo-a");
         assert_eq!(
             handle.endpoint,
             Endpoint::Tcp {
@@ -957,7 +957,7 @@ mod tests {
 
         assert_eq!(agent.id, name);
         assert_eq!(agent.name, name);
-        assert_eq!(agent.repo, "repo-a");
+        assert_eq!(agent.workspace, "repo-a");
         assert_eq!(agent.status, AgentStatus::Running);
         assert!(!agent.isolated);
         assert!(!agent.interactive);
@@ -998,7 +998,11 @@ mod tests {
             .expect("watch_fleet stream ended unexpectedly");
 
         match change {
-            FleetChange::Discovered { id, repo, agent } => {
+            FleetChange::Discovered {
+                id,
+                workspace: repo,
+                agent,
+            } => {
                 assert_eq!(id, AgentId::from(name.clone()));
                 assert_eq!(repo, "repo-a");
                 assert_eq!(agent.status, AgentStatus::Running);
@@ -1031,7 +1035,11 @@ mod tests {
             .expect("timed out waiting for the live Discovered")
             .expect("watch_fleet stream ended unexpectedly");
         match discovered {
-            FleetChange::Discovered { id, repo, agent } => {
+            FleetChange::Discovered {
+                id,
+                workspace: repo,
+                agent,
+            } => {
                 assert_eq!(id, AgentId::from(name.clone()));
                 assert_eq!(repo, "repo-a");
                 // No status yet (fresh apply, no phase) -> Spawning.
@@ -1048,7 +1056,11 @@ mod tests {
             .expect("watch_fleet stream ended unexpectedly");
         match status_changed {
             FleetChange::StatusChanged {
-                id, repo, from, to, ..
+                id,
+                workspace: repo,
+                from,
+                to,
+                ..
             } => {
                 assert_eq!(id, AgentId::from(name));
                 assert_eq!(repo, "repo-a");
@@ -1090,7 +1102,10 @@ mod tests {
             .expect("timed out waiting for Gone")
             .expect("watch_fleet stream ended unexpectedly");
         match gone {
-            FleetChange::Gone { id, repo } => {
+            FleetChange::Gone {
+                id,
+                workspace: repo,
+            } => {
                 assert_eq!(id, AgentId::from(name));
                 assert_eq!(repo, "repo-a");
             }

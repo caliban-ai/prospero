@@ -9,7 +9,7 @@ use sqlx::postgres::PgPool;
 
 use crate::config_store::ConfigStore;
 use crate::error::{CoreError, Result};
-use crate::registry::RegisteredRepo;
+use crate::registry::RegisteredWorkspace;
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS repos (\
     name   TEXT PRIMARY KEY,\
@@ -43,7 +43,7 @@ impl PostgresConfigStore {
 
 #[async_trait]
 impl ConfigStore for PostgresConfigStore {
-    async fn list_repos(&self) -> Result<Vec<RegisteredRepo>> {
+    async fn list_repos(&self) -> Result<Vec<RegisteredWorkspace>> {
         let rows = sqlx::query("SELECT name, root, config FROM repos ORDER BY name")
             .fetch_all(&self.pool)
             .await
@@ -54,7 +54,7 @@ impl ConfigStore for PostgresConfigStore {
             let name: String = row.try_get("name").map_err(decode)?;
             let root: String = row.try_get("root").map_err(decode)?;
             let config_json: String = row.try_get("config").map_err(decode)?;
-            repos.push(RegisteredRepo {
+            repos.push(RegisteredWorkspace {
                 name,
                 root: root.into(),
                 config: serde_json::from_str(&config_json)?,
@@ -63,7 +63,7 @@ impl ConfigStore for PostgresConfigStore {
         Ok(repos)
     }
 
-    async fn upsert_repo(&self, repo: &RegisteredRepo) -> Result<()> {
+    async fn upsert_repo(&self, repo: &RegisteredWorkspace) -> Result<()> {
         let config = serde_json::to_string(&repo.config)?;
         let root = repo
             .root
