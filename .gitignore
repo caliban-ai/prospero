@@ -2,5 +2,6 @@
 .superpowers/
 /docs/guide/book
 /docs/guide/src/adr/
+/docs/guide/src/changelog.md
 /docs/guide/theme/caliban-ai.css
 /docs/guide/theme/nav.js
