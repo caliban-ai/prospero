@@ -215,6 +215,36 @@ impl FakeCaliband {
     }
 }
 
+/// A backend a `FleetProvider` implementation drives, generalized just enough
+/// for [`fleet_provider_conformance`] to (a) assert a provision reached the
+/// backend and (b) simulate the eventual reap of a stopped agent so
+/// `watch_fleet` observes `Gone`. `FakeCaliband` implements it trivially
+/// (below); a `K8sFleet`-side fake (`prospero_core::k8s::fake::FakeK8s`,
+/// behind the `k8s` feature) implements it too, which is what makes the
+/// conformance suite itself backend-agnostic.
+pub trait FakeBackend {
+    /// True once the backend received at least one provision request (a
+    /// Unix `FakeCaliband`: a `Spawn` spec; a k8s fake: a `CalibanTask`
+    /// apply).
+    fn received_any_spec(&self) -> bool;
+
+    /// Simulate the eventual reap of a stopped agent (real caliban/k8s both
+    /// remove a stopped agent's registry entry/CR sometime after the stop,
+    /// not instantly) so a live `watch_fleet` subscription observes `Gone`.
+    /// Idempotent — safe to call on an id already reaped.
+    fn simulate_reap(&self, id: &str);
+}
+
+impl FakeBackend for FakeCaliband {
+    fn received_any_spec(&self) -> bool {
+        !self.received_specs().is_empty()
+    }
+
+    fn simulate_reap(&self, id: &str) {
+        self.remove_agent(id);
+    }
+}
+
 impl Drop for FakeCaliband {
     fn drop(&mut self) {
         for t in &self.tasks {
@@ -599,22 +629,27 @@ pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigSto
 
 /// Behavioral contract every [`crate::fleet_provider::FleetProvider`] backend
 /// must satisfy: `ensure_agent` provisions an attachable handle and its spec
-/// reaches caliband; `watch_fleet` observes the new agent (`Discovered`);
+/// reaches the backend; `watch_fleet` observes the new agent (`Discovered`);
 /// `stop_agent` stops it and `watch_fleet` observes its departure (`Gone`);
 /// `restart_agent` yields a fresh id. Mirrors the store/config conformance
-/// style — driven over a `FakeCaliband` so it needs no real caliban. Runs
-/// against `LocalFleet` here; `K8sFleet` (epic #274, P2) calls this too, so a
-/// new backend is correct by construction, not by hope.
+/// style — driven over a [`FakeBackend`] so it needs no real caliban/cluster.
+/// Runs against `LocalFleet` (+ `FakeCaliband`) here; `K8sFleet` (+ `FakeK8s`,
+/// epic #274, P2) calls this too, so a new backend is correct by
+/// construction, not by hope.
 ///
 /// Deliberately drives everything through the `FleetProvider` trait plus
-/// `FakeCaliband`'s own hooks (`received_specs`, `remove_agent`) — never a
-/// backend-internal poll method (e.g. `LocalFleet`'s `FleetManager::
+/// [`FakeBackend`]'s two hooks (`received_any_spec`, `simulate_reap`) — never
+/// a backend-internal poll method (e.g. `LocalFleet`'s `FleetManager::
 /// poll_repo_once`) — so this same function is reusable across backends with
 /// their own reconciliation loop. That means the caller (each backend's own
 /// test wiring) is responsible for actually running that backend's background
 /// reconciliation (for `LocalFleet`, `FleetManager::run` on a fast poll
-/// interval) so the bounded waits below converge instead of timing out.
-pub async fn fleet_provider_conformance(provider: &dyn crate::FleetProvider, fake: &FakeCaliband) {
+/// interval; for `K8sFleet`, its own `watch_fleet`-spawned poll loop) so the
+/// bounded waits below converge instead of timing out.
+pub async fn fleet_provider_conformance(
+    provider: &dyn crate::FleetProvider,
+    backend: &dyn FakeBackend,
+) {
     use crate::fleet::SpawnRequest;
     use crate::model::{AgentId, DrainPolicy, FleetChange, TaskSpec};
     use futures::StreamExt;
@@ -657,7 +692,7 @@ pub async fn fleet_provider_conformance(provider: &dyn crate::FleetProvider, fak
         .await
         .expect("ensure_agent");
     assert_eq!(h.repo, "repo-a");
-    assert!(!fake.received_specs().is_empty(), "spec reached caliband");
+    assert!(backend.received_any_spec(), "provision reached backend");
 
     // 2. `watch_fleet` observes it. `ensure_agent` attaches the agent as part
     // of spawning it, so `reconcile` treats it as already-known and suppresses
@@ -669,17 +704,17 @@ pub async fn fleet_provider_conformance(provider: &dyn crate::FleetProvider, fak
 
     // 3. `stop_agent(id, DrainPolicy::Kill)` stops it; `watch_fleet` observes
     // `Gone`. Subscribe *before* triggering the stop so this is a genuine live
-    // diff, not another initial-listing read. `FakeCaliband`'s `Kill` marks
-    // the agent `Killed` but — matching real caliban, where a killed agent's
-    // registry entry is reaped later, not instantly — leaves it registered,
-    // so `remove_agent` simulates that eventual reap deterministically
-    // instead of the test waiting on it.
+    // diff, not another initial-listing read. A backend's `Kill` may only
+    // mark the agent stopped rather than removing it immediately (matching
+    // real caliban, where a killed agent's registry entry is reaped later,
+    // not instantly) — `simulate_reap` simulates that eventual reap
+    // deterministically instead of the test waiting on it.
     let mut changes = provider.watch_fleet();
     provider
         .stop_agent(&h.id, DrainPolicy::Kill)
         .await
         .expect("stop_agent");
-    fake.remove_agent(h.id.as_str());
+    backend.simulate_reap(h.id.as_str());
 
     let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
     let mut gone = false;
