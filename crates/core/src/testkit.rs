@@ -747,16 +747,19 @@ pub async fn fleet_provider_conformance(
         .expect("ensure_agent (2nd agent, for restart)");
     wait_for_discovered(provider, &h2.id).await;
 
-    // `FakeCaliband`'s `Respawn` handler (this file, `handle_control_conn`)
-    // removes the old agent record but does not register a new one for the
-    // id it returns (no `AgentRecord`, no stream listener) — a known fake
-    // limitation, not a provider one. So this only asserts what's actually
-    // observable through the trait: the call succeeds and hands back an id
-    // distinct from the one it replaced. It deliberately does NOT assert the
-    // new id later shows up in a `watch_fleet` listing, since the fake never
-    // makes that true.
+    // The trait contract is that `restart_agent` succeeds and returns *an* id
+    // for the restarted agent — "the (possibly new) id". Backends differ on
+    // whether it changes: `LocalFleet`/`FakeCaliband`'s `Respawn` assigns a
+    // fresh caliban id, while `K8sFleet` keeps the spec-deterministic CR name
+    // as a stable identity (prospero #77 M1). So the conformance bar is a
+    // non-empty id, not a *different* one. (It deliberately does NOT assert the
+    // id later shows up in a `watch_fleet` listing — the fake never makes that
+    // true for the returned id.)
     let new_id = provider.restart_agent(&h2.id).await.expect("restart_agent");
-    assert_ne!(new_id, h2.id, "restart_agent must yield a fresh id");
+    assert!(
+        !new_id.as_str().is_empty(),
+        "restart_agent must return an id for the restarted agent"
+    );
 }
 
 /// Build a minimal `AgentRecord` for tests.

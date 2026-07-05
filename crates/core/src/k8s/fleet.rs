@@ -16,7 +16,6 @@
 //! poll-based reconciliation on this timescale.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,18 +53,6 @@ pub fn task_name(spec: &TaskSpec) -> String {
     if let Some(label) = &spec.request.label {
         hasher.update(label.as_bytes());
     }
-    let digest = hasher.finalize();
-    format!("ct-{}", &hex::encode(digest)[..16])
-}
-
-/// Derive a fresh CR name for a restart, salted off the old name plus a
-/// monotonic nonce so repeated restarts of the same agent each get a distinct
-/// name (names are otherwise spec-deterministic via [`task_name`]).
-fn restart_name(old_name: &str, nonce: u64) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(old_name.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(nonce.to_le_bytes());
     let digest = hasher.finalize();
     format!("ct-{}", &hex::encode(digest)[..16])
 }
@@ -325,7 +312,6 @@ pub struct K8sFleet<A: CalibanTaskApi> {
     // to its background poll-diff task without requiring `A: Clone`.
     api: Arc<A>,
     poll: PollConfig,
-    restart_nonce: AtomicU64,
     /// How often `watch_fleet`'s background poll-diff loop calls `list()`.
     /// Production default is ~2s; tests override it much shorter (e.g. 20ms)
     /// via [`Self::with_watch_poll_interval`] so change assertions don't wait
@@ -377,7 +363,6 @@ impl<A: CalibanTaskApi> K8sFleet<A> {
         Self {
             api: Arc::new(api),
             poll,
-            restart_nonce: AtomicU64::new(0),
             watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL,
             emitter: Emitter::new(bus, store),
             tls: None,
@@ -643,18 +628,31 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             .await?
             .ok_or_else(|| CoreError::AgentNotFound(old_name.to_string()))?;
 
-        let nonce = self.restart_nonce.fetch_add(1, Ordering::Relaxed);
-        let new_name = restart_name(old_name, nonce);
-        debug_assert_ne!(new_name, old_name, "restart must produce a fresh CR name");
+        // A CR's name is a pure function of spec (`task_name`, set at
+        // `ensure_agent`), so a restart re-applies the SAME name rather than a
+        // salted one — keeping identity idempotent so a future declarative
+        // `ensure_agent(spec)` reconcile targets the one CR instead of applying
+        // a duplicate. (#77 M1)
+        self.api.delete(old_name).await?;
+        // Wait for the old CR to actually disappear before re-applying the same
+        // name, so we never race a not-yet-finalized delete. `FakeK8s` deletes
+        // synchronously; real kube deletion with finalizers needs this poll.
+        let deadline = tokio::time::Instant::now() + self.poll.deadline;
+        while self.api.get(old_name).await?.is_some() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CoreError::Fleet(format!(
+                    "restart: CalibanTask {old_name} did not delete within the budget"
+                )));
+            }
+            tokio::time::sleep(self.poll.interval).await;
+        }
 
-        let mut fresh = CalibanTask::new(&new_name, old.spec.clone());
+        let mut fresh = CalibanTask::new(old_name, old.spec.clone());
         // A brand-new CR starts with no status; the operator populates it.
         fresh.status = None;
-
-        self.api.delete(old_name).await?;
         self.api.apply(&fresh).await?;
 
-        Ok(AgentId::from(new_name))
+        Ok(AgentId::from(old_name))
     }
 
     async fn remove_agent(&self, id: &AgentId, _force: bool) -> Result<()> {
@@ -956,7 +954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_agent_yields_a_new_id_and_a_fresh_cr() {
+    async fn restart_agent_reapplies_the_same_name_with_reset_status() {
         let api = MemTaskApi::new();
         let (bus, store) = test_seams();
         let fleet = K8sFleet::new(api, bus, store);
@@ -975,14 +973,14 @@ mod tests {
             .await
             .expect("restart_agent");
 
-        assert_ne!(new_id.as_str(), old_name);
-        assert!(fleet.api.get(&old_name).await.unwrap().is_none());
+        // #77 M1: restart keeps the spec-deterministic name (stable identity).
+        assert_eq!(new_id.as_str(), old_name);
         let fresh = fleet
             .api
             .get(new_id.as_str())
             .await
             .unwrap()
-            .expect("fresh CR exists");
+            .expect("fresh CR exists at the same name");
         // Spec carries over from the old CR...
         assert_eq!(fresh.spec.task.prompt, "task");
         // ...but status is reset, since a brand-new CR hasn't been
