@@ -19,9 +19,12 @@ concurrency:
   cancel-in-progress: true
 
 # The workspace integration tests (core/api/cli) need prospero-core's testkit
-# feature to compile, so every cargo step enables it.
+# feature to compile, so every cargo step enables it. We also enable the `k8s`
+# feature so the K8sFleet backend (kube) is compiled + tested in CI rather than
+# rotting behind an unbuilt feature gate. A separate lean-build step below
+# guarantees the DEFAULT build still pulls no kube.
 env:
-  TESTKIT: "--features prospero-core/testkit"
+  TESTKIT: "--features prospero-core/testkit,prospero-core/k8s"
 
 jobs:
   check:
@@ -92,6 +95,17 @@ jobs:
       - name: cargo build
         if: steps.changes.outputs.code == 'true'
         run: cargo build --workspace --all-targets $TESTKIT
+
+      # Guard the "LocalFleet pulls no kube" property: the default prospero-core
+      # build (no k8s feature) must compile and must NOT pull the kube stack.
+      - name: lean build (no k8s) pulls no kube
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          cargo build -p prospero-core
+          if cargo tree -p prospero-core -e no-dev -i kube 2>/dev/null | grep -q '^kube'; then
+            echo "::error::default prospero-core build pulled 'kube' — the k8s feature gate leaked"; exit 1
+          fi
+          echo "default build is kube-free ✓"
 
       - name: cargo test
         if: steps.changes.outputs.code == 'true'
