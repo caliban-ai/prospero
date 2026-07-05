@@ -62,7 +62,13 @@ async fn cli_drives_the_full_stack() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
-    let app = prospero_api::router(manager.clone(), LocalFleet::new(manager));
+    let local = LocalFleet::new(manager.clone());
+    let app = prospero_api::router(
+        Arc::new(local.clone()),
+        Some(Arc::new(local)),
+        manager.store(),
+        manager.bus(),
+    );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
