@@ -243,6 +243,20 @@ impl Emitter {
         }
     }
 
+    /// The shared event store, for a backend that needs to probe it directly
+    /// (K8sFleet's `readiness`). (#76)
+    #[cfg(feature = "k8s")]
+    pub(crate) fn store(&self) -> Arc<dyn Store> {
+        self.store.clone()
+    }
+
+    /// A metrics snapshot with `active` as the live attach gauge — the same
+    /// recorder `FleetManager::metrics` reads. (#76)
+    #[cfg(feature = "k8s")]
+    pub(crate) fn metrics_snapshot(&self, active: u64) -> MetricsSnapshot {
+        self.metrics.snapshot(active)
+    }
+
     async fn next_event(&self, repo: &str, agent_id: &str, kind: EventKind) -> FleetEvent {
         let stream_key = crate::event::stream_key_for(repo, agent_id);
         let seq = self.next_seq(&stream_key).await;
@@ -473,6 +487,20 @@ impl FleetManager {
     /// watchers pass `repo:<name>` / `fleet`.
     pub fn subscribe(&self, stream_key: &str) -> crate::bus::BusSubscription {
         self.inner.emitter.bus.subscribe(stream_key)
+    }
+
+    /// The shared event store. Observability reads (agent history/SSE) route
+    /// here rather than through the fleet backend, so any `FleetProvider`
+    /// (local or k8s) that emits to this store serves the same read path. (#76)
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn Store> {
+        self.inner.emitter.store.clone()
+    }
+
+    /// The shared event bus (SSE `subscribe` routes here). See [`Self::store`]. (#76)
+    #[must_use]
+    pub fn bus(&self) -> Arc<dyn EventBus> {
+        self.inner.emitter.bus.clone()
     }
 
     /// Subscribe to every stream's live events, unfiltered (see

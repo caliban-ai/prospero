@@ -25,6 +25,22 @@ pub trait FleetProvider: Send + Sync {
 
     /// Restart an agent; returns the (possibly new) id.
     async fn restart_agent(&self, id: &AgentId) -> Result<AgentId>;
+
+    /// Forget an agent entirely (local: remove from caliband's registry; k8s:
+    /// delete its `CalibanTask` CR). (#76)
+    async fn remove_agent(&self, id: &AgentId, force: bool) -> Result<()>;
+
+    /// A point-in-time view of the whole fleet. Local builds it from the poll
+    /// snapshot; k8s projects the live `CalibanTask`s. (#76)
+    async fn snapshot(&self) -> crate::model::FleetSnapshot;
+
+    /// Readiness of the backend + its store. Local reports store-writability +
+    /// per-workspace poll health; k8s reports store-writability + kube API
+    /// reachability. (#76)
+    async fn readiness(&self) -> crate::model::Readiness;
+
+    /// Backend counters for `/api/metrics`. (#76)
+    fn metrics(&self) -> crate::metrics::MetricsSnapshot;
 }
 
 /// caliband-over-Unix-sockets backend — wraps today's `FleetManager` verbatim.
@@ -82,6 +98,71 @@ impl FleetProvider for LocalFleet {
     async fn restart_agent(&self, id: &AgentId) -> Result<AgentId> {
         let new_id = self.inner.respawn_agent(id.as_str()).await?;
         Ok(AgentId::from(new_id))
+    }
+
+    async fn remove_agent(&self, id: &AgentId, force: bool) -> Result<()> {
+        self.inner.rm_agent(id.as_str(), force).await
+    }
+
+    async fn snapshot(&self) -> crate::model::FleetSnapshot {
+        self.inner.snapshot().await
+    }
+
+    async fn readiness(&self) -> crate::model::Readiness {
+        self.inner.readiness().await
+    }
+
+    fn metrics(&self) -> crate::metrics::MetricsSnapshot {
+        self.inner.metrics()
+    }
+}
+
+/// The workspace-registry / provider-config plane — a prospero concept
+/// (`Registry` of managed workspaces). `LocalFleet` implements it; k8s has no
+/// analogue (workspaces are `CalibanTask`/namespace-driven), so `K8sFleet` does
+/// NOT implement it and the API returns 405 for these routes under k8s. (#76)
+#[async_trait]
+pub trait FleetAdmin: Send + Sync {
+    /// Register a workspace and persist it.
+    async fn add_workspace(
+        &self,
+        name: String,
+        root: std::path::PathBuf,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()>;
+
+    /// Unregister a workspace; returns whether one existed.
+    async fn remove_workspace(&self, name: &str) -> Result<bool>;
+
+    /// Replace a workspace's provider config (restarts its caliband).
+    async fn set_workspace_config(
+        &self,
+        name: &str,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()>;
+}
+
+#[async_trait]
+impl FleetAdmin for LocalFleet {
+    async fn add_workspace(
+        &self,
+        name: String,
+        root: std::path::PathBuf,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        self.inner.add_workspace_with_config(name, root, config).await
+    }
+
+    async fn remove_workspace(&self, name: &str) -> Result<bool> {
+        self.inner.remove_repo(name).await
+    }
+
+    async fn set_workspace_config(
+        &self,
+        name: &str,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        self.inner.set_repo_config(name, config).await
     }
 }
 
@@ -402,5 +483,42 @@ mod local_fleet_tests {
         );
 
         mgr.begin_shutdown();
+    }
+
+    /// #76: the extended `FleetProvider` methods (snapshot/readiness/metrics)
+    /// are reachable through the trait object and delegate to the manager.
+    #[tokio::test]
+    async fn local_fleet_snapshot_readiness_metrics_via_trait() {
+        let (provider, _fake, _dir) = setup().await;
+        let p: &dyn FleetProvider = &provider;
+        let snap = p.snapshot().await;
+        assert!(snap.workspaces.iter().any(|w| w.name == "repo-a"));
+        let r = p.readiness().await;
+        // store is writable in the test setup.
+        assert!(r.store_writable);
+        let _ = p.metrics();
+    }
+
+    /// #76: the `FleetAdmin` seam registers/removes a workspace through the
+    /// trait object.
+    #[tokio::test]
+    async fn local_fleet_admin_add_and_remove_workspace() {
+        let (provider, _fake, dir) = setup().await;
+        let admin: &dyn FleetAdmin = &provider;
+        let root = dir.path().join("repo-b");
+        std::fs::create_dir_all(&root).unwrap();
+        admin
+            .add_workspace("repo-b".into(), root, Default::default())
+            .await
+            .unwrap();
+        assert!(
+            provider
+                .snapshot()
+                .await
+                .workspaces
+                .iter()
+                .any(|w| w.name == "repo-b")
+        );
+        assert!(admin.remove_workspace("repo-b").await.unwrap());
     }
 }
