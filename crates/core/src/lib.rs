@@ -39,7 +39,7 @@ pub use distributed_bus::DistributedBus;
 pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};
-pub use fleet_provider::{FleetProvider, LocalFleet};
+pub use fleet_provider::{FleetAdmin, FleetProvider, LocalFleet};
 #[cfg(feature = "k8s")]
 pub use k8s::fleet::{CalibanTaskApi, K8sFleet, KubeTaskApi};
 pub use leased_ownership::LeasedOwnership;

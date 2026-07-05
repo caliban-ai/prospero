@@ -656,6 +656,79 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 
         Ok(AgentId::from(new_name))
     }
+
+    async fn remove_agent(&self, id: &AgentId, _force: bool) -> Result<()> {
+        // k8s: forgetting an agent is deleting its CalibanTask CR.
+        self.api.delete(id.as_str()).await
+    }
+
+    async fn snapshot(&self) -> crate::model::FleetSnapshot {
+        // List the live CalibanTasks and project each into a prospero `Agent`.
+        // k8s has no prospero registry, so all agents group under one synthetic
+        // workspace named for the backend (namespace scoping is the api's).
+        let tasks = self.api.list().await.unwrap_or_default();
+        let agents: Vec<crate::model::Agent> = tasks.iter().map(agent_from_task).collect();
+        let ws = crate::model::Workspace {
+            name: "k8s".into(),
+            root: std::path::PathBuf::new(),
+            sources: Vec::new(),
+            health: crate::model::WorkspaceHealth::Healthy,
+            config: crate::registry::RepoProviderConfig::default(),
+            agents,
+        };
+        crate::model::FleetSnapshot {
+            host: "k8s".into(),
+            workspaces: vec![ws],
+        }
+    }
+
+    async fn readiness(&self) -> crate::model::Readiness {
+        // Ready iff the store accepts writes AND the kube API is reachable
+        // (a `list` doubles as the reachability probe). No per-workspace poll
+        // health under k8s — report the single synthetic namespace workspace.
+        let store_writable = self.emitter.store().writable().await;
+        let api_ok = self.api.list().await.is_ok();
+        crate::model::Readiness {
+            ready: store_writable && api_ok,
+            store_writable,
+            repos_total: 1,
+            repos_healthy: usize::from(api_ok),
+            repos_unreachable: usize::from(!api_ok),
+        }
+    }
+
+    fn metrics(&self) -> crate::metrics::MetricsSnapshot {
+        let active = self.attached.lock().unwrap().len() as u64;
+        self.emitter.metrics_snapshot(active)
+    }
+
+    async fn send_input(
+        &self,
+        id: &AgentId,
+        input: crate::caliband::wire::AttachInbound,
+    ) -> Result<()> {
+        // Resolve the agent's networked caliband endpoint from its CR status,
+        // then deliver the frame over the same TCP+TLS+token session plane
+        // `start_agent_stream` uses (ADR 0008 §3).
+        let task = self
+            .api
+            .get(id.as_str())
+            .await?
+            .ok_or_else(|| CoreError::AgentNotFound(id.as_str().to_string()))?;
+        let handle = handle_from(&task, "k8s".into()).ok_or_else(|| CoreError::InvalidState {
+            op: "send_input".to_string(),
+            id: id.as_str().to_string(),
+            status: "not attachable".to_string(),
+        })?;
+        let Endpoint::Tcp { addr } = &handle.endpoint else {
+            return Err(CoreError::Fleet(
+                "k8s agent endpoint is not Tcp".to_string(),
+            ));
+        };
+        let client =
+            CalibandClient::connect_tcp(addr.clone(), self.tls.clone(), self.token.clone());
+        client.send_inbound(&handle.endpoint, &input).await
+    }
 }
 
 /// An in-memory `CalibanTaskApi` — precursor to Task B5's more general
@@ -1111,5 +1184,61 @@ mod tests {
             }
             other => panic!("expected Gone, got {other:?}"),
         }
+    }
+
+    // ---- #76: extended FleetProvider methods ----
+
+    #[tokio::test]
+    async fn k8s_snapshot_lists_calibantasks_as_agents() {
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), "a1"))
+            .await
+            .unwrap();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), "a2"))
+            .await
+            .unwrap();
+        api.set_running("a2", "10.0.0.9:9443");
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
+
+        let snap = fleet.snapshot().await;
+        let agents: Vec<_> = snap.workspaces.iter().flat_map(|w| &w.agents).collect();
+        assert_eq!(agents.len(), 2, "both CRs projected as agents");
+        assert_eq!(snap.workspaces[0].name, "k8s");
+    }
+
+    #[tokio::test]
+    async fn k8s_remove_agent_deletes_the_cr() {
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), "a1"))
+            .await
+            .unwrap();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
+
+        fleet
+            .remove_agent(&AgentId::from("a1"), true)
+            .await
+            .unwrap();
+        assert!(
+            fleet
+                .snapshot()
+                .await
+                .workspaces
+                .iter()
+                .all(|w| w.agents.is_empty()),
+            "the CR is gone after remove_agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn k8s_readiness_true_when_api_and_store_healthy() {
+        let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
+        let r = fleet.readiness().await;
+        assert!(r.store_writable);
+        assert!(r.ready);
+        assert_eq!(r.repos_healthy, 1);
     }
 }

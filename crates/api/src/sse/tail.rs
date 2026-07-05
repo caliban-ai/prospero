@@ -4,10 +4,13 @@
 //! and a decision to keep tailing or close — with no axum in sight, so the
 //! `Lagged` self-heal path is unit-testable without HTTP or a real channel.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use prospero_core::BusEvent;
+use prospero_core::FleetEvent;
 use prospero_core::event::EventKind;
-use prospero_core::{FleetEvent, FleetManager};
+use prospero_core::store::Store;
 
 /// One unit the stream forwards to the client.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,11 +49,10 @@ pub(crate) trait HistorySource {
 }
 
 #[async_trait]
-impl HistorySource for FleetManager {
+impl HistorySource for Arc<dyn Store> {
     async fn history(&self, agent_id: &str, from: u64) -> Vec<FleetEvent> {
-        FleetManager::history(self, agent_id, from)
-            .await
-            .unwrap_or_default()
+        // An agent's stream key is its own id (see `event::stream_key_for`).
+        self.replay(agent_id, from).await.unwrap_or_default()
     }
 }
 

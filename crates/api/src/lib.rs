@@ -11,28 +11,45 @@ pub mod error;
 pub mod handlers;
 pub mod sse;
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::routing::{delete, get, post, put};
-use prospero_core::{FleetManager, LocalFleet};
+use prospero_core::bus::EventBus;
+use prospero_core::store::Store;
+use prospero_core::{FleetAdmin, FleetProvider};
 
-/// Shared application state handed to every handler.
+/// Shared application state handed to every handler. Backend-agnostic (#76):
+/// the control plane is a `FleetProvider`, the workspace-registry plane an
+/// optional `FleetAdmin` (`None` under k8s → those routes 405), and
+/// observability (history/SSE) reads the shared `Store`/`EventBus` directly.
 #[derive(Clone)]
 pub struct AppState {
-    /// The fleet control plane. Almost every handler (fleet/repo listing,
-    /// agent lookup, kill/respawn, the session plane) still talks to this
-    /// directly — unchanged in P1.
-    pub manager: FleetManager,
-    /// The `FleetProvider` seam, wrapping the same `manager`. Only the
-    /// spawn/ensure path is routed through it today; see
-    /// `handlers::spawn_agent`.
-    pub fleet: LocalFleet,
+    /// The fleet control plane (ensure/stop/restart/snapshot/readiness/metrics/
+    /// remove_agent/send_input). `LocalFleet` or `K8sFleet`.
+    pub fleet: Arc<dyn FleetProvider>,
+    /// The workspace-registry/config plane. `Some` for local; `None` for k8s.
+    pub admin: Option<Arc<dyn FleetAdmin>>,
+    /// Shared durable event store — agent history reads route here.
+    pub store: Arc<dyn Store>,
+    /// Shared event bus — SSE subscribe routes here.
+    pub bus: Arc<dyn EventBus>,
 }
 
-/// Build the application router over the given fleet manager and its
-/// `FleetProvider` wrapper (constructed once, at the daemon's composition
-/// edge — see `prospero-daemon`'s `main.rs`).
-pub fn router(manager: FleetManager, fleet: LocalFleet) -> Router {
-    let state = AppState { manager, fleet };
+/// Build the application router over the backend seams (constructed once, at the
+/// daemon's composition edge — see `prospero-daemon`'s `main.rs`).
+pub fn router(
+    fleet: Arc<dyn FleetProvider>,
+    admin: Option<Arc<dyn FleetAdmin>>,
+    store: Arc<dyn Store>,
+    bus: Arc<dyn EventBus>,
+) -> Router {
+    let state = AppState {
+        fleet,
+        admin,
+        store,
+        bus,
+    };
     Router::new()
         // Dashboard.
         .route("/", get(dashboard::index))
