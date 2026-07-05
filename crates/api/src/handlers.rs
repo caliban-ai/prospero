@@ -41,7 +41,10 @@ pub async fn add_workspace(
     State(st): State<AppState>,
     Json(body): Json<AddWorkspaceBody>,
 ) -> Result<StatusCode, ApiError> {
-    let admin = st.admin.as_ref().ok_or_else(ApiError::unsupported_on_backend)?;
+    let admin = st
+        .admin
+        .as_ref()
+        .ok_or_else(ApiError::unsupported_on_backend)?;
     admin
         .add_workspace(body.name, body.root.into(), body.config)
         .await?;
@@ -54,7 +57,10 @@ pub async fn set_workspace_config(
     Path(name): Path<String>,
     Json(body): Json<SetConfigBody>,
 ) -> Result<StatusCode, ApiError> {
-    let admin = st.admin.as_ref().ok_or_else(ApiError::unsupported_on_backend)?;
+    let admin = st
+        .admin
+        .as_ref()
+        .ok_or_else(ApiError::unsupported_on_backend)?;
     admin.set_workspace_config(&name, body.0).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -64,7 +70,10 @@ pub async fn delete_workspace(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let admin = st.admin.as_ref().ok_or_else(ApiError::unsupported_on_backend)?;
+    let admin = st
+        .admin
+        .as_ref()
+        .ok_or_else(ApiError::unsupported_on_backend)?;
     if admin.remove_workspace(&name).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {

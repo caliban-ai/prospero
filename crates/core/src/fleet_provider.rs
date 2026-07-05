@@ -45,8 +45,11 @@ pub trait FleetProvider: Send + Sync {
     /// Steer an interactive agent: deliver an inbound frame to its session
     /// plane (local: over the per-agent Unix socket; k8s: dial the agent's
     /// caliband endpoint over the network). (#76)
-    async fn send_input(&self, id: &AgentId, input: crate::caliband::wire::AttachInbound)
-    -> Result<()>;
+    async fn send_input(
+        &self,
+        id: &AgentId,
+        input: crate::caliband::wire::AttachInbound,
+    ) -> Result<()>;
 }
 
 /// caliband-over-Unix-sockets backend — wraps today's `FleetManager` verbatim.
@@ -164,7 +167,9 @@ impl FleetAdmin for LocalFleet {
         root: std::path::PathBuf,
         config: crate::registry::RepoProviderConfig,
     ) -> Result<()> {
-        self.inner.add_workspace_with_config(name, root, config).await
+        self.inner
+            .add_workspace_with_config(name, root, config)
+            .await
     }
 
     async fn remove_workspace(&self, name: &str) -> Result<bool> {

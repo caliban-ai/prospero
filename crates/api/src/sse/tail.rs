@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use prospero_core::BusEvent;
+use prospero_core::FleetEvent;
 use prospero_core::event::EventKind;
 use prospero_core::store::Store;
-use prospero_core::FleetEvent;
 
 /// One unit the stream forwards to the client.
 #[derive(Debug, Clone, PartialEq)]

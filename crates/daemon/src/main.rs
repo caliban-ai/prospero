@@ -127,8 +127,6 @@ fn heartbeat_interval(explicit_ms: Option<u64>, lease_ttl_secs: f64) -> Duration
     }
 }
 
-/// Fail fast if `backend` cannot actually be served yet.
-///
 /// Default data dir: `$XDG_DATA_HOME/prospero` or `$HOME/.local/share/prospero`.
 fn default_data_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
@@ -246,8 +244,8 @@ async fn main() -> anyhow::Result<()> {
             let client = kube::Client::try_default()
                 .await
                 .with_context(|| "connecting to the Kubernetes API server")?;
-            let ns = std::env::var("PROSPERO_K8S_NAMESPACE")
-                .unwrap_or_else(|_| "default".to_string());
+            let ns =
+                std::env::var("PROSPERO_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
             let api = prospero_core::KubeTaskApi::new(client, &ns);
             let k8s = prospero_core::K8sFleet::new(api, manager.bus(), manager.store());
             tracing::info!(target: "prosperod", backend = "k8s", namespace = %ns, "serving via K8sFleet");

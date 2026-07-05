@@ -725,7 +725,8 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
                 "k8s agent endpoint is not Tcp".to_string(),
             ));
         };
-        let client = CalibandClient::connect_tcp(addr.clone(), self.tls.clone(), self.token.clone());
+        let client =
+            CalibandClient::connect_tcp(addr.clone(), self.tls.clone(), self.token.clone());
         client.send_inbound(&handle.endpoint, &input).await
     }
 }

@@ -1896,6 +1896,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "kube",
  "prospero-api",
  "prospero-core",
  "tokio",
