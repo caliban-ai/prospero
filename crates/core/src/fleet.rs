@@ -539,14 +539,33 @@ impl FleetManager {
         self.inner.emitter.store.prune(&before).await
     }
 
-    /// Register a repo and persist the registry. Triggers an immediate poll.
-    pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
-        self.add_repo_with_config(name, root, Default::default())
+    /// Register a workspace and persist the registry. Triggers an immediate poll.
+    pub async fn add_workspace(
+        &self,
+        name: impl Into<String>,
+        root: impl Into<PathBuf>,
+    ) -> Result<()> {
+        self.add_workspace_with_config(name, root, Default::default())
             .await
     }
 
-    /// Register a repo with an initial provider config.
+    /// Back-compat alias for [`Self::add_workspace`]: a single-repo workspace.
+    pub async fn add_repo(&self, name: impl Into<String>, root: impl Into<PathBuf>) -> Result<()> {
+        self.add_workspace(name, root).await
+    }
+
+    /// Back-compat alias for [`Self::add_workspace_with_config`].
     pub async fn add_repo_with_config(
+        &self,
+        name: impl Into<String>,
+        root: impl Into<PathBuf>,
+        config: crate::registry::RepoProviderConfig,
+    ) -> Result<()> {
+        self.add_workspace_with_config(name, root, config).await
+    }
+
+    /// Register a workspace with an initial provider config.
+    pub async fn add_workspace_with_config(
         &self,
         name: impl Into<String>,
         root: impl Into<PathBuf>,
