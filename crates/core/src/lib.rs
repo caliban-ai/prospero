@@ -14,6 +14,8 @@ pub mod error;
 pub mod event;
 pub mod fleet;
 pub mod fleet_provider;
+#[cfg(feature = "k8s")]
+pub mod k8s;
 pub mod leased_ownership;
 pub mod metrics;
 pub mod model;
@@ -37,6 +39,8 @@ pub use error::{CoreError, Result};
 pub use event::{EventKind, FleetEvent, OutputStream};
 pub use fleet::{FleetConfig, FleetManager, SpawnRequest};
 pub use fleet_provider::{FleetProvider, LocalFleet};
+#[cfg(feature = "k8s")]
+pub use k8s::fleet::{CalibanTaskApi, K8sFleet, KubeTaskApi};
 pub use leased_ownership::LeasedOwnership;
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Repo, RepoHealth};

@@ -7,6 +7,12 @@ edition.workspace = true
 name = "prosperod"
 path = "src/main.rs"
 
+[features]
+# Compile in the `K8sFleet` backend library (crates/core, feature "k8s") so
+# `PROSPERO_FLEET=k8s` can be distinguished as "not wired" rather than "not
+# compiled in". Does NOT make the daemon serve via K8sFleet — see main.rs.
+k8s = ["prospero-core/k8s"]
+
 [dependencies]
 prospero-core.workspace = true
 prospero-api.workspace = true

@@ -8,6 +8,9 @@ edition.workspace = true
 # `rcgen` backs the TCP+TLS fake's self-signed cert; `tempfile` its per-agent
 # socket dir.
 testkit = ["dep:tempfile", "dep:rcgen"]
+# Kubernetes FleetProvider backend (K8sFleet, CalibanTask CR mirror). Pulls
+# `kube`/`k8s-openapi`; `LocalFleet`-only builds stay free of them.
+k8s = ["dep:kube", "dep:k8s-openapi", "dep:schemars"]
 
 [dependencies]
 tokio.workspace = true
@@ -26,9 +29,13 @@ tokio-stream.workspace = true
 async-stream = { workspace = true }
 futures.workspace = true
 tokio-rustls.workspace = true
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 serde_json.workspace = true
 rcgen.workspace = true
+serde_yaml.workspace = true

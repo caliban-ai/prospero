@@ -32,9 +32,9 @@ impl IntoResponse for ApiError {
             CoreError::ProviderMisconfigured(_) => {
                 (StatusCode::BAD_REQUEST, "provider_misconfigured")
             }
-            CoreError::CalibandUnreachable { .. } | CoreError::Discovery(_) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "unreachable")
-            }
+            CoreError::CalibandUnreachable { .. }
+            | CoreError::Discovery(_)
+            | CoreError::Fleet(_) => (StatusCode::SERVICE_UNAVAILABLE, "unreachable"),
             CoreError::Protocol(_) => (StatusCode::BAD_GATEWAY, "protocol"),
             CoreError::Store(_)
             | CoreError::SeqConflict
