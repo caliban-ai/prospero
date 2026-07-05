@@ -53,6 +53,16 @@ pub fn tls_client_from_pem(ca_pem: &[u8], server_name: &str) -> std::io::Result<
             .add(cert.map_err(|e| std::io::Error::other(e.to_string()))?)
             .map_err(std::io::Error::other)?;
     }
+    // A trust store with zero certs can never validate a peer — it always
+    // silently rejects. That only happens when `ca_pem` held no CERTIFICATE PEM
+    // block (an empty or garbage file), which is a misconfiguration; surface it
+    // as an error rather than a useless-but-`Ok` client.
+    if roots.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no certificates found in CA PEM",
+        ));
+    }
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
