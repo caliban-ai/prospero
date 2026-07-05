@@ -68,3 +68,4 @@ supersedes the old one, and update the old one's status to
 | [0006](0006-layered-crate-boundaries.md) | Layered crate boundaries: cli/daemon → api → core | accepted |
 | [0007](0007-fake-caliban-test-harness.md) | Test the control plane against an in-process fake caliban | accepted |
 | [0008](0008-k8s-fleet-backend.md) | `K8sFleet` — a Kubernetes `FleetProvider` backend (CalibanTask CRs; session plane over #71/#75 transport) | accepted |
+| [0009](0009-agpl-3.0-only-license.md) | License prospero under AGPL-3.0-only | accepted |
