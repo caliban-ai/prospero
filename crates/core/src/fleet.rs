@@ -101,6 +101,28 @@ pub struct FleetConfig {
     pub default_env: std::collections::BTreeMap<String, String>,
     /// Reconnection backoff for a dropped per-agent attach stream.
     pub attach_backoff: AttachBackoff,
+    /// Optional network transport for caliband (ADR 0051): when `Some`, the
+    /// manager dials this TCP endpoint over TLS + bearer token instead of
+    /// resolving a local Unix control socket. This is the threading seam for
+    /// #71; production *discovery* of a per-workspace endpoint
+    /// (env/Secret/Sandbox-DNS) is deferred to prospero #64/#72.
+    pub caliband_network: Option<CalibandNetworkConfig>,
+}
+
+/// Materials to dial a caliband control endpoint over TCP + rustls TLS + a
+/// bearer token (ADR 0051). PEM bytes rather than a built `TlsClient` so the
+/// config stays cloneable/`Debug` and mirrors how an operator would carry it
+/// (a mounted Secret).
+#[derive(Debug, Clone)]
+pub struct CalibandNetworkConfig {
+    /// `host:port` of the caliband control endpoint.
+    pub addr: String,
+    /// PEM the client trusts (the CA, or a self-signed server cert).
+    pub ca_pem: Vec<u8>,
+    /// Expected server name (SNI / cert validation target).
+    pub server_name: String,
+    /// Bearer token presented after the TLS handshake. `None` = no token.
+    pub token: Option<String>,
 }
 
 /// Bounded exponential-backoff policy for reconnecting a dropped attach stream.
@@ -162,6 +184,26 @@ impl FleetConfig {
             event_buffer: 1024,
             default_env: std::collections::BTreeMap::new(),
             attach_backoff: AttachBackoff::default(),
+            caliband_network: None,
+        }
+    }
+
+    /// Build the network control client when [`Self::caliband_network`] is set,
+    /// else `None` (the caller falls back to Unix discovery). The single
+    /// threading seam for #71 — one networked caliband for the manager;
+    /// per-workspace endpoint resolution is prospero #64/#72.
+    fn network_client(&self) -> Result<Option<CalibandClient>> {
+        match &self.caliband_network {
+            None => Ok(None),
+            Some(net) => {
+                let tls =
+                    crate::caliband::transport::tls_client_from_pem(&net.ca_pem, &net.server_name)?;
+                Ok(Some(CalibandClient::connect_tcp(
+                    net.addr.clone(),
+                    Some(tls),
+                    net.token.clone(),
+                )))
+            }
         }
     }
 }
@@ -590,6 +632,17 @@ impl FleetManager {
     async fn client_for(&self, repo: &str) -> Result<CalibandClient> {
         if let Some(c) = self.inner.clients.lock().unwrap().get(repo).cloned() {
             return Ok(c);
+        }
+        // Network transport (ADR 0051): when configured, dial the caliband over
+        // TCP+TLS+token instead of resolving a local Unix socket. Cached per repo
+        // like the Unix client.
+        if let Some(client) = self.inner.config.network_client()? {
+            self.inner
+                .clients
+                .lock()
+                .unwrap()
+                .insert(repo.to_string(), client.clone());
+            return Ok(client);
         }
         let root = {
             let reg = self.inner.registry.read().await;
@@ -1397,6 +1450,25 @@ async fn attach_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_config_network_yields_tcp_client() {
+        // The #71 threading seam: a config carrying network materials builds a
+        // TCP client; without it, the Unix path is unchanged (network_client None).
+        let plain = FleetConfig::new("local", std::path::Path::new("/tmp/x"));
+        assert!(plain.network_client().unwrap().is_none());
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut cfg = FleetConfig::new("local", std::path::Path::new("/tmp/x"));
+        cfg.caliband_network = Some(CalibandNetworkConfig {
+            addr: "h:9443".into(),
+            ca_pem: cert.cert.pem().into_bytes(),
+            server_name: "localhost".into(),
+            token: Some("t".into()),
+        });
+        let client = cfg.network_client().unwrap().expect("network client");
+        assert!(matches!(client.endpoint(), Endpoint::Tcp { .. }));
+    }
 
     #[test]
     fn attach_backoff_is_exponential_capped_and_jittered() {

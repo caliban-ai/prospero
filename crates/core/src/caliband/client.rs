@@ -269,12 +269,7 @@ mod tests {
         let sock = dir.path().join("ctl.sock");
         let mut fake = FakeCaliband::start_at(&sock).await.unwrap();
         let client = CalibandClient::new(&sock);
-        assert_eq!(
-            client.endpoint(),
-            &Endpoint::Unix {
-                path: sock.clone()
-            }
-        );
+        assert_eq!(client.endpoint(), &Endpoint::Unix { path: sock.clone() });
 
         let (id, _endpoint) = client.spawn(test_spec()).await.unwrap();
         assert!(client.list().await.unwrap().iter().any(|a| a.id == id));
@@ -305,5 +300,43 @@ mod tests {
             client.list().await.unwrap_err(),
             CoreError::CalibandUnreachable { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn client_round_trips_over_tcp_tls_token() {
+        use crate::testkit::FakeCaliband;
+        let (fake, fixture) = FakeCaliband::start_tcp_tls("s3cr3t").await.unwrap();
+        let tls =
+            crate::caliband::transport::tls_client_from_pem(&fixture.ca_pem, "localhost").unwrap();
+        let client =
+            CalibandClient::connect_tcp(fixture.addr.clone(), Some(tls), Some("s3cr3t".into()));
+        assert!(matches!(client.endpoint(), Endpoint::Tcp { .. }));
+
+        let (id, _ep) = client.spawn(test_spec()).await.unwrap();
+        assert!(client.list().await.unwrap().iter().any(|a| a.id == id));
+        let _ = client.attach(&id).await.unwrap();
+        assert!(client.status().await.unwrap().agents >= 1);
+        client.kill(&id).await.unwrap();
+        client.shutdown().await.unwrap();
+        let _ = fake;
+    }
+
+    #[tokio::test]
+    async fn client_rejects_bad_token_over_tcp() {
+        use crate::testkit::FakeCaliband;
+        let (fake, fixture) = FakeCaliband::start_tcp_tls("right").await.unwrap();
+        let tls =
+            crate::caliband::transport::tls_client_from_pem(&fixture.ca_pem, "localhost").unwrap();
+        let client =
+            CalibandClient::connect_tcp(fixture.addr.clone(), Some(tls), Some("wrong".into()));
+        // The server rejects the token at accept-time and drops the connection,
+        // which surfaces on the client as a failed dial (CalibandUnreachable), a
+        // clean EOF before any reply (Protocol), or a mid-write connection reset
+        // over TLS (Io) — any of which correctly denies the bad token.
+        assert!(matches!(
+            client.list().await.unwrap_err(),
+            CoreError::CalibandUnreachable { .. } | CoreError::Protocol(_) | CoreError::Io(_)
+        ));
+        let _ = fake;
     }
 }

@@ -234,9 +234,7 @@ mod server {
         pub fn local_addr(&self) -> Option<String> {
             match self {
                 Listener::Unix(_) => None,
-                Listener::Tcp { listener, .. } => {
-                    listener.local_addr().ok().map(|a| a.to_string())
-                }
+                Listener::Tcp { listener, .. } => listener.local_addr().ok().map(|a| a.to_string()),
             }
         }
 

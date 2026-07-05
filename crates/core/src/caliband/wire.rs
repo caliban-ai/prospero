@@ -274,10 +274,7 @@ mod tests {
             Some(std::path::Path::new("/x.sock"))
         );
         assert_eq!(
-            Endpoint::Tcp {
-                addr: "h:1".into()
-            }
-            .unix_socket_path(),
+            Endpoint::Tcp { addr: "h:1".into() }.unix_socket_path(),
             None
         );
     }
@@ -404,7 +401,8 @@ mod tests {
 
     #[test]
     fn spawned_reply_parses() {
-        let json = r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"unix","path":"/tmp/a1.sock"}}"#;
+        let json =
+            r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"unix","path":"/tmp/a1.sock"}}"#;
         let r: CtlReply = serde_json::from_str(json).unwrap();
         assert_eq!(
             r,
