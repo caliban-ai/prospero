@@ -135,11 +135,11 @@ async fn cli_drives_the_full_stack() {
     );
 
     // `repo config` sets the per-repo provider end-to-end (kept last: it restarts
-    // caliband). Verify the daemon persisted it via /api/repos.
+    // caliband). Verify the daemon persisted it via /api/workspaces.
     let (ok, out) = run_cli(
         &base,
         &[
-            "repo",
+            "workspace",
             "config",
             "repo",
             "--provider",
@@ -154,7 +154,7 @@ async fn cli_drives_the_full_stack() {
         "config output: {out}"
     );
 
-    let repos_url = format!("{base}/api/repos");
+    let repos_url = format!("{base}/api/workspaces");
     let repos: serde_json::Value =
         tokio::task::spawn_blocking(move || ureq::get(&repos_url).call().unwrap().into_json())
             .await

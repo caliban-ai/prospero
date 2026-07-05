@@ -12,13 +12,13 @@ const modalRoot = document.getElementById("modal-root");
 
 let selectedAgent = null;
 let evtSource = null;
-let healthyRepos = []; // names of reachable repos, for the launch picker
+let healthyWorkspaces = []; // names of reachable repos, for the launch picker
 let lastFleet = null; // most recent fleet snapshot, for stream-head lookups
 let streamCtx = null; // { id, name, status, model, cost, turns } for the streamed agent
 
 function findAgent(id) {
   if (!lastFleet) return null;
-  for (const r of lastFleet.repos) {
+  for (const r of lastFleet.workspaces) {
     for (const a of r.agents) if (a.id === id) return a;
   }
   return null;
@@ -82,9 +82,9 @@ function closeModal() {
 function openAddRepoModal() {
   const form = document.createElement("div");
   form.innerHTML =
-    `<div class="form-title">add repo</div>` +
-    `<label class="fl">name<input class="in" id="ar-name" placeholder="my-repo"></label>` +
-    `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/repo"></label>`;
+    `<div class="form-title">add workspace</div>` +
+    `<label class="fl">name<input class="in" id="ar-name" placeholder="my-workspace"></label>` +
+    `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/workspace"></label>`;
   openModal(form);
   appendProviderFields(form, {});
   const err = document.createElement("div");
@@ -106,7 +106,7 @@ function openAddRepoModal() {
     if (!name || !root) { err.textContent = "name and path are required"; return; }
     submit.disabled = true;
     try {
-      await api("POST", "/api/repos", { name, root, config: readProviderConfig(form) });
+      await api("POST", "/api/workspaces", { name, root, config: readProviderConfig(form) });
       closeModal();
       refreshFleet();
     } catch (e) {
@@ -183,7 +183,7 @@ function readProviderConfig(form) {
 async function openRepoSettings(repo) {
   let cfg = {};
   try {
-    const repos = await api("GET", "/api/repos");
+    const repos = await api("GET", "/api/workspaces");
     const found = (repos || []).find((r) => r.name === repo.name);
     cfg = (found && found.config) || {};
   } catch (e) { showBanner(String(e.message || e)); return; }
@@ -209,7 +209,7 @@ async function openRepoSettings(repo) {
     }
     save.disabled = true;
     try {
-      await api("PUT", `/api/repos/${encodeURIComponent(repo.name)}/config`, readProviderConfig(form));
+      await api("PUT", `/api/workspaces/${encodeURIComponent(repo.name)}/config`, readProviderConfig(form));
       closeModal();
       refreshFleet();
     } catch (e) {
@@ -225,7 +225,7 @@ function openLaunchModal(repoName) {
   const form = document.createElement("div");
   form.innerHTML =
     `<div class="form-title">launch agent</div>` +
-    `<label class="fl">repo<select class="in" id="la-repo"></select></label>` +
+    `<label class="fl">workspace<select class="in" id="la-repo"></select></label>` +
     `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
     `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
     `<label class="chk"><input type="checkbox" id="la-interactive"> interactive (awaits your input)</label>` +
@@ -245,7 +245,7 @@ function openLaunchModal(repoName) {
   // whose launch button was clicked. Options are built via the DOM so repo
   // names are never interpolated into markup.
   const repoSel = form.querySelector("#la-repo");
-  for (const r of healthyRepos) {
+  for (const r of healthyWorkspaces) {
     const opt = document.createElement("option");
     opt.value = r;
     opt.textContent = r;
@@ -267,7 +267,7 @@ function openLaunchModal(repoName) {
     const prompt = form.querySelector("#la-task").value.trim();
     const err = form.querySelector("#la-err");
     err.textContent = "";
-    if (!repo || !prompt) { err.textContent = "repo and task are required"; return; }
+    if (!repo || !prompt) { err.textContent = "workspace and task are required"; return; }
 
     const body = { prompt };
     if (!form.querySelector("#la-wt").checked) body.isolation = "shared";
@@ -281,7 +281,7 @@ function openLaunchModal(repoName) {
 
     submit.disabled = true;
     try {
-      const res = await api("POST", `/api/repos/${encodeURIComponent(repo)}/agents`, body);
+      const res = await api("POST", `/api/workspaces/${encodeURIComponent(repo)}/agents`, body);
       closeModal();
       if (res && res.agent_id) selectAgent(res.agent_id);
       else refreshFleet();
@@ -358,15 +358,15 @@ function agentMeta(agent) {
 
 function renderFleet(fleet) {
   lastFleet = fleet;
-  healthyRepos = fleet.repos
+  healthyWorkspaces = fleet.workspaces
     .filter((r) => r.health.state === "healthy")
     .map((r) => r.name);
-  const agentTotal = fleet.repos.reduce((n, r) => n + r.agents.length, 0);
-  const rc = fleet.repos.length;
+  const agentTotal = fleet.workspaces.reduce((n, r) => n + r.agents.length, 0);
+  const rc = fleet.workspaces.length;
   document.getElementById("fleet-count").textContent =
-    `fleet · ${rc} repo${rc === 1 ? "" : "s"} · ${agentTotal} agent${agentTotal === 1 ? "" : "s"}`;
-  if (!fleet.repos.length) {
-    fleetListEl.innerHTML = `<div class="muted">no repos registered</div>`;
+    `fleet ·  workspace · ${agentTotal} agent${agentTotal === 1 ? "" : "s"}`;
+  if (!fleet.workspaces.length) {
+    fleetListEl.innerHTML = `<div class="muted">no workspaces registered</div>`;
     return;
   }
   // Preserve in-progress agent-input typing across this poll rebuild.
@@ -381,7 +381,7 @@ function renderFleet(fleet) {
     }
   }
   fleetListEl.innerHTML = "";
-  for (const repo of fleet.repos) {
+  for (const repo of fleet.workspaces) {
     const box = document.createElement("div");
     box.className = "repo";
     const healthy = repo.health.state === "healthy";
@@ -401,8 +401,8 @@ function renderFleet(fleet) {
     gear.onclick = () => openRepoSettings(repo);
     acts.appendChild(gear);
     acts.appendChild(actionBtn("remove", "danger", (b) =>
-      rowAction("DELETE", `/api/repos/${encodeURIComponent(repo.name)}`,
-                `Remove repo ${repo.name}?`, b)));
+      rowAction("DELETE", `/api/workspaces/${encodeURIComponent(repo.name)}`,
+                `Remove workspace ${repo.name}?`, b)));
     head.appendChild(acts);
     box.appendChild(head);
 
@@ -410,6 +410,14 @@ function renderFleet(fleet) {
     health.className = `health ${healthy ? "healthy" : "unreachable"}`;
     health.textContent = healthTxt;
     box.appendChild(health);
+
+    const sourceNames = (repo.sources || []).map((s) => s.name);
+    if (sourceNames.length) {
+      const src = document.createElement("div");
+      src.className = "sources";
+      src.textContent = `sources: ${sourceNames.join(", ")}`;
+      box.appendChild(src);
+    }
 
     if (healthy) {
       const launch = document.createElement("button");

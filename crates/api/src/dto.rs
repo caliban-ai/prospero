@@ -16,11 +16,11 @@ pub struct AddWorkspaceBody {
     pub config: RepoProviderConfig,
 }
 
-/// Body for `PUT /api/repos/{name}/config`.
+/// Body for `PUT /api/workspaces/{name}/config`.
 #[derive(Debug, Deserialize)]
 pub struct SetConfigBody(pub RepoProviderConfig);
 
-/// Body for `POST /api/repos/{repo}/agents`.
+/// Body for `POST /api/workspaces/{repo}/agents`.
 #[derive(Debug, Deserialize)]
 pub struct SpawnBody {
     /// Initial prompt / task.
