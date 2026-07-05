@@ -24,7 +24,7 @@ concurrency:
 # rotting behind an unbuilt feature gate. A separate lean-build step below
 # guarantees the DEFAULT build still pulls no kube.
 env:
-  TESTKIT: "--features prospero-core/testkit,prospero-core/k8s"
+  TESTKIT: "--features prospero-core/testkit,prospero-core/k8s,prospero-api/k8s"
 
 jobs:
   check:

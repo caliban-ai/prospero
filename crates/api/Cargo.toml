@@ -3,6 +3,13 @@ name = "prospero-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enables the k8s-backend integration test (`tests/k8s_backend.rs`), which needs
+# prospero-core's `k8s` module. Gated behind a feature so the coverage build
+# (prospero-core/testkit only, no k8s) still compiles; CI's test gate turns it on
+# (see ci.yml `TESTKIT`). (#76)
+k8s = ["prospero-core/k8s"]
+
 [dependencies]
 prospero-core.workspace = true
 axum.workspace = true

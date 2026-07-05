@@ -2,8 +2,10 @@
 //! non-Unix backend serves the read path via the `FleetProvider` seam and that
 //! the workspace-registry routes (`FleetAdmin`, absent under k8s) return 405.
 //!
-//! Requires the `prospero-core/testkit` + `prospero-core/k8s` features (CI
-//! passes both), same as `api_integration.rs` requires `testkit`.
+//! Gated on the `prospero-api/k8s` feature (which pulls in `prospero-core/k8s`),
+//! so the testkit-only coverage build compiles without it. CI's test gate
+//! enables it via `TESTKIT`.
+#![cfg(feature = "k8s")]
 
 use std::sync::Arc;
 
