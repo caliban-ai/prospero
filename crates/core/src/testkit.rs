@@ -506,23 +506,51 @@ async fn spawn_tcp_stream_listener(
         },
         tls: Some(tls_server_from_pem(cert_pem, key_pem).expect("server tls")),
         // No token check on the stream leg; the client may still send one (its
-        // control token), which this listener simply never reads — it only
-        // writes frames. The bytes sit unread and harmless.
+        // control token). The accept loop below drains those inbound bytes
+        // concurrently so they don't linger unread in the receive buffer — an
+        // unread buffer would make a Linux `close()` emit a RST that truncates
+        // the frames we're writing (see the accept loop's drain comment).
         token: None,
     })
     .await
     .expect("bind per-agent tcp stream listener");
     let addr = listener.local_addr().expect("tcp stream addr");
     let task = tokio::spawn(async move {
-        while let Ok(mut conn) = listener.accept().await {
+        use tokio::io::AsyncReadExt as _;
+        while let Ok(conn) = listener.accept().await {
+            // Split so we can DRAIN the client's inbound bytes concurrently
+            // with writing frames. The client's `open_stream` sends a bearer
+            // preamble (`client_send_token`) that this listener declares no
+            // token for and so never reads. If those bytes sat unread in the
+            // socket's receive buffer when we close, Linux answers `close()`
+            // with a TCP **RST** instead of a FIN, which discards the frames
+            // still in flight to the client — truncating the stream and
+            // hanging the reader (macOS closes gracefully, hiding this). A
+            // concurrent drain keeps the receive buffer empty so the close is
+            // a clean FIN on every platform.
+            let (mut rd, mut wr) = tokio::io::split(conn);
+            let drain = tokio::spawn(async move {
+                let mut scratch = [0u8; 256];
+                while let Ok(n) = rd.read(&mut scratch).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                rd // hold the read half open until writing is done
+            });
             for frame in &script {
                 let mut line = serde_json::to_vec(frame).unwrap();
                 line.push(b'\n');
-                if conn.write_all(&line).await.is_err() {
+                if wr.write_all(&line).await.is_err() {
                     break;
                 }
             }
-            let _ = conn.flush().await;
+            let _ = wr.flush().await;
+            // Clean half-close: FIN/close_notify so the client reads a proper
+            // end-of-stream, then release the drain so the connection drops
+            // with nothing unread.
+            let _ = wr.shutdown().await;
+            drain.abort();
         }
     });
     (addr, task)
