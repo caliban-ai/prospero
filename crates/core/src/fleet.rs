@@ -24,7 +24,9 @@ use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
-use crate::model::{Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, Workspace, WorkspaceHealth};
+use crate::model::{
+    Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, Workspace, WorkspaceHealth,
+};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
 use crate::store::Store;

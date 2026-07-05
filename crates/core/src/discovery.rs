@@ -76,7 +76,10 @@ pub fn control_socket_path(workspace_root_canonical: &Path, env: &DiscoveryEnv) 
 /// waits forever. (#45)
 pub fn canonical_root(workspace_root: &Path) -> Result<PathBuf> {
     workspace_root.canonicalize().map_err(|e| {
-        CoreError::Discovery(format!("cannot canonicalize {}: {e}", workspace_root.display()))
+        CoreError::Discovery(format!(
+            "cannot canonicalize {}: {e}",
+            workspace_root.display()
+        ))
     })
 }
 

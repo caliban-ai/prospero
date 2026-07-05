@@ -430,14 +430,22 @@ async fn poll_refreshes_registry_from_shared_config_store() {
 
     // B loaded its registry at startup (before the add) so it can't see it yet.
     assert!(
-        b.snapshot().await.workspaces.iter().all(|r| r.name != "shared"),
+        b.snapshot()
+            .await
+            .workspaces
+            .iter()
+            .all(|r| r.name != "shared"),
         "B should not see the peer's repo before refreshing"
     );
 
     // A poll refreshes B's registry from the shared store, surfacing the repo.
     b.poll_all_once().await;
     assert!(
-        b.snapshot().await.workspaces.iter().any(|r| r.name == "shared"),
+        b.snapshot()
+            .await
+            .workspaces
+            .iter()
+            .any(|r| r.name == "shared"),
         "B must pick up the peer-registered repo after a poll, without a restart"
     );
 }

@@ -998,7 +998,11 @@ mod tests {
             .expect("watch_fleet stream ended unexpectedly");
 
         match change {
-            FleetChange::Discovered { id, workspace: repo, agent } => {
+            FleetChange::Discovered {
+                id,
+                workspace: repo,
+                agent,
+            } => {
                 assert_eq!(id, AgentId::from(name.clone()));
                 assert_eq!(repo, "repo-a");
                 assert_eq!(agent.status, AgentStatus::Running);
@@ -1031,7 +1035,11 @@ mod tests {
             .expect("timed out waiting for the live Discovered")
             .expect("watch_fleet stream ended unexpectedly");
         match discovered {
-            FleetChange::Discovered { id, workspace: repo, agent } => {
+            FleetChange::Discovered {
+                id,
+                workspace: repo,
+                agent,
+            } => {
                 assert_eq!(id, AgentId::from(name.clone()));
                 assert_eq!(repo, "repo-a");
                 // No status yet (fresh apply, no phase) -> Spawning.
@@ -1048,7 +1056,11 @@ mod tests {
             .expect("watch_fleet stream ended unexpectedly");
         match status_changed {
             FleetChange::StatusChanged {
-                id, workspace: repo, from, to, ..
+                id,
+                workspace: repo,
+                from,
+                to,
+                ..
             } => {
                 assert_eq!(id, AgentId::from(name));
                 assert_eq!(repo, "repo-a");
@@ -1090,7 +1102,10 @@ mod tests {
             .expect("timed out waiting for Gone")
             .expect("watch_fleet stream ended unexpectedly");
         match gone {
-            FleetChange::Gone { id, workspace: repo } => {
+            FleetChange::Gone {
+                id,
+                workspace: repo,
+            } => {
                 assert_eq!(id, AgentId::from(name));
                 assert_eq!(repo, "repo-a");
             }

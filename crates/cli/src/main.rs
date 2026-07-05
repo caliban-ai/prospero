@@ -197,7 +197,8 @@ fn main() -> Result<()> {
             if !a.tool_allowlist.is_empty() {
                 body["tool_allowlist"] = a.tool_allowlist.into();
             }
-            let resp = client.post_json(&format!("/api/workspaces/{}/agents", a.workspace), body)?;
+            let resp =
+                client.post_json(&format!("/api/workspaces/{}/agents", a.workspace), body)?;
             let id = resp.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
             let isolated = resp
                 .get("isolated")

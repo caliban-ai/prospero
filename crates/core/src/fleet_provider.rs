@@ -350,4 +350,57 @@ mod local_fleet_tests {
         provider.manager().begin_shutdown();
         let _ = fake;
     }
+
+    /// #72 acceptance: a workspace whose root holds **two** source checkouts
+    /// registers both sources and drives the single caliband keyed on the
+    /// workspace root; agents surface through that one control socket.
+    #[tokio::test]
+    async fn workspace_with_two_sources_drives_one_caliband() {
+        use crate::testkit::test_record;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("alpha/.git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("beta/.git")).unwrap();
+
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        // The one caliband is keyed on the (canonical) workspace root.
+        let socket = crate::discovery::resolve_socket(dir.path(), &config.discovery_env).unwrap();
+        let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+        let store = Arc::new(JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store).await.unwrap();
+
+        mgr.add_workspace("ws", dir.path()).await.unwrap();
+
+        // Both source checkouts discovered under the workspace root.
+        {
+            let snap = mgr.snapshot().await;
+            let ws = snap.workspaces.iter().find(|w| w.name == "ws").unwrap();
+            assert_eq!(
+                ws.sources
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["alpha", "beta"],
+                "workspace enumerates its two sources"
+            );
+        }
+
+        // An agent (whichever source it runs in) surfaces via the one caliband.
+        let canon = crate::discovery::canonical_root(dir.path()).unwrap();
+        fake.add_agent(
+            test_record("a1", &canon, crate::model::AgentStatus::Running, false),
+            Vec::new(),
+        )
+        .await;
+        mgr.poll_repo_once("ws").await;
+        let snap = mgr.snapshot().await;
+        assert!(
+            snap.find_agent("a1").is_some(),
+            "agent observed through the single workspace caliband"
+        );
+
+        mgr.begin_shutdown();
+    }
 }
