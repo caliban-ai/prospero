@@ -62,6 +62,12 @@ pub enum CoreError {
     #[error("provider misconfigured: {0}")]
     ProviderMisconfigured(String),
 
+    /// A `FleetProvider` backend's own control-plane operation failed (e.g.
+    /// `K8sFleet`'s `kube` CRUD/apply against `CalibanTask`, or its
+    /// wait-for-`Running` deadline).
+    #[error("fleet backend error: {0}")]
+    Fleet(String),
+
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -125,6 +131,10 @@ mod tests {
         assert_eq!(
             CoreError::RepoNotFound("r".into()).to_string(),
             "repo not registered: r"
+        );
+        assert_eq!(
+            CoreError::Fleet("timed out".into()).to_string(),
+            "fleet backend error: timed out"
         );
     }
 

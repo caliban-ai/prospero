@@ -4,3 +4,4 @@
 //! See [ADR 0008](../../../../docs/adr/0008-k8s-fleet-backend.md).
 
 pub mod crd;
+pub mod fleet;
