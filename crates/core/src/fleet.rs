@@ -564,9 +564,7 @@ impl FleetManager {
     /// Delete persisted events older than `max_age`. Returns the count removed.
     /// Backs the daemon's age-based retention loop (#4).
     pub async fn prune_older_than(&self, max_age: std::time::Duration) -> Result<u64> {
-        let max = chrono::Duration::from_std(max_age).unwrap_or_else(|_| chrono::Duration::zero());
-        let before = (chrono::Utc::now() - max).to_rfc3339();
-        self.inner.emitter.store.prune(&before).await
+        crate::store::prune_store_older_than(self.inner.emitter.store.as_ref(), max_age).await
     }
 
     /// Register a workspace and persist the registry. Triggers an immediate poll.

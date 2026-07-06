@@ -51,6 +51,19 @@ pub trait Store: Send + Sync {
     async fn prune(&self, before_ts: &str) -> Result<u64>;
 }
 
+/// Delete events older than `max_age` from `store`, returning the count
+/// removed. The daemon's age-based retention policy (#4), factored out of
+/// [`crate::fleet::FleetManager::prune_older_than`] so the k8s arm — which
+/// builds no `FleetManager` (#83) — can prune off the shared store too.
+pub async fn prune_store_older_than(
+    store: &dyn Store,
+    max_age: std::time::Duration,
+) -> Result<u64> {
+    let max = chrono::Duration::from_std(max_age).unwrap_or_else(|_| chrono::Duration::zero());
+    let before = (chrono::Utc::now() - max).to_rfc3339();
+    store.prune(&before).await
+}
+
 /// Append-only JSON-lines store. All events go to a single `events.jsonl`;
 /// replay filters by stream key. Simple and debuggable for the first stab; rotation
 /// and per-agent sharding are deferred.
@@ -189,6 +202,28 @@ mod tests {
                 chunk: chunk.into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn prune_store_older_than_removes_only_aged_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        // One event ~2h old, one ~now (real RFC3339-UTC so lexical == chrono).
+        let mut e_old = ev(1, "a", "old");
+        e_old.ts = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let mut e_new = ev(2, "a", "new");
+        e_new.ts = chrono::Utc::now().to_rfc3339();
+        store.append(&e_old).await.unwrap();
+        store.append(&e_new).await.unwrap();
+
+        // Prune everything older than 1h ⇒ only the 2h-old event goes.
+        let removed = prune_store_older_than(&store, std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        let left = store.replay("a", 0).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].seq, 2);
     }
 
     #[tokio::test]
