@@ -160,18 +160,33 @@ async fn cli_drives_the_full_stack() {
         "config output: {out}"
     );
 
+    // `/api/workspaces` serves the poll-refreshed snapshot, so the just-set
+    // config becomes visible eventually (typically within a poll cycle), not
+    // necessarily on the very next read — the workspace also legitimately goes
+    // `unreachable` here because the config change restarted its caliband. Poll
+    // for the provider to appear rather than asserting a single immediate read
+    // (prospero #85 — the underlying registry clobber is fixed in core; this
+    // keeps the e2e robust to the endpoint's eventual-consistency).
     let repos_url = format!("{base}/api/workspaces");
-    let repos: serde_json::Value =
-        tokio::task::spawn_blocking(move || ureq::get(&repos_url).call().unwrap().into_json())
-            .await
-            .unwrap()
-            .unwrap();
-    let cfg = &repos.as_array().unwrap()[0]["config"];
-    assert_eq!(
-        cfg["provider"].as_str(),
-        Some("ollama"),
-        "repo config must persist the provider end-to-end: {repos}"
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let cfg = loop {
+        let url = repos_url.clone();
+        let repos: serde_json::Value =
+            tokio::task::spawn_blocking(move || ureq::get(&url).call().unwrap().into_json())
+                .await
+                .unwrap()
+                .unwrap();
+        let cfg = repos.as_array().unwrap()[0]["config"].clone();
+        if cfg["provider"].as_str() == Some("ollama") {
+            break cfg;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "repo config never became visible via /api/workspaces: {repos}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(cfg["provider"].as_str(), Some("ollama"));
     assert_eq!(cfg["base_url"].as_str(), Some("http://h:11434"));
 }
 

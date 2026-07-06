@@ -688,15 +688,19 @@ impl FleetManager {
         repo: &str,
         config: crate::registry::RepoProviderConfig,
     ) -> Result<()> {
-        let record = {
-            let mut reg = self.inner.registry.write().await;
-            if !reg.set_config(repo, config) {
-                return Err(CoreError::WorkspaceNotFound(repo.to_string()));
-            }
-            reg.get(repo)
-                .cloned()
-                .expect("repo exists after successful set_config")
-        };
+        // Hold the registry write lock across the durable upsert so a concurrent
+        // `refresh_registry_from_store` (poll loop) cannot read stale durable
+        // state and clobber this write back. The registry RwLock is async, so
+        // awaiting the config-store write under the guard is sound; config stores
+        // never re-enter the registry lock, so there's no inversion (prospero #85).
+        let mut reg = self.inner.registry.write().await;
+        if !reg.set_config(repo, config) {
+            return Err(CoreError::WorkspaceNotFound(repo.to_string()));
+        }
+        let record = reg
+            .get(repo)
+            .cloned()
+            .expect("repo exists after successful set_config");
         self.inner.config_store.upsert_repo(&record).await?;
         Ok(())
     }
@@ -954,20 +958,26 @@ impl FleetManager {
     /// their health/agents. A read failure leaves the cached view intact. For
     /// standalone (single writer) this is a cheap, idempotent no-op. (#50)
     async fn refresh_registry_from_store(&self) {
-        let durable = match self.inner.config_store.list_repos().await {
-            Ok(repos) => repos,
-            Err(e) => {
-                tracing::warn!(
-                    target: "prospero_fleet", error = %e,
-                    "registry refresh from config store failed; keeping cached view"
-                );
-                return;
-            }
-        };
-        {
+        // Read durable state and wholesale-replace the in-memory registry
+        // atomically under the write lock, so a concurrent
+        // `set_repo_config_registry_only` can't interleave and get clobbered by a
+        // stale durable read (prospero #85). Costs one config-store read per poll
+        // held under the registry lock — sub-ms standalone, a few ms clustered.
+        let durable = {
             let mut reg = self.inner.registry.write().await;
+            let durable = match self.inner.config_store.list_repos().await {
+                Ok(repos) => repos,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "prospero_fleet", error = %e,
+                        "registry refresh from config store failed; keeping cached view"
+                    );
+                    return;
+                }
+            };
             reg.workspaces = durable.clone();
-        }
+            durable
+        };
         let mut snap = self.inner.snapshot.write().await;
         snap.workspaces
             .retain(|r| durable.iter().any(|d| d.name == r.name));
@@ -1530,6 +1540,88 @@ async fn attach_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A ConfigStore whose `list_repos` snapshots its state, THEN sleeps (opening
+    // the exact read-after-write window), returning the pre-sleep snapshot. Lets
+    // a test deterministically interleave a `set_config` inside a
+    // `refresh_registry_from_store`'s durable read (prospero #85).
+    struct SlowListConfigStore {
+        repos: std::sync::Mutex<Vec<crate::registry::RegisteredWorkspace>>,
+        read_delay: Duration,
+    }
+    impl SlowListConfigStore {
+        fn new(read_delay: Duration) -> Self {
+            Self {
+                repos: std::sync::Mutex::new(Vec::new()),
+                read_delay,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::config_store::ConfigStore for SlowListConfigStore {
+        async fn list_repos(&self) -> Result<Vec<crate::registry::RegisteredWorkspace>> {
+            let snapshot = self.repos.lock().unwrap().clone(); // read BEFORE the delay
+            tokio::time::sleep(self.read_delay).await; // window for a concurrent set_config
+            Ok(snapshot)
+        }
+        async fn upsert_repo(&self, repo: &crate::registry::RegisteredWorkspace) -> Result<()> {
+            let mut v = self.repos.lock().unwrap();
+            if let Some(e) = v.iter_mut().find(|e| e.name == repo.name) {
+                *e = repo.clone();
+            } else {
+                v.push(repo.clone());
+            }
+            Ok(())
+        }
+        async fn delete_repo(&self, name: &str) -> Result<bool> {
+            let mut v = self.repos.lock().unwrap();
+            let before = v.len();
+            v.retain(|e| e.name != name);
+            Ok(v.len() != before)
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_does_not_clobber_a_just_set_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.ensure.autostart = false;
+        let root = dir.path().join("r");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let cfg_store: Arc<dyn crate::config_store::ConfigStore> =
+            Arc::new(SlowListConfigStore::new(Duration::from_millis(150)));
+        let mgr = FleetManager::with_config_store(config, store, cfg_store)
+            .await
+            .unwrap();
+        mgr.add_repo("r", &root).await.unwrap(); // registry + durable hold r, config {}
+
+        // Kick off a poll-style refresh; with the fix it holds the registry lock
+        // across the slow list_repos, so the set_config below serializes after it.
+        let m = mgr.clone();
+        let refresh = tokio::spawn(async move { m.refresh_registry_from_store().await });
+
+        // Let refresh get into list_repos, then set the config mid-flight.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let cfg = crate::registry::RepoProviderConfig {
+            provider: Some("ollama".to_string()),
+            ..Default::default()
+        };
+        mgr.set_repo_config_registry_only("r", cfg).await.unwrap();
+        refresh.await.unwrap();
+
+        // The just-set config must survive the concurrent refresh.
+        let snap = mgr.snapshot().await;
+        let repo = snap.workspaces.iter().find(|w| w.name == "r").unwrap();
+        assert_eq!(
+            repo.config.provider.as_deref(),
+            Some("ollama"),
+            "refresh clobbered a concurrent set_config back to durable; got {:?}",
+            repo.config
+        );
+    }
 
     #[test]
     fn fleet_config_network_yields_tcp_client() {
