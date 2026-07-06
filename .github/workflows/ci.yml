@@ -117,6 +117,25 @@ jobs:
         if: steps.changes.outputs.code != 'true'
         run: echo "Only docs/markdown/license changed; skipping cargo fmt/clippy/build/test."
 
+  wasm-types:
+    name: prospero-types builds for wasm32
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # The shared DTO crate MUST stay wasm-compatible so the Dioxus dashboard
+      # (prospero #97) can depend on it — this guards against a native dep
+      # sneaking into prospero-types (serde/serde_json only).
+      - name: Install Rust toolchain (+ wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build -p prospero-types --target wasm32-unknown-unknown
+        run: cargo build -p prospero-types --target wasm32-unknown-unknown
+
   coverage:
     name: line-coverage gate
     needs: check
