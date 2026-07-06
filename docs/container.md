@@ -56,6 +56,11 @@ namespace-driven rather than a prospero registry.
 the ambient kubeconfig / in-cluster service account; pass `--kubeconfig <path>`
 (or `KUBECONFIG`) to select an explicit kubeconfig file instead.
 
+Under `k8s`, prosperod serves `K8sFleet` over the shared event store/bus and
+runs **no** local `FleetManager`, poll loop, or lease heartbeat — those are
+`local`-only machinery. Both backends still share the same storage topology
+(sqlite standalone / Postgres clustered) for history and SSE.
+
 ### k8s session-plane security
 
 The per-agent session plane (prosperod → each caliband pod: live output stream
