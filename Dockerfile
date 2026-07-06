@@ -6,8 +6,10 @@ WORKDIR /src
 COPY . .
 # dashboard is compiled in (include_str!) — no Node stage. sqlx = runtime queries,
 # so no DATABASE_URL is needed at build time.
+# `--features k8s` compiles in the K8sFleet backend (PROSPERO_FLEET=k8s); without it
+# the released image can only run the local backend.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release -p prospero-daemon --bin prosperod
+    cargo build --release -p prospero-daemon --bin prosperod --features k8s
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
