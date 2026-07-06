@@ -1,169 +1,17 @@
 //! Prospero's fleet domain model: `Host -> Workspace -> [Agent]`.
 //!
-//! `Agent` is the primary unit; `Workspace` is a grouping that can host many
-//! concurrent agents (parallel streams of work on one codebase).
-
-use std::path::PathBuf;
+//! The read-model DTOs (`Agent`, `Workspace`, `FleetSnapshot`, `AgentStatus`,
+//! `WorkspaceHealth`, `Readiness`, `AgentId`) now live in [`prospero_types`] so
+//! the WASM dashboard can share them (prospero #98); they are re-exported here
+//! from their original path. The control-plane types below (`TaskSpec`,
+//! `AgentHandle`, `DrainPolicy`, `FleetChange`) stay in `prospero-core` — they
+//! reference core-only types (`SpawnRequest`, `Endpoint`).
 
 use serde::{Deserialize, Serialize};
 
-/// Lifecycle state of an agent. Mirrors caliban's `AgentStatus` wire enum
-/// exactly so the same value round-trips through both protocols.
-/// Aggregate readiness of prosperod, distinct from mere liveness.
-///
-/// `ready` gates traffic/restarts: it is `true` only when the durable store can
-/// accept writes. The workspace-health counts are an informational summary
-/// (per-workspace reachability is already surfaced in `/api/workspaces` and `/api/fleet`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Readiness {
-    /// Overall ready signal — currently equivalent to `store_writable`.
-    pub ready: bool,
-    /// Whether the durable event store can accept writes.
-    pub store_writable: bool,
-    /// Total managed workspaces.
-    pub repos_total: usize,
-    /// Repos whose caliband responded to the last poll.
-    pub repos_healthy: usize,
-    /// Repos whose caliband was unreachable at the last poll.
-    pub repos_unreachable: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStatus {
-    /// Registered, not yet executing.
-    Spawning,
-    /// Actively running (or attached).
-    Running,
-    /// Awaiting input; no compute pending.
-    Idle,
-    /// Stopped via kill.
-    Killed,
-    /// Finished successfully.
-    Done,
-    /// Finished with an error.
-    Failed,
-    /// Supervisor restarted while active; needs recovery.
-    Crashed,
-}
-
-impl AgentStatus {
-    /// True for states where the agent will produce no further work.
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            AgentStatus::Killed | AgentStatus::Done | AgentStatus::Failed | AgentStatus::Crashed
-        )
-    }
-
-    /// True while the agent may still be streaming output worth attaching to.
-    pub fn is_active(self) -> bool {
-        matches!(self, AgentStatus::Spawning | AgentStatus::Running)
-    }
-}
-
-/// Connectivity of a managed workspace's caliband daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum WorkspaceHealth {
-    /// The control socket responded to the last poll.
-    Healthy,
-    /// The control socket could not be reached; carries the reason.
-    Unreachable {
-        /// Human-readable reason from the last failed poll.
-        reason: String,
-    },
-}
-
-/// Prospero's view of a single agent (projected from a caliban `AgentRecord`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Agent {
-    /// Opaque caliban agent id.
-    pub id: String,
-    /// Human-readable label.
-    pub name: String,
-    /// Owning workspace name (Prospero registry key).
-    pub workspace: String,
-    /// Current lifecycle state.
-    pub status: AgentStatus,
-    /// RFC-3339 timestamp when the agent was registered.
-    pub started_at: String,
-    /// True if the agent runs in an isolated git worktree.
-    pub isolated: bool,
-    /// True if the agent was spawned in interactive mode (accepts operator input).
-    pub interactive: bool,
-    /// Path to the agent's session directory on disk.
-    pub session_dir: PathBuf,
-}
-
-/// A managed workspace (root + its source checkouts) and the agents running
-/// under its single caliband.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Workspace {
-    /// Registry key (operator-chosen short name).
-    pub name: String,
-    /// Canonical workspace root path.
-    pub root: PathBuf,
-    /// The source checkouts discovered under `root` (1..N). Filesystem-derived
-    /// at snapshot-build time, not persisted.
-    #[serde(default)]
-    pub sources: Vec<crate::caliband::sources::Source>,
-    /// Health of the workspace's caliband daemon.
-    pub health: WorkspaceHealth,
-    /// The workspace's provider config (so operators can read back what a workspace is
-    /// configured with). Defaults to empty for workspaces with no config set.
-    #[serde(default)]
-    pub config: crate::registry::RepoProviderConfig,
-    /// Agents currently known under this workspace.
-    pub agents: Vec<Agent>,
-}
-
-/// A point-in-time view of the whole fleet on one host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FleetSnapshot {
-    /// Host identity (single host in the first stab).
-    pub host: String,
-    /// Managed workspaces and their agents.
-    pub workspaces: Vec<Workspace>,
-}
-
-impl FleetSnapshot {
-    /// Find an agent by id across all workspaces, returning `(repo_name, &Agent)`.
-    pub fn find_agent(&self, id: &str) -> Option<(&str, &Agent)> {
-        self.workspaces.iter().find_map(|r| {
-            r.agents
-                .iter()
-                .find(|a| a.id == id)
-                .map(|a| (r.name.as_str(), a))
-        })
-    }
-}
-
-/// Stable identifier for a running agent (caliband's agent id).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AgentId(pub String);
-
-impl AgentId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-impl From<&str> for AgentId {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-impl From<String> for AgentId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-impl std::fmt::Display for AgentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+pub use prospero_types::{
+    Agent, AgentId, AgentStatus, FleetSnapshot, Readiness, Workspace, WorkspaceHealth,
+};
 
 /// Desired state for one agent — the provider-agnostic spec `ensure_agent` takes.
 /// Generalizes today's `(workspace, SpawnRequest)` pair (fleet.rs:618).
@@ -224,12 +72,6 @@ mod fleet_provider_types_tests {
     use super::*;
 
     #[test]
-    fn agent_id_roundtrips_str() {
-        let id = AgentId::from("agent-abc");
-        assert_eq!(id.as_str(), "agent-abc");
-        assert_eq!(id.to_string(), "agent-abc");
-    }
-    #[test]
     fn drain_policy_defaults_to_kill() {
         assert!(matches!(DrainPolicy::default(), DrainPolicy::Kill));
     }
@@ -244,72 +86,5 @@ mod fleet_provider_types_tests {
         let j = serde_json::to_string(&c).unwrap();
         let back: FleetChange = serde_json::from_str(&j).unwrap();
         assert_eq!(back, c);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_serializes_snake_case() {
-        let j = serde_json::to_string(&AgentStatus::Running).unwrap();
-        assert_eq!(j, "\"running\"");
-    }
-
-    #[test]
-    fn status_terminal_and_active_partition_correctly() {
-        for s in [AgentStatus::Spawning, AgentStatus::Running] {
-            assert!(s.is_active() && !s.is_terminal());
-        }
-        for s in [
-            AgentStatus::Killed,
-            AgentStatus::Done,
-            AgentStatus::Failed,
-            AgentStatus::Crashed,
-        ] {
-            assert!(s.is_terminal() && !s.is_active());
-        }
-        // Idle is neither active nor terminal: awaiting input.
-        assert!(!AgentStatus::Idle.is_active() && !AgentStatus::Idle.is_terminal());
-    }
-
-    #[test]
-    fn repo_health_tags_state() {
-        let j = serde_json::to_string(&WorkspaceHealth::Healthy).unwrap();
-        assert_eq!(j, "{\"state\":\"healthy\"}");
-        let j = serde_json::to_string(&WorkspaceHealth::Unreachable {
-            reason: "no socket".into(),
-        })
-        .unwrap();
-        assert_eq!(j, "{\"state\":\"unreachable\",\"reason\":\"no socket\"}");
-    }
-
-    #[test]
-    fn find_agent_searches_across_repos() {
-        let snap = FleetSnapshot {
-            host: "local".into(),
-            workspaces: vec![Workspace {
-                name: "prospero".into(),
-                root: "/r".into(),
-                sources: vec![],
-                health: WorkspaceHealth::Healthy,
-                config: crate::registry::RepoProviderConfig::default(),
-                agents: vec![Agent {
-                    id: "a1".into(),
-                    name: "x".into(),
-                    workspace: "prospero".into(),
-                    status: AgentStatus::Running,
-                    started_at: "t".into(),
-                    isolated: true,
-                    interactive: false,
-                    session_dir: "/s".into(),
-                }],
-            }],
-        };
-        let (workspace, agent) = snap.find_agent("a1").unwrap();
-        assert_eq!(workspace, "prospero");
-        assert_eq!(agent.id, "a1");
-        assert!(snap.find_agent("nope").is_none());
     }
 }

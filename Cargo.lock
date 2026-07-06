@@ -1874,6 +1874,7 @@ dependencies = [
  "hex",
  "k8s-openapi",
  "kube",
+ "prospero-types",
  "rcgen",
  "schemars",
  "serde",
@@ -1904,6 +1905,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "prospero-types"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

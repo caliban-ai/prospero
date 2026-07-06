@@ -13,6 +13,7 @@ testkit = ["dep:tempfile", "dep:rcgen"]
 k8s = ["dep:kube", "dep:k8s-openapi", "dep:schemars"]
 
 [dependencies]
+prospero-types.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

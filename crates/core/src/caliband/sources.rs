@@ -2,18 +2,12 @@
 //! caliban's `caliban-supervisor::sources` so both sides agree on source
 //! identity (name = directory basename). See caliban #281 / ADR 0052.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-
-/// One source checkout within a workspace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Source {
-    /// Directory basename (unique within a workspace).
-    pub name: String,
-    /// Absolute path to the source checkout.
-    pub path: PathBuf,
-}
+// The `Source` struct now lives in `prospero-types` (shared with the WASM
+// dashboard, prospero #98); re-exported here. `discover_sources` (filesystem
+// logic) stays in `prospero-core`.
+pub use prospero_types::Source;
 
 /// Is `p` a git checkout (has a `.git` entry)?
 fn is_checkout(p: &Path) -> bool {
