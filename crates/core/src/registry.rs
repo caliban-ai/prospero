@@ -5,34 +5,15 @@
 //! name. A workspace is a root directory holding 1..N source checkouts
 //! (caliban #281 / ADR 0052); its caliband is keyed on `hash16(root)`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 
-/// Per-repo provider/environment configuration applied to its caliband daemon.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoProviderConfig {
-    /// Selected provider → `CALIBAN_PROVIDER`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Provider base URL / host → `{PROVIDER}_BASE_URL`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    /// NAME of an env var in prosperod's environment whose value is injected as
-    /// `{PROVIDER}_API_KEY` at spawn time. Never the literal secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_from_env: Option<String>,
-    /// Raw escape-hatch env overrides (highest precedence within a repo).
-    ///
-    /// Unlike `api_key_from_env` (a reference), values here are stored verbatim
-    /// in the repo config store and returned by the repos/fleet API — do not
-    /// put secrets here; use `api_key_from_env` for credentials.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-}
+// The per-repo provider config DTO now lives in `prospero-types` (shared with the
+// WASM dashboard, prospero #98); re-exported here from its original path.
+pub use prospero_types::RepoProviderConfig;
 
 /// A single managed workspace's *persisted* identity: name + root + config.
 /// Sources are discovered from the filesystem at snapshot-build time (they are
