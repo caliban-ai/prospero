@@ -610,29 +610,33 @@ function appendEvent(ev) {
   renderTimeline();
 }
 
-// Fold the ordered event list into render segments. Total by construction: every
-// event becomes a segment or a raw fallback line. Tool spans pair
-// ToolStarted→ToolFinished by name (FIFO for repeats); assistant output coalesces
-// into the current turn's text.
+// Fold the ordered event list into a flat, chronological segment list. Total by
+// construction: every event becomes a segment or a raw fallback. Consecutive
+// assistant `output` chunks coalesce into one block; tool spans pair
+// ToolStarted→ToolFinished by name (FIFO for repeats). We render a flat timeline
+// rather than per-turn groups because `EventKind` carries no turn-boundary event
+// (caliban's TurnStart isn't normalized to a variant) — the true turn *count*
+// is shown in the header from `AgentFinished.turns`.
 function groupEvents(events) {
   const segs = [];
-  let turn = null; // { kind:"turn", tools:[], text:"" }
+  let out = null; // current coalescing output block { kind:"out", text:"" }
   const openTools = {}; // name -> [tool rows awaiting their finish]
-  const startTurn = () => { turn = { kind: "turn", tools: [], text: "" }; segs.push(turn); };
+  const flushOut = () => { out = null; };
   for (const ev of events) {
     const k = ev.kind, seq = ev.seq;
     switch (k.kind) {
       case "agent_init":
+        flushOut();
         segs.push({ kind: "init", model: k.model, tools: k.tools || [] });
         break;
       case "output":
-        if (!turn) startTurn();
-        turn.text += k.chunk;
+        if (!out) { out = { kind: "out", text: "" }; segs.push(out); }
+        out.text += k.chunk;
         break;
       case "tool_started": {
-        if (!turn) startTurn();
-        const row = { seq, name: k.name, input: k.input, ok: null };
-        turn.tools.push(row);
+        flushOut();
+        const row = { kind: "tool", seq, name: k.name, input: k.input, ok: null };
+        segs.push(row);
         (openTools[k.name] = openTools[k.name] || []).push(row);
         break;
       }
@@ -642,15 +646,19 @@ function groupEvents(events) {
         break;
       }
       case "status_changed":
+        flushOut();
         segs.push({ kind: "status", from: k.from, to: k.to });
         break;
       case "agent_finished":
+        flushOut();
         segs.push({ kind: "finished", outcome: k.outcome, cost: k.cost_usd, turns: k.turns });
         break;
       case "store_persist_failed":
+        flushOut();
         segs.push({ kind: "sys", text: `recovered dropped events (seq ${k.lost_seq})` });
         break;
       default:
+        flushOut();
         segs.push({ kind: "raw", text: k.kind });
     }
   }
@@ -660,25 +668,21 @@ function groupEvents(events) {
 function renderTimeline() {
   const nearBottom = streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 40;
   const segs = groupEvents(streamEvents);
-  let html = "", turnNo = 0;
+  let html = "";
   for (const s of segs) {
     if (s.kind === "init") {
       html += `<div class="tl-init"><span class="k">init</span> `
         + `model=${escapeHtml(s.model || "?")} · ${s.tools.length} tools</div>`;
-    } else if (s.kind === "turn") {
-      turnNo++;
-      html += `<div class="tl-turn"><div class="tl-turn-h">turn ${turnNo}</div>`;
-      for (const t of s.tools) {
-        const pill = t.ok === null ? `<span class="tl-pill run">running</span>`
-          : t.ok ? `<span class="tl-pill ok">ok</span>` : `<span class="tl-pill fail">fail</span>`;
-        const open = expandedTools.has(t.seq);
-        html += `<div class="tl-tool" data-seq="${t.seq}">`
-          + `<div class="tl-tool-h"><span class="tool">▸ ${escapeHtml(t.name)}</span>${pill}</div>`
-          + (open ? `<pre class="tl-input">${escapeHtml(JSON.stringify(t.input, null, 2))}</pre>` : "")
-          + `</div>`;
-      }
+    } else if (s.kind === "tool") {
+      const pill = s.ok === null ? `<span class="tl-pill run">running</span>`
+        : s.ok ? `<span class="tl-pill ok">ok</span>` : `<span class="tl-pill fail">fail</span>`;
+      const open = expandedTools.has(s.seq);
+      html += `<div class="tl-tool" data-seq="${s.seq}">`
+        + `<div class="tl-tool-h"><span class="tool">▸ ${escapeHtml(s.name)}</span>${pill}</div>`
+        + (open ? `<pre class="tl-input">${escapeHtml(JSON.stringify(s.input, null, 2))}</pre>` : "")
+        + `</div>`;
+    } else if (s.kind === "out") {
       if (s.text.trim()) html += `<div class="tl-out">${escapeHtml(s.text)}</div>`;
-      html += `</div>`;
     } else if (s.kind === "status") {
       html += `<div class="tl-status muted">${escapeHtml(s.from)} → ${escapeHtml(s.to)}</div>`;
     } else if (s.kind === "finished") {

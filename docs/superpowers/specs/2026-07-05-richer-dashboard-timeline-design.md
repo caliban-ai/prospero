@@ -36,27 +36,31 @@ scope.
 stream view. Each item is a `FleetEvent { seq, ts, repo, agent_id, kind }` with
 `kind` one of the `EventKind` variants. No new endpoints.
 
-## Timeline model (client-side grouping)
+## Timeline model (client-side, flat chronological)
 
 A pure function `groupEvents(events) -> [Segment]` folds the ordered event list
-into render segments. It needs no server change — turns are inferred from the
-stream:
+into a **flat, chronological** segment list. **Important data reality:**
+`EventKind` carries **no turn-boundary event** — caliban's `TurnStart` wire frame
+is not normalized to a variant — so the timeline cannot truthfully split by turn.
+Inventing "turn N" labels would be misleading; instead we render a flat activity
+timeline and surface the true turn **count** in the header (from
+`AgentFinished.turns`).
 
-- **`AgentInit{model, tools, session_id}`** → a header segment (model + tool list).
-- A **turn boundary** starts at each `ToolStarted` that follows non-tool output,
-  or on the first event after init; assistant `Output{stream, chunk}` accumulates
-  into the current turn's text (contiguous chunks coalesced).
-- **`ToolStarted{name, input}`** opens a tool span; the next matching
-  **`ToolFinished{name, ok}`** closes it (match by name, FIFO for repeats) →
-  one inspectable tool row `{name, input, ok}`.
+- **`AgentInit{model, tools, session_id}`** → a header segment (model + tool count).
+- **`Output{stream, chunk}`** → contiguous chunks coalesce into one output block
+  (flushed when any non-output event arrives).
+- **`ToolStarted{name, input}`** → an inspectable tool row `{name, input, ok}`;
+  the next matching **`ToolFinished{name, ok}`** sets its `ok` (match by name,
+  FIFO for repeats).
 - **`StatusChanged{from, to}`** → a thin inline marker.
 - **`AgentFinished{outcome, cost_usd, turns}`** → the terminal summary (also
   feeds the header stat).
-- **`StorePersistFailed` / `RepoHealth` / `AgentGone`** → small muted system
-  markers (kept visible, not hidden).
+- **`StorePersistFailed`** → a small muted "recovered dropped events" marker
+  (the SSE `gap` signal folds in as this kind too).
 
-Unpaired `ToolStarted` (still running) renders as an open span with a spinner
-dot; unknown/unhandled kinds render as a raw fallback line (never dropped).
+Unpaired `ToolStarted` (still running) renders with a `running` pill; unknown
+kinds render as a raw fallback line (never dropped). Verified via a synthetic-run
+harness in a browser (render + click-to-expand + per-tool expanded state).
 
 Live SSE events append through the same `groupEvents` incremental path (or a
 re-fold of the accumulated list — simplest correct first: keep the event array,
