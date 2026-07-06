@@ -372,6 +372,87 @@ async fn events_endpoint_returns_history_after_poll() {
     );
 }
 
+/// Locks the exact `EventKind` JSON shapes the dashboard timeline
+/// (`groupEvents`/`renderTimeline` in `dashboard/app.js`) reads. Seeds the store
+/// directly so the assertion is on the wire contract, not on caliban frame
+/// normalization. (#5)
+#[tokio::test]
+async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
+    use prospero_core::event::EventKind;
+    let h = setup().await;
+    let store = h.manager.store();
+    let ev = |seq, kind| FleetEvent {
+        seq,
+        ts: "2026-07-05T00:00:00Z".to_string(),
+        repo: "repo".to_string(),
+        agent_id: "agent001".to_string(),
+        kind,
+    };
+    store
+        .append(&ev(
+            1,
+            EventKind::ToolStarted {
+                name: "Read".to_string(),
+                input: serde_json::json!({ "path": "/x.rs" }),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            EventKind::ToolFinished {
+                name: "Read".to_string(),
+                ok: true,
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            3,
+            EventKind::AgentFinished {
+                outcome: "success".to_string(),
+                cost_usd: 0.12,
+                turns: 4,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/agent001/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let arr = v.as_array().unwrap();
+    assert!(
+        arr.iter().any(|e| e["kind"]["kind"] == "tool_started"
+            && e["kind"]["name"] == "Read"
+            && e["kind"]["input"]["path"] == "/x.rs"),
+        "tool_started shape: {v}"
+    );
+    assert!(
+        arr.iter()
+            .any(|e| e["kind"]["kind"] == "tool_finished" && e["kind"]["ok"] == true),
+        "tool_finished shape: {v}"
+    );
+    assert!(
+        arr.iter().any(|e| e["kind"]["kind"] == "agent_finished"
+            && e["kind"]["cost_usd"] == 0.12
+            && e["kind"]["turns"] == 4),
+        "agent_finished shape: {v}"
+    );
+}
+
 #[tokio::test]
 async fn sse_stream_closes_after_agent_finished() {
     let mut h = setup().await;

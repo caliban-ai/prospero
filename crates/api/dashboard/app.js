@@ -14,7 +14,9 @@ let selectedAgent = null;
 let evtSource = null;
 let healthyWorkspaces = []; // names of reachable repos, for the launch picker
 let lastFleet = null; // most recent fleet snapshot, for stream-head lookups
-let streamCtx = null; // { id, name, status, model, cost, turns } for the streamed agent
+let streamCtx = null; // { id, name, status, model, cost, turns, outcome } for the streamed agent
+let streamEvents = []; // accumulated events for the selected agent (folded into the timeline)
+const expandedTools = new Set(); // tool span keys (event seq) the user expanded
 
 function findAgent(id) {
   if (!lastFleet) return null;
@@ -554,7 +556,8 @@ function paintStreamHead() {
   const badge = `<span class="badge ${c.status}">${escapeHtml(c.status)}</span>`;
   const model = c.model ? `<span class="sh-meta">${escapeHtml(c.model)}</span>` : "";
   const cost = c.cost != null && c.turns != null
-    ? `<span class="sh-meta">· $${c.cost.toFixed(4)} · ${c.turns} turns</span>` : "";
+    ? `<span class="sh-meta">· ${escapeHtml(c.outcome || "done")} · ${c.turns} turns · $${c.cost.toFixed(4)}</span>`
+    : `<span class="sh-meta">· running</span>`;
   const dot = streamIsLive()
     ? `<span class="sh-conn live">● live</span>` : `<span class="sh-conn closed">⚠ closed</span>`;
   streamHeadEl.innerHTML =
@@ -568,7 +571,9 @@ function selectAgent(id) {
   selectedAgent = id;
   document.body.classList.add("show-stream"); // responsive: reveal the stream pane
   const a = findAgent(id);
-  streamCtx = { id, name: (a && a.name) || id, status: (a && a.status) || "", model: null, cost: null, turns: null };
+  streamCtx = { id, name: (a && a.name) || id, status: (a && a.status) || "", model: null, cost: null, turns: null, outcome: null };
+  streamEvents = [];
+  expandedTools.clear();
   refreshFleet();
   streamLogEl.innerHTML = "";
   if (evtSource) evtSource.close();
@@ -580,53 +585,123 @@ function selectAgent(id) {
   evtSource.addEventListener("gap", (e) => {
     let info = {};
     try { info = JSON.parse(e.data); } catch { /* ignore malformed */ }
-    const note = document.createElement("div");
-    note.className = "empty-hint";
-    note.textContent =
-      `Fell behind — recovered ${info.skipped ?? "?"} dropped event(s) from history.`;
-    streamLogEl.appendChild(note);
-    streamLogEl.scrollTop = streamLogEl.scrollHeight;
+    // Fold the recovery notice into the timeline like any other marker.
+    streamEvents.push({ seq: -1, kind: {
+      kind: "store_persist_failed",
+      lost_seq: info.skipped ?? 0,
+      detail: "recovered dropped events from history",
+    } });
+    renderTimeline();
   });
   evtSource.onerror = () => paintStreamHead();
   paintStreamHead();
 }
 
 function appendEvent(ev) {
-  const line = document.createElement("div");
-  line.className = "ev";
+  streamEvents.push(ev);
   const k = ev.kind;
   if (streamCtx) {
     if (k.kind === "agent_init") streamCtx.model = k.model;
-    else if (k.kind === "agent_finished") { streamCtx.cost = k.cost_usd; streamCtx.turns = k.turns; }
-    else if (k.kind === "status_changed") streamCtx.status = k.to;
+    else if (k.kind === "agent_finished") {
+      streamCtx.cost = k.cost_usd; streamCtx.turns = k.turns; streamCtx.outcome = k.outcome;
+    } else if (k.kind === "status_changed") streamCtx.status = k.to;
     paintStreamHead();
   }
-  let body;
-  switch (k.kind) {
-    case "output":
-      body = `<span class="out">${escapeHtml(k.chunk)}</span>`;
-      break;
-    case "tool_started":
-      body = `<span class="tool">⚙ ${k.name}(${escapeHtml(JSON.stringify(k.input))})</span>`;
-      break;
-    case "tool_finished":
-      body = `<span class="tool">${k.ok ? "✓" : "✗"} ${k.name}</span>`;
-      break;
-    case "agent_init":
-      body = `<span class="k">init</span> model=${k.model} tools=[${k.tools.join(", ")}]`;
-      break;
-    case "agent_finished":
-      body = `<span class="fin">● finished (${k.outcome}) — $${k.cost_usd.toFixed(4)}, ${k.turns} turns</span>`;
-      break;
-    case "status_changed":
-      body = `<span class="k">status</span> ${k.from} → ${k.to}`;
-      break;
-    default:
-      body = `<span class="k">${k.kind}</span>`;
+  renderTimeline();
+}
+
+// Fold the ordered event list into a flat, chronological segment list. Total by
+// construction: every event becomes a segment or a raw fallback. Consecutive
+// assistant `output` chunks coalesce into one block; tool spans pair
+// ToolStarted→ToolFinished by name (FIFO for repeats). We render a flat timeline
+// rather than per-turn groups because `EventKind` carries no turn-boundary event
+// (caliban's TurnStart isn't normalized to a variant) — the true turn *count*
+// is shown in the header from `AgentFinished.turns`.
+function groupEvents(events) {
+  const segs = [];
+  let out = null; // current coalescing output block { kind:"out", text:"" }
+  const openTools = {}; // name -> [tool rows awaiting their finish]
+  const flushOut = () => { out = null; };
+  for (const ev of events) {
+    const k = ev.kind, seq = ev.seq;
+    switch (k.kind) {
+      case "agent_init":
+        flushOut();
+        segs.push({ kind: "init", model: k.model, tools: k.tools || [] });
+        break;
+      case "output":
+        if (!out) { out = { kind: "out", text: "" }; segs.push(out); }
+        out.text += k.chunk;
+        break;
+      case "tool_started": {
+        flushOut();
+        const row = { kind: "tool", seq, name: k.name, input: k.input, ok: null };
+        segs.push(row);
+        (openTools[k.name] = openTools[k.name] || []).push(row);
+        break;
+      }
+      case "tool_finished": {
+        const q = openTools[k.name];
+        if (q && q.length) q.shift().ok = k.ok;
+        break;
+      }
+      case "status_changed":
+        flushOut();
+        segs.push({ kind: "status", from: k.from, to: k.to });
+        break;
+      case "agent_finished":
+        flushOut();
+        segs.push({ kind: "finished", outcome: k.outcome, cost: k.cost_usd, turns: k.turns });
+        break;
+      case "store_persist_failed":
+        flushOut();
+        segs.push({ kind: "sys", text: `recovered dropped events (seq ${k.lost_seq})` });
+        break;
+      default:
+        flushOut();
+        segs.push({ kind: "raw", text: k.kind });
+    }
   }
-  line.innerHTML = body;
-  streamLogEl.appendChild(line);
-  streamEl.scrollTop = streamEl.scrollHeight;
+  return segs;
+}
+
+function renderTimeline() {
+  const nearBottom = streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 40;
+  const segs = groupEvents(streamEvents);
+  let html = "";
+  for (const s of segs) {
+    if (s.kind === "init") {
+      html += `<div class="tl-init"><span class="k">init</span> `
+        + `model=${escapeHtml(s.model || "?")} · ${s.tools.length} tools</div>`;
+    } else if (s.kind === "tool") {
+      const pill = s.ok === null ? `<span class="tl-pill run">running</span>`
+        : s.ok ? `<span class="tl-pill ok">ok</span>` : `<span class="tl-pill fail">fail</span>`;
+      const open = expandedTools.has(s.seq);
+      html += `<div class="tl-tool" data-seq="${s.seq}">`
+        + `<div class="tl-tool-h"><span class="tool">▸ ${escapeHtml(s.name)}</span>${pill}</div>`
+        + (open ? `<pre class="tl-input">${escapeHtml(JSON.stringify(s.input, null, 2))}</pre>` : "")
+        + `</div>`;
+    } else if (s.kind === "out") {
+      if (s.text.trim()) html += `<div class="tl-out">${escapeHtml(s.text)}</div>`;
+    } else if (s.kind === "status") {
+      html += `<div class="tl-status muted">${escapeHtml(s.from)} → ${escapeHtml(s.to)}</div>`;
+    } else if (s.kind === "finished") {
+      html += `<div class="tl-fin fin">● ${escapeHtml(s.outcome)} · ${s.turns} turns · $${s.cost.toFixed(4)}</div>`;
+    } else if (s.kind === "sys") {
+      html += `<div class="tl-status muted">⚠ ${escapeHtml(s.text)}</div>`;
+    } else {
+      html += `<div class="ev muted">${escapeHtml(s.text)}</div>`;
+    }
+  }
+  streamLogEl.innerHTML = html || `<div class="muted">waiting for events…</div>`;
+  streamLogEl.querySelectorAll(".tl-tool").forEach((el) => {
+    el.querySelector(".tl-tool-h").onclick = () => {
+      const seq = Number(el.dataset.seq);
+      if (expandedTools.has(seq)) expandedTools.delete(seq); else expandedTools.add(seq);
+      renderTimeline();
+    };
+  });
+  if (nearBottom) streamEl.scrollTop = streamEl.scrollHeight;
 }
 
 function escapeHtml(s) {
