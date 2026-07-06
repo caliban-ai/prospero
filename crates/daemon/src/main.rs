@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use prospero_core::bus::EventBus;
-use prospero_core::config_store::ConfigStore;
+use prospero_core::bus::{EventBus, InProcessBus};
+use prospero_core::config_store::{ConfigStore, SqliteConfigStore};
 use prospero_core::discovery::{DiscoveryEnv, EnsureConfig};
 use prospero_core::fleet::{FleetConfig, FleetManager};
 use prospero_core::fleet_provider::LocalFleet;
-use prospero_core::ownership::Ownership;
+use prospero_core::ownership::{Ownership, SelfOwnsAll};
 use prospero_core::sqlite_store::SqliteStore;
 use prospero_core::store::Store;
 use prospero_core::{DistributedBus, LeasedOwnership, PostgresConfigStore, PostgresStore};
@@ -239,84 +239,132 @@ async fn main() -> anyhow::Result<()> {
     };
     config.default_env = args.default_env.iter().cloned().collect();
 
-    // Select the storage/ownership topology. A Postgres URL ⇒ clustered.
-    let mut heartbeat_handle: Option<JoinHandle<()>> = None;
-    let manager = if let Some(url) = args.database_url.clone() {
-        let replica_id = resolve_replica_id(args.replica_id.as_deref());
+    // Phase 1 — the shared observability plane (store + bus), composed per
+    // storage topology and handed to whichever backend serves. A Postgres URL
+    // ⇒ clustered (Postgres store + LISTEN/NOTIFY bus); else standalone (sqlite
+    // + in-process bus). This is all the k8s backend needs (#83): it reads
+    // history/SSE from this store/bus and never builds a FleetManager.
+    let (store, bus): (Arc<dyn Store>, Arc<dyn EventBus>) = if let Some(url) =
+        args.database_url.clone()
+    {
         let store: Arc<dyn Store> = Arc::new(
             PostgresStore::connect(&url)
                 .await
                 .with_context(|| "connecting clustered event store")?,
-        );
-        let config_store: Arc<dyn ConfigStore> = Arc::new(
-            PostgresConfigStore::connect(&url)
-                .await
-                .with_context(|| "connecting clustered config store")?,
         );
         let bus: Arc<dyn EventBus> = Arc::new(
             DistributedBus::connect(&url, store.clone())
                 .await
                 .with_context(|| "connecting clustered event bus")?,
         );
-        let ownership = Arc::new(
-            LeasedOwnership::connect(&url, replica_id.clone(), args.lease_ttl_secs)
-                .await
-                .with_context(|| "connecting clustered ownership")?,
-        );
-
-        // Heartbeat: renew this replica's held leases so it keeps its streams.
-        let interval = heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_secs);
-        let hb = ownership.clone();
-        heartbeat_handle = Some(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                hb.heartbeat().await;
-            }
-        }));
-
-        tracing::info!(
-            target: "prosperod",
-            topology = "clustered", %replica_id,
-            lease_ttl_secs = args.lease_ttl_secs,
-            heartbeat_ms = interval.as_millis() as u64,
-            "selected clustered topology"
-        );
-
-        FleetManager::with_seams(
-            config,
-            store,
-            config_store,
-            bus,
-            ownership as Arc<dyn Ownership>,
-        )
-        .await
-        .with_context(|| "building clustered fleet manager")?
+        tracing::info!(target: "prosperod", topology = "clustered", "selected clustered topology");
+        (store, bus)
     } else {
-        let store = Arc::new(
+        let store: Arc<dyn Store> = Arc::new(
             SqliteStore::open(&data_dir)
                 .await
                 .with_context(|| "opening event store")?,
         );
+        let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(config.event_buffer));
         tracing::info!(target: "prosperod", topology = "standalone", "selected standalone topology");
-        FleetManager::new(config, store)
-            .await
-            .with_context(|| "building fleet manager")?
+        (store, bus)
     };
 
-    // Select the serving `FleetProvider`/`FleetAdmin` at the daemon's
-    // composition edge (#76). Both backends emit to — and the API reads
-    // observability (history/SSE) from — the same `manager.store()`/
-    // `manager.bus()`. The workspace-registry plane (`FleetAdmin`) is a
-    // prospero concept, so it's `Some` for local and `None` for k8s (those
-    // routes then return 405, as k8s workspaces are `CalibanTask`-driven).
-    let local = LocalFleet::new(manager.clone());
-    let (fleet, admin): (
+    // Phase 2 — select the serving backend over the shared store/bus. `local`
+    // builds the full FleetManager (registry + ownership + poll loop); `k8s`
+    // serves K8sFleet with NO manager, poll loop, config store, ownership, or
+    // heartbeat — those are local-only machinery, inert under k8s (#83). The
+    // `FleetAdmin` (workspace registry) is likewise `Some` only for local; its
+    // routes return 405 under k8s, where workspaces are `CalibanTask`-driven.
+    // The match yields the serving fleet/admin plus the background handles this
+    // backend owns (poll loop, heartbeat, manager for graceful shutdown) — all
+    // `None` under k8s, which starts none of them (#83).
+    #[allow(clippy::type_complexity)]
+    let (fleet, admin, poll_handle, heartbeat_handle, manager_for_shutdown): (
         Arc<dyn prospero_core::FleetProvider>,
         Option<Arc<dyn prospero_core::FleetAdmin>>,
+        Option<JoinHandle<()>>,
+        Option<JoinHandle<()>>,
+        Option<FleetManager>,
     ) = match args.fleet_backend {
-        FleetBackend::Local => (Arc::new(local.clone()), Some(Arc::new(local))),
+        FleetBackend::Local => {
+            // Per-topology registry + ownership seams (clustered adds a lease
+            // heartbeat). Both topologies go through `with_seams`, building the
+            // same manager `FleetManager::new` would for standalone.
+            let (config_store, ownership, heartbeat_handle): (
+                Arc<dyn ConfigStore>,
+                Arc<dyn Ownership>,
+                Option<JoinHandle<()>>,
+            ) = if let Some(url) = args.database_url.clone() {
+                let replica_id = resolve_replica_id(args.replica_id.as_deref());
+                let config_store: Arc<dyn ConfigStore> = Arc::new(
+                    PostgresConfigStore::connect(&url)
+                        .await
+                        .with_context(|| "connecting clustered config store")?,
+                );
+                let ownership = Arc::new(
+                    LeasedOwnership::connect(&url, replica_id.clone(), args.lease_ttl_secs)
+                        .await
+                        .with_context(|| "connecting clustered ownership")?,
+                );
+
+                // Heartbeat: renew this replica's held leases so it keeps its
+                // streams. Local-only — k8s builds no ownership (#83).
+                let interval = heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_secs);
+                let hb = ownership.clone();
+                let heartbeat_handle = tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(interval);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        hb.heartbeat().await;
+                    }
+                });
+                tracing::info!(
+                    target: "prosperod", %replica_id,
+                    lease_ttl_secs = args.lease_ttl_secs,
+                    heartbeat_ms = interval.as_millis() as u64,
+                    "clustered ownership + heartbeat active"
+                );
+                (
+                    config_store,
+                    ownership as Arc<dyn Ownership>,
+                    Some(heartbeat_handle),
+                )
+            } else {
+                let config_store: Arc<dyn ConfigStore> = Arc::new(
+                    SqliteConfigStore::open(&data_dir)
+                        .await
+                        .with_context(|| "opening config store")?,
+                );
+                (
+                    config_store,
+                    Arc::new(SelfOwnsAll) as Arc<dyn Ownership>,
+                    None,
+                )
+            };
+
+            let manager = FleetManager::with_seams(
+                config,
+                store.clone(),
+                config_store,
+                bus.clone(),
+                ownership,
+            )
+            .await
+            .with_context(|| "building fleet manager")?;
+
+            let local = LocalFleet::new(manager.clone());
+            let poll_handle = tokio::spawn(manager.clone().run());
+            tracing::info!(target: "prosperod", backend = "local", "serving via LocalFleet");
+            (
+                Arc::new(local.clone()) as Arc<dyn prospero_core::FleetProvider>,
+                Some(Arc::new(local) as Arc<dyn prospero_core::FleetAdmin>),
+                Some(poll_handle),
+                heartbeat_handle,
+                Some(manager),
+            )
+        }
         #[cfg(feature = "k8s")]
         FleetBackend::K8s => {
             let client = build_kube_client(args.kubeconfig.as_deref()).await?;
@@ -338,14 +386,22 @@ async fn main() -> anyhow::Result<()> {
                 .map(read_token_file)
                 .transpose()?;
 
-            let k8s = prospero_core::K8sFleet::new(api, manager.bus(), manager.store())
+            // No FleetManager under k8s: K8sFleet serves directly over the
+            // shared store/bus (#83).
+            let k8s = prospero_core::K8sFleet::new(api, bus.clone(), store.clone())
                 .with_network(tls.clone(), token.clone());
             tracing::info!(
                 target: "prosperod", backend = "k8s", namespace = %ns,
                 session_tls = tls.is_some(), session_token = token.is_some(),
-                "serving via K8sFleet"
+                "serving via K8sFleet (no FleetManager)"
             );
-            (Arc::new(k8s), None)
+            (
+                Arc::new(k8s) as Arc<dyn prospero_core::FleetProvider>,
+                None,
+                None,
+                None,
+                None,
+            )
         }
         #[cfg(not(feature = "k8s"))]
         FleetBackend::K8s => anyhow::bail!(
@@ -354,18 +410,16 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
 
-    // Background poll loop (drives the local caliband-over-Unix backend; a no-op
-    // over an empty registry under k8s).
-    let poll_handle = tokio::spawn(manager.clone().run());
-
+    // Age-based retention (#4) — both arms, off the shared store, with no
+    // dependency on FleetManager (#83).
     if args.retention_days > 0 {
-        let m = manager.clone();
+        let s = store.clone();
         let max_age = Duration::from_secs(args.retention_days * 24 * 3600);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tick.tick().await;
-                match m.prune_older_than(max_age).await {
+                match prospero_core::store::prune_store_older_than(s.as_ref(), max_age).await {
                     Ok(n) if n > 0 => {
                         tracing::info!(target: "prosperod", pruned = n, "retention swept old events")
                     }
@@ -378,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = prospero_api::router(fleet, admin, manager.store(), manager.bus());
+    let app = prospero_api::router(fleet, admin, store.clone(), bus.clone());
     let listener = tokio::net::TcpListener::bind(args.addr)
         .await
         .with_context(|| format!("binding {}", args.addr))?;
@@ -394,10 +448,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| "serving HTTP")?;
 
-    // HTTP has drained; now drain the background poll loop and attach tasks so we
-    // don't abandon an in-flight poll/append mid-iteration.
-    manager.begin_shutdown();
-    if let Err(e) = poll_handle.await {
+    // HTTP has drained; now drain whatever background work this backend started.
+    // Only the local arm builds a poll loop / heartbeat — under k8s there's
+    // nothing to drain (#83).
+    if let Some(manager) = &manager_for_shutdown {
+        manager.begin_shutdown();
+    }
+    if let Some(poll_handle) = poll_handle
+        && let Err(e) = poll_handle.await
+    {
         tracing::warn!(error = %e, "poll loop did not drain cleanly");
     }
     if let Some(hb) = heartbeat_handle {
