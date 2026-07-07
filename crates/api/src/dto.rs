@@ -40,6 +40,9 @@ pub struct SpawnBody {
     /// Run the agent in interactive mode (awaits operator input).
     #[serde(default)]
     pub interactive: bool,
+    /// Optional agent-template / frontmatter markdown file path (#6).
+    #[serde(default)]
+    pub frontmatter_path: Option<String>,
 }
 
 impl SpawnBody {
@@ -54,6 +57,7 @@ impl SpawnBody {
             isolation_worktree,
             tool_allowlist: self.tool_allowlist,
             interactive: self.interactive,
+            frontmatter_path: self.frontmatter_path.map(std::path::PathBuf::from),
         }
     }
 }
@@ -118,6 +122,18 @@ mod tests {
         assert!(with.into_request().interactive);
         let without: SpawnBody = serde_json::from_str(r#"{"prompt":"p"}"#).unwrap();
         assert!(!without.into_request().interactive);
+    }
+
+    #[test]
+    fn spawn_body_carries_frontmatter_path() {
+        let with: SpawnBody =
+            serde_json::from_str(r#"{"prompt":"p","frontmatter_path":"/tpl.md"}"#).unwrap();
+        assert_eq!(
+            with.into_request().frontmatter_path,
+            Some(std::path::PathBuf::from("/tpl.md"))
+        );
+        let without: SpawnBody = serde_json::from_str(r#"{"prompt":"p"}"#).unwrap();
+        assert_eq!(without.into_request().frontmatter_path, None);
     }
 
     #[test]
