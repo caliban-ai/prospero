@@ -239,12 +239,24 @@ mod tests {
         format!("{tag}-{nanos}-{n}")
     }
 
+    /// Serialize the Postgres-gated bus tests against each other. They share one
+    /// database and — critically — one NOTIFY channel: `subscribe_all` replays
+    /// from the store for *every* notification on that channel, so a sibling
+    /// test publishing concurrently floods this channel and, under the full
+    /// suite's CPU pressure, can starve `subscribe_all`'s doorbell loop until it
+    /// times out. Distinct `unique_agent` keys keep their *data* from colliding;
+    /// this guard keeps their *doorbell traffic* from colliding. Held across
+    /// awaits, so it must be a `tokio` mutex. Each test takes it right after the
+    /// `DATABASE_URL` guard (an unset-DB skip never contends).
+    static BUS_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn doorbell_delivers_a_live_event_to_a_subscriber() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP doorbell_delivers_a_live_event_to_a_subscriber: DATABASE_URL unset");
             return;
         };
+        let _serial = BUS_TEST_SERIAL.lock().await;
 
         let store = PostgresStore::connect(&url).await.unwrap();
         let store: Arc<dyn Store> = Arc::new(store);
@@ -260,22 +272,27 @@ mod tests {
         // (now-live) listener replays it.
         let recv =
             tokio::spawn(
-                async move { tokio::time::timeout(Duration::from_secs(20), sub.next()).await },
+                async move { tokio::time::timeout(Duration::from_secs(30), sub.next()).await },
             );
 
+        // Keep nudging until the subscriber actually receives an event, NOT for a
+        // fixed number of tries: under the full suite's CPU pressure the lazy
+        // LISTEN can take many seconds to come up, and if the nudges stop before
+        // then, nothing is ever replayed. The cap (~25s of nudging) sits under
+        // the 30s recv timeout so a genuine hang still fails rather than hangs.
         let mut delivered = None;
-        for seq in 1..=40u64 {
+        for seq in 1..=250u64 {
             let e = ev(seq, &agent);
             store.append(&e).await.unwrap();
             bus.publish(e);
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if recv.is_finished() {
                 delivered = Some(recv.await.unwrap().expect("doorbell timed out"));
                 break;
             }
         }
 
-        match delivered.expect("subscriber never received a doorbell event after 40 tries") {
+        match delivered.expect("subscriber never received a doorbell event") {
             Some(BusEvent::Event(ev)) => assert_eq!(ev.agent_id, agent),
             other => panic!("expected a live event, got {other:?}"),
         }
@@ -295,6 +312,7 @@ mod tests {
             );
             return;
         };
+        let _serial = BUS_TEST_SERIAL.lock().await;
 
         let store = PostgresStore::connect(&url).await.unwrap();
         let store: Arc<dyn Store> = Arc::new(store);
@@ -308,15 +326,18 @@ mod tests {
         let mut sub = bus.subscribe(&agent);
         let recv =
             tokio::spawn(
-                async move { tokio::time::timeout(Duration::from_secs(20), sub.next()).await },
+                async move { tokio::time::timeout(Duration::from_secs(30), sub.next()).await },
             );
 
         // Ring the doorbell until the (now-live) listener replays the delta;
-        // re-NOTIFY is idempotent (replay starts from last_seq+1 = 1).
+        // re-NOTIFY is idempotent (replay starts from last_seq+1 = 1). Keep
+        // nudging until it's delivered, not for a fixed window: under the full
+        // suite's CPU pressure the lazy LISTEN can come up well after a short
+        // fixed window would have stopped nudging, leaving nothing to replay it.
         let mut delivered = None;
-        for _ in 0..40 {
+        for _ in 0..250 {
             bus.publish(early.clone());
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if recv.is_finished() {
                 delivered = Some(recv.await.unwrap().expect("doorbell timed out"));
                 break;
@@ -341,6 +362,7 @@ mod tests {
             eprintln!("SKIP doorbell_ignores_other_streams: DATABASE_URL unset");
             return;
         };
+        let _serial = BUS_TEST_SERIAL.lock().await;
 
         let store = PostgresStore::connect(&url).await.unwrap();
         let store: Arc<dyn Store> = Arc::new(store);
@@ -379,6 +401,7 @@ mod tests {
             );
             return;
         };
+        let _serial = BUS_TEST_SERIAL.lock().await;
 
         let store = PostgresStore::connect(&url).await.unwrap();
         let store: Arc<dyn Store> = Arc::new(store);
@@ -387,51 +410,65 @@ mod tests {
         let agent_a = unique_agent("agent-all-a");
         let agent_b = unique_agent("agent-all-b");
 
+        // `subscribe_all` is global and unfiltered by design, so under a shared
+        // test database it also observes events from *sibling* tests running
+        // concurrently (their own `unique_agent(...)` streams). This test is
+        // only about OUR two streams: consume until both have arrived, skipping
+        // any foreign stream key (and lag signals), while asserting neither of
+        // ours is ever delivered twice. Taking "the first two events" verbatim
+        // would flake whenever a concurrent test's event interleaves first.
         let mut sub = bus.subscribe_all();
+        let a_recv = agent_a.clone();
+        let b_recv = agent_b.clone();
         let recv = tokio::spawn(async move {
-            let first = tokio::time::timeout(Duration::from_secs(20), sub.next()).await;
-            let second = tokio::time::timeout(Duration::from_secs(20), sub.next()).await;
-            (first, second)
+            let mut seen = std::collections::HashSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while seen.len() < 2 {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(remaining, sub.next()).await {
+                    Ok(Some(BusEvent::Event(ev))) => {
+                        if ev.agent_id == a_recv || ev.agent_id == b_recv {
+                            assert!(
+                                seen.insert(ev.agent_id.clone()),
+                                "duplicate delivery for stream {} (per-key high-water not advancing)",
+                                ev.agent_id
+                            );
+                        }
+                        // Foreign stream keys (concurrent tests) are expected — skip them.
+                    }
+                    // Lag signals aren't a delivery of one of our streams — keep waiting.
+                    Ok(Some(BusEvent::Lagged(_))) => {}
+                    Ok(None) => panic!("subscription closed before both streams arrived"),
+                    Err(_) => panic!("doorbell timed out; saw {seen:?} of our two streams"),
+                }
+            }
+            seen
         });
 
         // Same bounded-retry doorbell-ring pattern as
         // `doorbell_delivers_a_live_event_to_a_subscriber`: the LISTEN
         // connection is established lazily on first poll, so ring both
-        // doorbells repeatedly (idempotent — replay starts from
-        // last_seq+1 per key) until the now-live, unfiltered subscriber has
-        // consumed both events.
+        // doorbells repeatedly (idempotent — replay starts from last_seq+1 per
+        // key). Crucially, keep ringing until the subscriber has actually
+        // consumed both events (`recv.is_finished()`), NOT for a fixed window:
+        // under a saturated runtime (the full parallel test suite) the
+        // subscribe_all task's lazy LISTEN can take several seconds to come up,
+        // and if the nudges stop before then, no later doorbell ever replays our
+        // rows and the subscriber times out having seen nothing.
         let event_a = ev(1, &agent_a);
         let event_b = ev(1, &agent_b);
         store.append(&event_a).await.unwrap();
         store.append(&event_b).await.unwrap();
-        for _ in 0..40 {
-            bus.publish(event_a.clone());
-            bus.publish(event_b.clone());
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        for _ in 0..280 {
             if recv.is_finished() {
                 break;
             }
+            bus.publish(event_a.clone());
+            bus.publish(event_b.clone());
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let (first, second) = recv.await.unwrap();
-        let mut seen = std::collections::HashSet::new();
-        for r in [first, second] {
-            match r.expect("doorbell timed out") {
-                Some(BusEvent::Event(ev)) => {
-                    assert!(
-                        ev.agent_id == agent_a || ev.agent_id == agent_b,
-                        "unexpected stream key delivered: {}",
-                        ev.agent_id
-                    );
-                    assert!(
-                        seen.insert(ev.agent_id.clone()),
-                        "duplicate delivery for stream {} (per-key high-water not advancing)",
-                        ev.agent_id
-                    );
-                }
-                other => panic!("expected a live event, got {other:?}"),
-            }
-        }
+        let seen = recv.await.unwrap();
         assert_eq!(
             seen.len(),
             2,
