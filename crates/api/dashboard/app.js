@@ -14,8 +14,9 @@ let selectedAgent = null;
 let evtSource = null;
 let healthyWorkspaces = []; // names of reachable repos, for the launch picker
 let lastFleet = null; // most recent fleet snapshot, for stream-head lookups
-let streamCtx = null; // { id, name, status, model, cost, turns, outcome } for the streamed agent
+let streamCtx = null; // { id, name, status, model, cost, turns, outcome, lastSeq, terminal } for the streamed agent
 let streamEvents = []; // accumulated events for the selected agent (folded into the timeline)
+let reconnectTimer = null; // pending manual SSE reconnect (see openAgentStream)
 const expandedTools = new Set(); // tool span keys (event seq) the user expanded
 
 function findAgent(id) {
@@ -571,13 +572,26 @@ function selectAgent(id) {
   selectedAgent = id;
   document.body.classList.add("show-stream"); // responsive: reveal the stream pane
   const a = findAgent(id);
-  streamCtx = { id, name: (a && a.name) || id, status: (a && a.status) || "", model: null, cost: null, turns: null, outcome: null };
+  streamCtx = { id, name: (a && a.name) || id, status: (a && a.status) || "", model: null, cost: null, turns: null, outcome: null, lastSeq: 0, terminal: false };
   streamEvents = [];
   expandedTools.clear();
   refreshFleet();
   streamLogEl.innerHTML = "";
-  if (evtSource) evtSource.close();
-  evtSource = new EventSource(`/api/agents/${encodeURIComponent(id)}/stream`);
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  openAgentStream(id, 0);
+  paintStreamHead();
+}
+
+// Open (or reopen) the SSE stream from `fromSeq`. We manage reconnection
+// ourselves rather than leaning on EventSource's built-in retry: the built-in
+// path always reopens the *original* URL (`from=0`), so on a terminal agent —
+// whose stream the server closes for good — it would loop forever, re-replaying
+// the whole history and growing the timeline without bound. Instead we resume
+// from the last seq we saw, and stop entirely once the agent is terminal.
+function openAgentStream(id, fromSeq) {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  evtSource = new EventSource(`/api/agents/${encodeURIComponent(id)}/stream?from=${fromSeq}`);
   evtSource.onopen = () => paintStreamHead();
   evtSource.onmessage = (e) => appendEvent(JSON.parse(e.data));
   // The backend self-heals a slow-consumer gap (replays the missed events from
@@ -593,17 +607,40 @@ function selectAgent(id) {
     } });
     renderTimeline();
   });
-  evtSource.onerror = () => paintStreamHead();
-  paintStreamHead();
+  evtSource.onerror = () => {
+    paintStreamHead();
+    // Take control of the closed connection (default retry would replay from 0).
+    if (evtSource) { evtSource.close(); evtSource = null; }
+    // A terminal agent's stream is closed permanently — do NOT reconnect. Also
+    // bail if the user has since selected a different agent.
+    if (!streamCtx || streamCtx.id !== id || streamCtx.terminal) return;
+    // Live agent, transient drop: reconnect once from the next unseen seq (so we
+    // don't replay already-seen events), after a small backoff.
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (streamCtx && streamCtx.id === id && !streamCtx.terminal) openAgentStream(id, streamCtx.lastSeq + 1);
+    }, 1000);
+  };
 }
 
 function appendEvent(ev) {
+  // Dedup by seq: a reconnect (or the server's own replay) may re-deliver events
+  // we've already folded in. Real events carry seq >= 1; synthetic UI markers
+  // (the `gap` notice) use seq -1 and are exempt.
+  if (streamCtx && ev.seq > 0) {
+    if (ev.seq <= streamCtx.lastSeq) return;
+    streamCtx.lastSeq = ev.seq;
+  }
   streamEvents.push(ev);
   const k = ev.kind;
   if (streamCtx) {
     if (k.kind === "agent_init") streamCtx.model = k.model;
     else if (k.kind === "agent_finished") {
       streamCtx.cost = k.cost_usd; streamCtx.turns = k.turns; streamCtx.outcome = k.outcome;
+      streamCtx.terminal = true;
+    } else if (k.kind === "agent_gone") {
+      streamCtx.terminal = true;
     } else if (k.kind === "status_changed") streamCtx.status = k.to;
     paintStreamHead();
   }
