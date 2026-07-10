@@ -1124,7 +1124,7 @@ impl FleetManager {
 
         // Agents that disappeared from caliban's registry. Only the repo
         // lifecycle-lease owner emits it. (#59)
-        for (old_id, _) in prior.iter() {
+        for old_id in prior.keys() {
             if own_lifecycle && !records.iter().any(|r| &r.id == old_id) {
                 self.inner
                     .emitter
