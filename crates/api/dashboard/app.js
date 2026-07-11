@@ -657,7 +657,8 @@ function appendEvent(ev) {
 function groupEvents(events) {
   const segs = [];
   let out = null; // current coalescing output block { kind:"out", text:"" }
-  const openTools = {}; // name -> [tool rows awaiting their finish]
+  const openById = {}; // tool_use_id -> tool row awaiting its finish
+  const openFifo = []; // open rows in start order (fallback when id is absent)
   const flushOut = () => { out = null; };
   for (const ev of events) {
     const k = ev.kind, seq = ev.seq;
@@ -672,14 +673,24 @@ function groupEvents(events) {
         break;
       case "tool_started": {
         flushOut();
-        const row = { kind: "tool", seq, name: k.name, input: k.input, ok: null };
+        const row = { kind: "tool", seq, id: k.id, name: k.name, input: k.input, ok: null };
         segs.push(row);
-        (openTools[k.name] = openTools[k.name] || []).push(row);
+        if (k.id) openById[k.id] = row;
+        openFifo.push(row);
         break;
       }
       case "tool_finished": {
-        const q = openTools[k.name];
-        if (q && q.length) q.shift().ok = k.ok;
+        // caliban's ToolCallEnd carries the tool_use_id but no name, so pair the
+        // finish to its start on `id`. Fall back to the oldest still-open tool
+        // (FIFO) for pre-#106 events that carry no id.
+        let row = k.id ? openById[k.id] : null;
+        if (!row) row = openFifo.find((r) => r.ok === null);
+        if (row) {
+          row.ok = k.ok;
+          if (row.id) delete openById[row.id];
+          const i = openFifo.indexOf(row);
+          if (i >= 0) openFifo.splice(i, 1);
+        }
         break;
       }
       case "status_changed":

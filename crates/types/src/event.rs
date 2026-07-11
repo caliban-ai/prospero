@@ -52,6 +52,11 @@ pub enum EventKind {
     },
     /// A tool call started.
     ToolStarted {
+        /// Caliban's `tool_use_id`, correlating this start with its
+        /// [`ToolFinished`]. `#[serde(default)]` for pre-#106 stored events,
+        /// which predate this field (they carry only `name`).
+        #[serde(default)]
+        id: String,
         /// Tool name (e.g. "Read").
         name: String,
         /// Tool input (opaque JSON).
@@ -59,7 +64,14 @@ pub enum EventKind {
     },
     /// A tool call finished.
     ToolFinished {
-        /// Tool name.
+        /// Caliban's `tool_use_id`, correlating this finish with its
+        /// [`ToolStarted`]. Caliban's `ToolCallEnd` carries the id but not the
+        /// name, so consumers pair on the id. `#[serde(default)]` for pre-#106
+        /// stored events.
+        #[serde(default)]
+        id: String,
+        /// Tool name. Empty in practice — caliban's `ToolCallEnd` omits it; the
+        /// name is on the matching [`ToolStarted`]. Kept for wire compatibility.
         name: String,
         /// Whether the tool succeeded.
         ok: bool,
@@ -137,11 +149,13 @@ mod tests {
     #[test]
     fn event_kind_is_internally_tagged() {
         let k = EventKind::ToolFinished {
+            id: "tu_1".into(),
             name: "Read".into(),
             ok: true,
         };
         let v = serde_json::to_value(&k).unwrap();
         assert_eq!(v["kind"], "tool_finished");
+        assert_eq!(v["id"], "tu_1");
         assert_eq!(v["name"], "Read");
         assert_eq!(v["ok"], true);
     }

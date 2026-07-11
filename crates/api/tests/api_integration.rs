@@ -392,6 +392,7 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
         .append(&ev(
             1,
             EventKind::ToolStarted {
+                id: "tu_1".to_string(),
                 name: "Read".to_string(),
                 input: serde_json::json!({ "path": "/x.rs" }),
             },
@@ -402,6 +403,7 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
         .append(&ev(
             2,
             EventKind::ToolFinished {
+                id: "tu_1".to_string(),
                 name: "Read".to_string(),
                 ok: true,
             },
