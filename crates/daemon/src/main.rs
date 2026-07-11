@@ -135,6 +135,26 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 ///
 /// Not feature-gated (its tests run in every build), but only *called* from the
 /// k8s arm — so a bin-only build without `k8s` sees it as dead. Allow that.
+/// Refuse to start the k8s backend with a session-plane token but no TLS: the
+/// token would be written in the clear on every per-agent dial (see the preamble
+/// in `caliband::transport`), defeating its purpose. Fail fast at startup rather
+/// than silently transmit it (#107).
+///
+/// Like [`read_token_file`], only *called* from the k8s arm, so a non-k8s build
+/// sees it as dead — but its test runs in every build.
+#[cfg_attr(not(feature = "k8s"), allow(dead_code))]
+fn require_token_tls(token_present: bool, tls_present: bool) -> anyhow::Result<()> {
+    if token_present && !tls_present {
+        anyhow::bail!(
+            "a session-plane token is configured (--k8s-caliband-token-file / \
+             PROSPERO_K8S_CALIBAND_TOKEN_FILE) but TLS is not (--k8s-caliband-ca-file / \
+             PROSPERO_K8S_CALIBAND_CA_FILE); the token would be sent in cleartext. \
+             Configure the CA file to enable TLS, or unset the token."
+        );
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(feature = "k8s"), allow(dead_code))]
 fn read_token_file(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
@@ -386,6 +406,9 @@ async fn main() -> anyhow::Result<()> {
                 .map(read_token_file)
                 .transpose()?;
 
+            // Never send the bearer token over plaintext (#107).
+            require_token_tls(token.is_some(), tls.is_some())?;
+
             // No FleetManager under k8s: K8sFleet serves directly over the
             // shared store/bus (#83).
             let k8s = prospero_core::K8sFleet::new(api, bus.clone(), store.clone())
@@ -509,6 +532,17 @@ mod tests {
     fn read_token_file_missing_is_err() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_token_file(&dir.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn require_token_tls_rejects_token_without_tls() {
+        // The one unsafe combination: a token but no TLS → cleartext token.
+        assert!(require_token_tls(true, false).is_err());
+        // Every other combination is fine (no token, or token protected by TLS,
+        // or TLS with no token).
+        assert!(require_token_tls(true, true).is_ok());
+        assert!(require_token_tls(false, false).is_ok());
+        assert!(require_token_tls(false, true).is_ok());
     }
 
     #[cfg(feature = "k8s")]
