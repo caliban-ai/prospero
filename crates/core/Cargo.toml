@@ -3,6 +3,13 @@ name = "prospero-core"
 version.workspace = true
 edition.workspace = true
 
+# `cargo llvm-cov` compiles with `--cfg coverage`; declare it so the normal
+# (non-coverage) build doesn't trip the `unexpected_cfgs` lint under `-D warnings`.
+# Used by a couple of live LISTEN/NOTIFY tests that are `#[cfg_attr(coverage, ignore)]`
+# (their doorbell timing is unreliable under instrumentation — see distributed_bus.rs).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
+
 [features]
 # Test/integration harness reused by other crates' tests (FakeCaliband).
 # `rcgen` backs the TCP+TLS fake's self-signed cert; `tempfile` its per-agent
