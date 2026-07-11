@@ -88,24 +88,58 @@ pub fn build_calibantask(spec: &TaskSpec, name: &str) -> CalibanTask {
     CalibanTask::new(name, crd_spec)
 }
 
-/// If `task` has reached `status.phase == "Running"` with a resolved
-/// `calibandEndpoint`, build the `AgentHandle` callers can attach through.
-/// Returns `None` while still provisioning (or if the name is somehow unset).
-#[must_use]
-pub fn handle_from(task: &CalibanTask, repo: String) -> Option<AgentHandle> {
-    let status = task.status.as_ref()?;
-    if status.phase != "Running" {
-        return None;
+/// Validate the operator-provided `calibandEndpoint` before it's handed to the
+/// dialer as a raw `host:port` (#127). Rejects the obviously-malformed cases —
+/// empty, a scheme-qualified URL (`tcp://…`, `https://…`), or embedded
+/// whitespace — so a misconfigured CR fails fast with a clear message instead
+/// of deferring to a late, generic connect error deep in the dial path. This is
+/// a cheap sanity gate, not a full authority parse: `caliband_endpoint` is a
+/// bare `host:port` by contract, and anything shaped unlike one is a config bug.
+fn validate_caliband_endpoint(addr: &str) -> Result<()> {
+    if addr.trim().is_empty() {
+        return Err(CoreError::Fleet(
+            "CalibanTask status.calibandEndpoint is empty".to_string(),
+        ));
     }
-    let endpoint_addr = status.caliband_endpoint.as_ref()?;
-    let name = task.metadata.name.clone()?;
-    Some(AgentHandle {
+    if addr.contains("://") {
+        return Err(CoreError::Fleet(format!(
+            "CalibanTask status.calibandEndpoint must be a bare host:port, not a URL: {addr:?}"
+        )));
+    }
+    if addr.chars().any(char::is_whitespace) {
+        return Err(CoreError::Fleet(format!(
+            "CalibanTask status.calibandEndpoint contains whitespace: {addr:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// If `task` has reached `status.phase == "Running"` with a resolved,
+/// well-formed `calibandEndpoint`, build the `AgentHandle` callers can attach
+/// through. `Ok(None)` while still provisioning (or if the name is somehow
+/// unset); `Err(..)` if the endpoint is present but malformed (#127) — a clear
+/// config error beats a late generic dial failure.
+pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandle>> {
+    let Some(status) = task.status.as_ref() else {
+        return Ok(None);
+    };
+    if status.phase != "Running" {
+        return Ok(None);
+    }
+    let Some(endpoint_addr) = status.caliband_endpoint.as_ref() else {
+        return Ok(None);
+    };
+    let Some(name) = task.metadata.name.clone() else {
+        return Ok(None);
+    };
+    validate_caliband_endpoint(endpoint_addr)?;
+    Ok(Some(AgentHandle {
         id: AgentId::from(name),
         workspace: repo,
         endpoint: Endpoint::Tcp {
             addr: endpoint_addr.clone(),
         },
-    })
+    }))
 }
 
 /// Map a `CalibanTask`'s `status.phase` string onto Prospero's `AgentStatus`.
@@ -126,13 +160,21 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Option<AgentHandle> {
 ///   `Running` for a dashboard, and it isn't `is_terminal()` since the CR is
 ///   still present.
 /// - `Completed` → `Done`, `Failed` → `Failed` (direct terminal mapping).
-/// - Anything else (an operator phase this mirror doesn't know about yet, or
-///   a blank/unset phase) → `Spawning`, the safe "not yet ready" default,
-///   logged as a warning rather than silently reported as `Running`.
+/// - A blank/unset phase (`""`) → `Spawning`: a CR the operator hasn't
+///   reconciled yet genuinely hasn't started, so "not yet ready" is correct.
+/// - Any *other* unrecognized, non-empty phase → `Failed`, a terminal state,
+///   logged as a warning. Mapping a named-but-unknown phase to the
+///   non-terminal `Spawning` was actively harmful: a phase we can't interpret
+///   (including a *finished* one this mirror is too old to name, e.g.
+///   "Succeeded"/"TimedOut") would look like it's still starting forever,
+///   wedging every `is_terminal`/`is_active` caller. A terminal fallback fails
+///   safe — a new *terminal* phase is far likelier than a new *provisioning*
+///   one, so "unknown ⇒ done/failed" beats "unknown ⇒ eternally spawning".
 #[must_use]
 pub fn phase_to_status(phase: &str) -> AgentStatus {
     match phase {
-        "Pending" | "Provisioning" => AgentStatus::Spawning,
+        // Not-yet-reconciled CR (no status written): still legitimately coming up.
+        "" | "Pending" | "Provisioning" => AgentStatus::Spawning,
         "Running" => AgentStatus::Running,
         "Draining" => AgentStatus::Idle,
         "Completed" => AgentStatus::Done,
@@ -140,9 +182,9 @@ pub fn phase_to_status(phase: &str) -> AgentStatus {
         other => {
             tracing::warn!(
                 target: "prospero_k8s_fleet", phase = other,
-                "unrecognized CalibanTask phase; defaulting to AgentStatus::Spawning"
+                "unrecognized CalibanTask phase; defaulting to terminal AgentStatus::Failed"
             );
-            AgentStatus::Spawning
+            AgentStatus::Failed
         }
     }
 }
@@ -388,7 +430,10 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
             // consistent snapshot, then broadcast after releasing it.
             let mut changes: Vec<FleetChange> = Vec::new();
             {
-                let mut known = known.lock().unwrap();
+                // Poison-tolerant: recover the guard if a prior holder panicked,
+                // so one panic can't wedge every later poll/watch/metrics call
+                // (#126). The map is a plain last-observed cache, safe to reuse.
+                let mut known = known.lock().unwrap_or_else(|e| e.into_inner());
                 let mut seen: HashSet<String> = HashSet::with_capacity(tasks.len());
                 for task in &tasks {
                     let Some(name) = task.metadata.name.clone() else {
@@ -552,7 +597,9 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
             }
         };
         {
-            let mut attached = self.attached.lock().unwrap();
+            // Poison-tolerant lock acquisition (#126): a panic elsewhere must
+            // not wedge session-plane attach for every later agent.
+            let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
             if !attached.insert(agent_id.to_string()) {
                 // Already streaming this agent (e.g. a repeat `ensure_agent`
                 // for the same spec-deterministic CR name).
@@ -588,7 +635,10 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
                     "k8s session-plane attach task ended with error"
                 );
             }
-            attached.lock().unwrap().remove(&agent_id);
+            attached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&agent_id); // poison-tolerant (#126)
         });
     }
 }
@@ -604,7 +654,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         let deadline = tokio::time::Instant::now() + self.poll.deadline;
         loop {
             if let Some(task) = self.api.get(&name).await?
-                && let Some(handle) = handle_from(&task, repo.clone())
+                && let Some(handle) = handle_from(&task, repo.clone())?
             {
                 // Session-plane bridge (Task B4, ADR 0008 §3): as soon as the
                 // agent is attachable, start feeding its live output into the
@@ -635,7 +685,8 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 
         let stream = async_stream::stream! {
             let seed: Vec<(String, Agent)> = {
-                let known = known.lock().unwrap();
+                // Poison-tolerant (#126): recover rather than panic the stream.
+                let known = known.lock().unwrap_or_else(|e| e.into_inner());
                 known.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
             };
             let mut seen: HashSet<String> = HashSet::with_capacity(seed.len());
@@ -661,7 +712,8 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
                         // Slow subscriber fell behind: re-seed from the shared
                         // `known` rather than silently dropping changes.
                         let reseed: Vec<(String, Agent)> = {
-                            let known = known.lock().unwrap();
+                            // Poison-tolerant (#126).
+                            let known = known.lock().unwrap_or_else(|e| e.into_inner());
                             known.iter().map(|(n, a)| (n.clone(), a.clone())).collect()
                         };
                         seen.clear();
@@ -778,7 +830,12 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
     }
 
     fn metrics(&self) -> crate::metrics::MetricsSnapshot {
-        let active = self.attached.lock().unwrap().len() as u64;
+        // Poison-tolerant (#126): a metrics scrape must never panic.
+        let active = self
+            .attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len() as u64;
         self.emitter.metrics_snapshot(active)
     }
 
@@ -795,7 +852,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             .get(id.as_str())
             .await?
             .ok_or_else(|| CoreError::AgentNotFound(id.as_str().to_string()))?;
-        let handle = handle_from(&task, "k8s".into()).ok_or_else(|| CoreError::InvalidState {
+        let handle = handle_from(&task, "k8s".into())?.ok_or_else(|| CoreError::InvalidState {
             op: "send_input".to_string(),
             id: id.as_str().to_string(),
             status: "not attachable".to_string(),
@@ -1091,9 +1148,78 @@ mod tests {
     }
 
     #[test]
-    fn phase_to_status_defaults_unknown_phases_to_spawning() {
-        assert_eq!(phase_to_status("SomeFuturePhase"), AgentStatus::Spawning);
+    fn phase_to_status_maps_unknown_named_phases_to_terminal_not_spawning() {
+        // #114: a named-but-unrecognized phase must NOT be reported as the
+        // non-terminal `Spawning` (which would make a finished agent look like
+        // it's still starting forever). It maps to a terminal state instead.
+        for phase in ["Succeeded", "TimedOut", "SomethingNew"] {
+            let status = phase_to_status(phase);
+            assert_ne!(
+                status,
+                AgentStatus::Spawning,
+                "unknown phase {phase} must not map to the non-terminal Spawning"
+            );
+            assert!(
+                status.is_terminal(),
+                "unknown phase {phase} should map to a terminal status, got {status:?}"
+            );
+            assert_eq!(status, AgentStatus::Failed);
+        }
+        // A blank/unset phase is the one exception: a not-yet-reconciled CR is
+        // genuinely still coming up, so it stays `Spawning`.
         assert_eq!(phase_to_status(""), AgentStatus::Spawning);
+    }
+
+    /// #127: a Running CR whose `calibandEndpoint` is malformed (empty, a
+    /// scheme-qualified URL, or whitespace-laden) must surface a clear error
+    /// from `handle_from`, not a well-formed handle that fails later at dial.
+    #[test]
+    fn handle_from_rejects_malformed_endpoint() {
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+
+        let with_endpoint = |endpoint: &str| {
+            let mut ct = build_calibantask(&s, &name);
+            ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+                phase: "Running".to_string(),
+                caliband_endpoint: Some(endpoint.to_string()),
+                sandbox_ref: None,
+            });
+            ct
+        };
+
+        for bad in [
+            "",
+            "   ",
+            "tcp://10.0.0.5:9443",
+            "https://host:9443",
+            "10.0.0.5 9443",
+        ] {
+            let err = handle_from(&with_endpoint(bad), "repo-a".into())
+                .expect_err(&format!("endpoint {bad:?} should be rejected"));
+            assert!(
+                matches!(err, CoreError::Fleet(_)),
+                "got {err:?} for {bad:?}"
+            );
+        }
+
+        // A well-formed bare host:port still yields a handle.
+        let handle = handle_from(&with_endpoint("10.0.0.5:9443"), "repo-a".into())
+            .expect("valid endpoint is Ok")
+            .expect("valid endpoint yields a handle");
+        assert_eq!(
+            handle.endpoint,
+            Endpoint::Tcp {
+                addr: "10.0.0.5:9443".to_string()
+            }
+        );
+
+        // Still provisioning (no status) is Ok(None), not an error.
+        assert!(
+            handle_from(&build_calibantask(&s, &name), "repo-a".into())
+                .expect("no status is Ok")
+                .is_none()
+        );
     }
 
     #[test]

@@ -185,10 +185,28 @@ mod server {
         String::from_utf8(buf).map_err(std::io::Error::other)
     }
 
+    /// Constant-time byte-string equality. Compares in time that depends only
+    /// on the *lengths* of the inputs, never on *where* they first differ, so a
+    /// bearer-token check can't be turned into a timing oracle that recovers
+    /// the token byte-by-byte. `subtle` isn't a dependency of this crate, so
+    /// this is a minimal hand-rolled version: bail early only on a length
+    /// mismatch (a token's length isn't secret), then XOR-accumulate every byte
+    /// so the loop always runs to completion regardless of the first mismatch.
+    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff: u8 = 0;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+
     async fn server_check_token(conn: &mut BoxConn, expected: &str) -> std::io::Result<()> {
         let line = read_preamble_line(conn).await?;
         let preamble: TokenPreamble = serde_json::from_str(&line).map_err(std::io::Error::other)?;
-        if preamble.bearer == expected {
+        if constant_time_eq(preamble.bearer.as_bytes(), expected.as_bytes()) {
             Ok(())
         } else {
             Err(std::io::Error::new(

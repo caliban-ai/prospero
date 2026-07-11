@@ -245,6 +245,22 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Reject an unsupported backend BEFORE any side effects (#121). Phase 1
+    // below creates the data dir and opens the sqlite/Postgres store; doing
+    // that first for a `--fleet-backend k8s` invocation on a build without the
+    // k8s feature would leave a data dir behind and open a store only to bail
+    // out at Phase 2. The `K8s` variant exists in every build — only the
+    // Phase-2 match arm is feature-gated — so guard it here, cfg'd out (and
+    // thus a no-op) when the k8s feature *is* present.
+    #[cfg(not(feature = "k8s"))]
+    if args.fleet_backend == FleetBackend::K8s {
+        anyhow::bail!(
+            "PROSPERO_FLEET=k8s requires a prosperod built with the k8s feature \
+             (`cargo build -p prospero-daemon --features k8s`)."
+        );
+    }
+
     let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
