@@ -417,6 +417,14 @@ mod tests {
     // they contend cooperatively on one thread and — under the slow, instrumented
     // coverage build especially — can starve the listener so no doorbell is ever
     // processed. Real threads keep the listener draining while we publish.
+    // Excluded from the instrumented coverage run: `subscribe_all` replays from
+    // the store for EVERY doorbell on the shared channel, so on an oversubscribed,
+    // instrumented CI runner its listener can be starved long enough to time out
+    // (observed: zero deliveries in 45s) even though it is reliable in the normal
+    // `cargo test` job. `cargo llvm-cov` sets `--cfg coverage`; the `subscribe()`
+    // doorbell path stays covered by the other three tests, which pass under
+    // instrumentation.
+    #[cfg_attr(coverage, ignore = "live doorbell timing is unreliable under llvm-cov instrumentation")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn subscribe_all_delivers_events_from_multiple_streams() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
