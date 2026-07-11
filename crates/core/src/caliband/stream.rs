@@ -64,13 +64,16 @@ pub fn normalize_frame(frame: &serde_json::Value, opts: NormalizeOptions) -> Nor
         // A tool call opened. The input arrives later via
         // `ToolCallInputDelta`s, so it is not yet known here.
         "ToolCallStart" => Normalized::Event(EventKind::ToolStarted {
+            id: str_field(frame, "tool_use_id"),
             name: str_field(frame, "name"),
             input: serde_json::Value::Null,
         }),
         // A tool call completed. caliban's `ToolCallEnd` carries the
         // `tool_use_id` and `is_error` but not the tool name (that was on the
-        // matching `ToolCallStart`), so `name` is left empty.
+        // matching `ToolCallStart`), so `name` is left empty and consumers pair
+        // the finish to its start on `tool_use_id`.
         "ToolCallEnd" => Normalized::Event(EventKind::ToolFinished {
+            id: str_field(frame, "tool_use_id"),
             name: String::new(),
             ok: !frame
                 .get("is_error")
@@ -167,6 +170,7 @@ mod tests {
                 "turn_index": 0, "tool_use_id": "tu_1", "name": "Read"
             })),
             Normalized::Event(EventKind::ToolStarted {
+                id: "tu_1".into(),
                 name: "Read".into(),
                 input: serde_json::Value::Null,
             })
@@ -181,6 +185,7 @@ mod tests {
                 "turn_index": 0, "tool_use_id": "tu_1", "is_error": true, "content": []
             })),
             Normalized::Event(EventKind::ToolFinished {
+                id: "tu_1".into(),
                 name: String::new(),
                 ok: false
             })
@@ -191,6 +196,7 @@ mod tests {
                 "turn_index": 0, "tool_use_id": "tu_1", "is_error": false, "content": []
             })),
             Normalized::Event(EventKind::ToolFinished {
+                id: "tu_1".into(),
                 name: String::new(),
                 ok: true
             })
