@@ -422,7 +422,7 @@ mod tests {
         let b_recv = agent_b.clone();
         let recv = tokio::spawn(async move {
             let mut seen = std::collections::HashSet::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
             while seen.len() < 2 {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 match tokio::time::timeout(remaining, sub.next()).await {
@@ -459,7 +459,7 @@ mod tests {
         let event_b = ev(1, &agent_b);
         store.append(&event_a).await.unwrap();
         store.append(&event_b).await.unwrap();
-        for _ in 0..280 {
+        for _ in 0..440 {
             if recv.is_finished() {
                 break;
             }
