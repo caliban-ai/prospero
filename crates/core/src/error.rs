@@ -57,6 +57,13 @@ pub enum CoreError {
     #[error("workspace not registered: {0}")]
     WorkspaceNotFound(String),
 
+    /// A request conflicts with existing state and can never succeed as-is —
+    /// e.g. registering a workspace name/root that is already taken. Distinct
+    /// from [`CoreError::Discovery`] (a *transient* reachability failure) so the
+    /// API can return `409 Conflict` rather than a retry-implying `503`.
+    #[error("{0}")]
+    Conflict(String),
+
     /// The repo's selected provider is missing a required credential, so a
     /// spawn would produce a doomed agent. Caught before the spawn is issued.
     #[error("provider misconfigured: {0}")]
