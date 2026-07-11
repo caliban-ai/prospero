@@ -425,10 +425,48 @@ async fn main() -> anyhow::Result<()> {
             // Never send the bearer token over plaintext (#107).
             require_token_tls(token.is_some(), tls.is_some())?;
 
+            // Leader election for the session plane (#108): when clustered
+            // (Postgres present), gate attach/emit on a per-agent `LeasedOwnership`
+            // lease so 2+ replicas don't both stream — and double-emit — the same
+            // agent. Reuses the exact replica-id + lease-ttl + heartbeat machinery
+            // the local clustered arm uses. Standalone keeps `SelfOwnsAll`, so
+            // single-replica k8s behavior is unchanged.
+            let (ownership, heartbeat_handle): (Arc<dyn Ownership>, Option<JoinHandle<()>>) =
+                if let Some(url) = args.database_url.clone() {
+                    let replica_id = resolve_replica_id(args.replica_id.as_deref());
+                    let ownership = Arc::new(
+                        LeasedOwnership::connect(&url, replica_id.clone(), args.lease_ttl_secs)
+                            .await
+                            .with_context(|| "connecting clustered ownership (k8s)")?,
+                    );
+                    let interval =
+                        heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_secs);
+                    let hb = ownership.clone();
+                    let heartbeat_handle = tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(interval);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            hb.heartbeat().await;
+                        }
+                    });
+                    tracing::info!(
+                        target: "prosperod", backend = "k8s", %replica_id,
+                        lease_ttl_secs = args.lease_ttl_secs,
+                        heartbeat_ms = interval.as_millis() as u64,
+                        "clustered k8s ownership + heartbeat active"
+                    );
+                    (ownership as Arc<dyn Ownership>, Some(heartbeat_handle))
+                } else {
+                    (Arc::new(SelfOwnsAll) as Arc<dyn Ownership>, None)
+                };
+
             // No FleetManager under k8s: K8sFleet serves directly over the
-            // shared store/bus (#83).
+            // shared store/bus (#83), with the ownership lease gating the
+            // session plane (#108).
             let k8s = prospero_core::K8sFleet::new(api, bus.clone(), store.clone())
-                .with_network(tls.clone(), token.clone());
+                .with_network(tls.clone(), token.clone())
+                .with_ownership(ownership);
             tracing::info!(
                 target: "prosperod", backend = "k8s", namespace = %ns,
                 session_tls = tls.is_some(), session_token = token.is_some(),
@@ -438,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(k8s) as Arc<dyn prospero_core::FleetProvider>,
                 None,
                 None,
-                None,
+                heartbeat_handle,
                 None,
             )
         }

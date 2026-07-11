@@ -99,13 +99,15 @@ async fn k8s_fleet_streams_a_network_agent_into_the_store() {
 
     // 5. The seam under test: dial the pod caliband's control endpoint over
     //    the network, attach, normalize, and land frames in the store.
-    fleet.start_agent_stream(
-        repo,
-        agent_id,
-        &Endpoint::Tcp {
-            addr: tls_fixture.addr,
-        },
-    );
+    fleet
+        .start_agent_stream(
+            repo,
+            agent_id,
+            &Endpoint::Tcp {
+                addr: tls_fixture.addr,
+            },
+        )
+        .await;
 
     // 6. Assert the frames actually reached the store, keyed the same way
     //    `/stream` would look them up — `stream_key_for(repo, agent_id)`,

@@ -16,6 +16,7 @@
 //! poll-based reconciliation on this timescale.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ use crate::fleet::{AttachBackoff, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
 use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, Source, TaskSpec as CrdTaskSpec, Workspace};
 use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
+use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::store::Store;
 
 /// Deterministic, DNS-1123-safe name for the `CalibanTask` CR backing `spec`.
@@ -358,23 +360,13 @@ pub struct K8sFleet<A: CalibanTaskApi> {
     /// via [`Self::with_watch_poll_interval`] so change assertions don't wait
     /// on the production cadence.
     watch_poll_interval: Duration,
-    /// Session-plane emitter: shares the exact bus/store `FleetManager`'s own
-    /// attach loop feeds (`crate::fleet::Emitter`).
-    emitter: Emitter,
-    /// TLS trust material for dialing each agent's caliband control endpoint,
-    /// operator-injected (env/Secret; see [`Self::with_network`]). `None` in
-    /// the fake/test plaintext path.
-    tls: Option<TlsClient>,
-    /// Bearer token presented after the TLS handshake (ADR 0051). `None` in
-    /// the fake/test no-auth path.
-    token: Option<String>,
-    /// CalibanTask names (== the `AgentId` `ensure_agent` hands back) with an
-    /// already-running session-plane attach task, guarding
-    /// [`Self::start_agent_stream`] against double-starting one when
-    /// `ensure_agent` is called again for an already-`Running` agent
-    /// (`ensure_agent`'s CR name is spec-deterministic, so this is a real
-    /// case, not just theoretical).
-    attached: Arc<Mutex<HashSet<String>>>,
+    /// The session-plane: emitter + dial materials + the live per-agent attach
+    /// tasks + the ownership lease that gates who attaches. Cloned into the
+    /// shared poll loop so the lease owner can attach observed-`Running` agents
+    /// (#113), and shared with the `FleetProvider` methods so stop/remove/
+    /// restart can stop a stale attach task (#112). All its mutable state is
+    /// behind `Arc`, so a clone shares one attach set / lease mirror.
+    session: SessionPlane,
     /// Canonical last-observed agents, maintained by the shared poll loop and
     /// read by `watch_fleet` to seed new subscribers consistently. (#77 M2)
     known: KnownAgents,
@@ -394,6 +386,202 @@ impl<A: CalibanTaskApi> Drop for K8sFleet<A> {
     }
 }
 
+/// Control handle for one agent's live session-plane attach task, so
+/// stop/remove/restart can stop it promptly instead of leaving it dialing a
+/// dead endpoint (#112). Kept in [`SessionPlane::attached`] keyed by agent id.
+struct AttachTask {
+    /// Cooperative shutdown: send `true` and [`attach_loop`] stops reconnecting
+    /// and drains between frames. Sufficient once the stream is established.
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// Hard-stop even while the task is blocked *dialing* a dead endpoint —
+    /// cooperative shutdown can't interrupt an in-flight connect, which is
+    /// exactly the ~30s-of-reconnect-budget hang #112 is about. `None` only for
+    /// the vanishing window between reserving the slot and the spawn returning.
+    abort: Option<tokio::task::AbortHandle>,
+    /// Distinguishes successive attach tasks for the same agent id so a stale
+    /// task's exit-cleanup can't evict a *newer* task's entry (restart
+    /// re-attach): the exiting task removes its entry only if the generation
+    /// still matches.
+    generation: u64,
+}
+
+/// The k8s session plane: the shared bus/store [`Emitter`], the dial materials
+/// for each agent's caliband control endpoint, the live per-agent attach tasks,
+/// and the [`Ownership`] lease that elects the single replica that attaches a
+/// given agent (#108). Cloned into the poll loop and shared with the
+/// `FleetProvider` methods; all mutable state is `Arc`, so every clone shares
+/// one attach set and one lease mirror.
+#[derive(Clone)]
+struct SessionPlane {
+    /// Session-plane emitter: shares the exact bus/store `FleetManager`'s own
+    /// attach loop feeds (`crate::fleet::Emitter`).
+    emitter: Emitter,
+    /// TLS trust material for dialing each agent's caliband control endpoint,
+    /// operator-injected (env/Secret; see [`K8sFleet::with_network`]). `None`
+    /// in the fake/test plaintext path.
+    tls: Option<TlsClient>,
+    /// Bearer token presented after the TLS handshake (ADR 0051). `None` in
+    /// the fake/test no-auth path.
+    token: Option<String>,
+    /// Agent ids (== the `AgentId` `ensure_agent` hands back) with a live
+    /// session-plane attach task. Guards [`Self::attach`] against
+    /// double-starting one, and gives stop/remove/restart a handle to stop it
+    /// (#112).
+    attached: Arc<Mutex<HashMap<String, AttachTask>>>,
+    /// Single-writer election for the session plane (#108): only the replica
+    /// that holds a given agent's per-agent lease attaches it, so 2+ replicas
+    /// don't both stream the same agent (duplicate SSE + racing seq). Defaults
+    /// to [`SelfOwnsAll`], so standalone/local behavior is unchanged.
+    ownership: Arc<dyn Ownership>,
+    /// Monotonic source for [`AttachTask::generation`].
+    generation: Arc<AtomicU64>,
+}
+
+impl SessionPlane {
+    /// Dial `endpoint` (the agent's pod-caliband **control** endpoint) and feed
+    /// its normalized frames into the shared bus/store — but only if THIS
+    /// replica wins the agent's ownership lease (#108). Idempotent: a no-op if a
+    /// stream for `agent_id` is already running here, a logged no-op for a
+    /// non-`Tcp` endpoint, and a silent no-op when a peer owns the lease.
+    async fn attach(&self, repo: &str, agent_id: &str, endpoint: &Endpoint) {
+        let addr = match endpoint {
+            Endpoint::Tcp { addr } => addr.clone(),
+            Endpoint::Unix { .. } => {
+                tracing::warn!(
+                    target: "prospero_k8s_fleet", %agent_id,
+                    "attach: k8s agent handle carries a Unix endpoint; \
+                     skipping session-plane attach (expected Tcp)"
+                );
+                return;
+            }
+        };
+
+        // Fast dedup before the (possibly remote) lease call: already streaming
+        // this agent here? Its task holds — and heartbeats — the lease; leave it.
+        if self
+            .attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(agent_id)
+        {
+            return;
+        }
+
+        // Ownership gate (#108): claim the per-agent stream. `SelfOwnsAll`
+        // always acquires (standalone unchanged); `LeasedOwnership` returns
+        // `None` if another live replica owns it, so exactly one replica
+        // attaches. Idempotent for a stream this replica already holds.
+        if self.ownership.try_acquire(agent_id).await.is_none() {
+            return;
+        }
+
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Reserve the slot under the lock (dedup against a concurrent attach for
+        // the same id — e.g. `ensure_agent` racing the poll loop). If someone
+        // already reserved it, that task owns the (idempotently-shared) lease and
+        // releases it on exit; we must NOT release here or we'd orphan its
+        // writer (mirrors `FleetManager::start_attach`).
+        {
+            let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+            if attached.contains_key(agent_id) {
+                return;
+            }
+            attached.insert(
+                agent_id.to_string(),
+                AttachTask {
+                    shutdown: shutdown_tx,
+                    abort: None,
+                    generation,
+                },
+            );
+        }
+
+        let client = CalibandClient::connect_tcp(addr, self.tls.clone(), self.token.clone());
+        let repo = repo.to_string();
+        // Owned copy for the task; the `&str` param stays valid for the
+        // abort-handle registration below.
+        let task_agent_id = agent_id.to_string();
+        let emitter = self.emitter.clone();
+        let attached = Arc::clone(&self.attached);
+        let ownership = Arc::clone(&self.ownership);
+
+        let handle = tokio::spawn(async move {
+            let result = attach_loop(
+                &client,
+                &repo,
+                &task_agent_id,
+                &emitter,
+                NormalizeOptions::default(),
+                AttachBackoff::default(),
+                &mut shutdown_rx,
+            )
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(
+                    target: "prospero_k8s_fleet", %repo, agent_id = %task_agent_id, error = %e,
+                    "k8s session-plane attach task ended with error"
+                );
+            }
+            // Self-cleanup, but only if we're still the current task for this id:
+            // a restart may have replaced us with a newer generation, whose entry
+            // we must not evict. (#112)
+            {
+                let mut attached = attached.lock().unwrap_or_else(|e| e.into_inner());
+                if attached.get(&task_agent_id).map(|t| t.generation) == Some(generation) {
+                    attached.remove(&task_agent_id);
+                }
+            }
+            // Release for prompt failover hand-off (clustered); no-op standalone.
+            ownership.release(&task_agent_id).await;
+        });
+
+        // Record the abort handle so stop/remove/restart can hard-stop a task
+        // wedged mid-dial. Guard on generation: `stop` may have already removed
+        // (and replaced or cleared) our reservation while we were spawning.
+        {
+            let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = attached.get_mut(agent_id)
+                && task.generation == generation
+            {
+                task.abort = Some(handle.abort_handle());
+            }
+        }
+    }
+
+    /// Stop the live attach task for `agent_id` (if any) and release its lease.
+    /// Prompt: cooperative shutdown drains an established stream, and the abort
+    /// handle kills one wedged mid-dial so it doesn't burn the reconnect budget
+    /// against a dead endpoint (#112). Clears the `attached` bookkeeping so a
+    /// later re-attach (#113 observe-`Running`) isn't suppressed.
+    async fn stop(&self, agent_id: &str) {
+        let task = self
+            .attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id);
+        if let Some(task) = task {
+            let _ = task.shutdown.send(true);
+            if let Some(abort) = task.abort {
+                abort.abort();
+            }
+        }
+        // Release the per-agent lease so a peer (or a future re-attach here) can
+        // claim it promptly rather than waiting out the TTL. Idempotent /
+        // no-op under `SelfOwnsAll`.
+        self.ownership.release(agent_id).await;
+    }
+
+    /// Live attach count — the `metrics()` active gauge.
+    fn active_count(&self) -> u64 {
+        self.attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len() as u64
+    }
+}
+
 /// Default cadence for `watch_fleet`'s poll-diff loop.
 const DEFAULT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -405,13 +593,15 @@ const DEFAULT_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 type KnownAgents = Arc<Mutex<HashMap<String, Agent>>>;
 
 /// Spawn the single shared poll-diff loop: `list()` on `interval`, diff against
-/// the shared `known` state, update it, and broadcast each `FleetChange` once.
+/// the shared `known` state, update it, broadcast each `FleetChange` once, and
+/// (#113) attach every observed-`Running` agent this replica is elected to own.
 /// Runs for the fleet's lifetime (aborted by `K8sFleet::drop`). (#77 M2)
 fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
     api: Arc<A>,
     known: KnownAgents,
     tx: tokio::sync::broadcast::Sender<FleetChange>,
     interval: Duration,
+    session: SessionPlane,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -426,6 +616,13 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     continue;
                 }
             };
+            // #113: any agent observed `Running` — including operator/peer-created
+            // ones this replica never spawned — must get attached so its `/stream`
+            // isn't permanently empty. Collect the attachable handles here (under
+            // the diff lock, `handle_from` is pure), then attach after releasing
+            // the lock. `session.attach` itself is gated by the #108 ownership
+            // lease, so exactly one replica actually attaches each.
+            let mut to_attach: Vec<(String, String, Endpoint)> = Vec::new();
             // Diff under the lock so a concurrent `watch_fleet` seed sees a
             // consistent snapshot, then broadcast after releasing it.
             let mut changes: Vec<FleetChange> = Vec::new();
@@ -441,6 +638,24 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     };
                     seen.insert(name.clone());
                     let agent = agent_from_task(task);
+                    // #113: queue an attach for a Running, attachable agent. A
+                    // malformed endpoint on a Running CR is logged and skipped
+                    // (same defensive posture as `handle_from`'s callers), not
+                    // fatal to the poll loop.
+                    match handle_from(task, agent.workspace.clone()) {
+                        Ok(Some(handle)) => {
+                            to_attach.push((
+                                agent.workspace.clone(),
+                                handle.id.as_str().to_string(),
+                                handle.endpoint,
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            target: "prospero_k8s_fleet", agent = %name, error = %e,
+                            "watch loop: Running CR has a malformed endpoint; skipping attach"
+                        ),
+                    }
                     match known.get(&name) {
                         None => changes.push(FleetChange::Discovered {
                             id: AgentId::from(name.clone()),
@@ -477,6 +692,13 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
             for change in changes {
                 let _ = tx.send(change);
             }
+            // #113: attach observed-Running agents (lock released above). Each
+            // call is deduped + ownership-gated inside `attach`, so a foreign or
+            // already-attached agent is cheap (a no-op after a lease miss / a
+            // map hit) and only the elected replica actually streams.
+            for (repo, id, endpoint) in to_attach {
+                session.attach(&repo, &id, &endpoint).await;
+            }
             tokio::time::sleep(interval).await;
         }
     })
@@ -506,24 +728,51 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
         let api = Arc::new(api);
         let known: KnownAgents = Arc::new(Mutex::new(HashMap::new()));
         let (changes, _) = tokio::sync::broadcast::channel::<FleetChange>(256);
+        let session = SessionPlane {
+            emitter: Emitter::new(bus, store),
+            tls: None,
+            token: None,
+            attached: Arc::new(Mutex::new(HashMap::new())),
+            // Standalone default (#108): every stream is owned unconditionally,
+            // so the lease is a no-op and single-replica/local behavior is
+            // identical to before. The daemon injects `LeasedOwnership` when
+            // clustered via [`Self::with_ownership`].
+            ownership: Arc::new(SelfOwnsAll),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
         let poll_task = spawn_watch_loop(
             Arc::clone(&api),
             Arc::clone(&known),
             changes.clone(),
             DEFAULT_WATCH_POLL_INTERVAL,
+            session.clone(),
         );
         Self {
             api,
             poll,
             watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL,
-            emitter: Emitter::new(bus, store),
-            tls: None,
-            token: None,
-            attached: Arc::new(Mutex::new(HashSet::new())),
+            session,
             known,
             changes,
             poll_task,
         }
+    }
+
+    /// Restart the shared poll loop so it captures the current session-plane
+    /// config (`tls`/`token`/`ownership`) and cadence. The builders below set
+    /// that config *after* construction, so each re-spawns the loop; since all
+    /// the loop's mutable state (`known`, `attached`, the broadcast channel) is
+    /// shared behind `Arc`, restarting it is seamless. Startup-only, so the
+    /// extra spawn is negligible.
+    fn respawn_watch_loop(&mut self) {
+        self.poll_task.abort();
+        self.poll_task = spawn_watch_loop(
+            Arc::clone(&self.api),
+            Arc::clone(&self.known),
+            self.changes.clone(),
+            self.watch_poll_interval,
+            self.session.clone(),
+        );
     }
 
     /// Override `watch_fleet`'s poll cadence. Tests use a short interval
@@ -531,14 +780,8 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// Restarts the shared poll loop at the new cadence.
     #[must_use]
     pub fn with_watch_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_task.abort();
         self.watch_poll_interval = interval;
-        self.poll_task = spawn_watch_loop(
-            Arc::clone(&self.api),
-            Arc::clone(&self.known),
-            self.changes.clone(),
-            interval,
-        );
+        self.respawn_watch_loop();
         self
     }
 
@@ -547,8 +790,20 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// Defaults to `(None, None)` — plaintext/no-auth, the fake/test path.
     #[must_use]
     pub fn with_network(mut self, tls: Option<TlsClient>, token: Option<String>) -> Self {
-        self.tls = tls;
-        self.token = token;
+        self.session.tls = tls;
+        self.session.token = token;
+        self.respawn_watch_loop();
+        self
+    }
+
+    /// Inject the single-writer election for the session plane (#108). The
+    /// daemon passes a `LeasedOwnership` when clustered (Postgres present) so
+    /// exactly one replica attaches — and thus emits events for — a given agent;
+    /// standalone keeps the default [`SelfOwnsAll`], so behavior is unchanged.
+    #[must_use]
+    pub fn with_ownership(mut self, ownership: Arc<dyn Ownership>) -> Self {
+        self.session.ownership = ownership;
+        self.respawn_watch_loop();
         self
     }
 }
@@ -579,67 +834,22 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// documented follow-up, not implemented here (kept to the narrowest
     /// version that proves network streaming into a `Store`).
     ///
-    /// ## Where this is called from (MVP scope)
-    /// Wired from [`FleetProvider::ensure_agent`] once a handle resolves.
-    /// A production implementation would also (re)attach on a `Running`
-    /// transition observed via `watch_fleet` (e.g. after an operator-driven
-    /// restart that bypasses `ensure_agent`) — not implemented here.
-    pub fn start_agent_stream(&self, repo: &str, agent_id: &str, endpoint: &Endpoint) {
-        let addr = match endpoint {
-            Endpoint::Tcp { addr } => addr.clone(),
-            Endpoint::Unix { .. } => {
-                tracing::warn!(
-                    target: "prospero_k8s_fleet", %agent_id,
-                    "start_agent_stream: k8s agent handle carries a Unix endpoint; \
-                     skipping session-plane attach (expected Tcp)"
-                );
-                return;
-            }
-        };
-        {
-            // Poison-tolerant lock acquisition (#126): a panic elsewhere must
-            // not wedge session-plane attach for every later agent.
-            let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
-            if !attached.insert(agent_id.to_string()) {
-                // Already streaming this agent (e.g. a repeat `ensure_agent`
-                // for the same spec-deterministic CR name).
-                return;
-            }
-        }
+    /// ## Where this is called from
+    /// Wired from [`FleetProvider::ensure_agent`] once a handle resolves, and —
+    /// as of #113 — from the shared poll loop for any agent observed `Running`
+    /// (including operator/peer-created ones this replica never spawned, and a
+    /// restarted CR once it comes back up). The #108 ownership lease inside
+    /// [`SessionPlane::attach`] ensures exactly one replica attaches.
+    pub async fn start_agent_stream(&self, repo: &str, agent_id: &str, endpoint: &Endpoint) {
+        self.session.attach(repo, agent_id, endpoint).await;
+    }
 
-        let client = CalibandClient::connect_tcp(addr, self.tls.clone(), self.token.clone());
-        let repo = repo.to_string();
-        let agent_id = agent_id.to_string();
-        let emitter = self.emitter.clone();
-        let attached = Arc::clone(&self.attached);
-
-        tokio::spawn(async move {
-            // No graceful-drain wiring at this seam yet (MVP) — an inert
-            // shutdown channel whose sender is kept alive in this task's own
-            // scope (never signalled) so `attach_loop`'s `shutdown.changed()`
-            // branch never fires spuriously from a dropped sender.
-            let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-            let result = attach_loop(
-                &client,
-                &repo,
-                &agent_id,
-                &emitter,
-                NormalizeOptions::default(),
-                AttachBackoff::default(),
-                &mut shutdown_rx,
-            )
-            .await;
-            if let Err(e) = result {
-                tracing::warn!(
-                    target: "prospero_k8s_fleet", %repo, %agent_id, error = %e,
-                    "k8s session-plane attach task ended with error"
-                );
-            }
-            attached
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&agent_id); // poison-tolerant (#126)
-        });
+    /// Stop the live session-plane attach for `agent_id`, if any (#112). Public
+    /// for symmetry with [`Self::start_agent_stream`]; the `FleetProvider`
+    /// stop/remove/restart paths call it so a torn-down agent's task doesn't
+    /// keep dialing a dead endpoint (and over-report in `metrics()`).
+    pub async fn stop_agent_stream(&self, agent_id: &str) {
+        self.session.stop(agent_id).await;
     }
 }
 
@@ -658,9 +868,10 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             {
                 // Session-plane bridge (Task B4, ADR 0008 §3): as soon as the
                 // agent is attachable, start feeding its live output into the
-                // same bus/store `/stream` reads. See `start_agent_stream`'s
-                // doc comment for the MVP-only-from-`ensure_agent` scope note.
-                self.start_agent_stream(&repo, handle.id.as_str(), &handle.endpoint);
+                // same bus/store `/stream` reads. Ownership-gated (#108) inside
+                // `attach`; the poll loop is the re-attach safety net (#113).
+                self.start_agent_stream(&repo, handle.id.as_str(), &handle.endpoint)
+                    .await;
                 return Ok(handle);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -731,6 +942,9 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
     }
 
     async fn stop_agent(&self, id: &AgentId, drain: DrainPolicy) -> Result<()> {
+        // Stop the live session-plane attach first so it stops dialing the
+        // about-to-be-deleted endpoint and `metrics()` stops counting it (#112).
+        self.stop_agent_stream(id.as_str()).await;
         match drain {
             DrainPolicy::Kill => self.api.delete(id.as_str()).await,
             DrainPolicy::Graceful { timeout_ms } => {
@@ -767,6 +981,11 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // salted one — keeping identity idempotent so a future declarative
         // `ensure_agent(spec)` reconcile targets the one CR instead of applying
         // a duplicate. (#77 M1)
+        // Stop the stale attach task and clear its `attached` bookkeeping (#112):
+        // the old CR is going away, and clearing the entry is what lets the
+        // #113 observe-`Running` re-attach fire for the fresh CR instead of
+        // being suppressed as "already attached".
+        self.stop_agent_stream(old_name).await;
         self.api.delete(old_name).await?;
         // Wait for the old CR to actually disappear before re-applying the same
         // name, so we never race a not-yet-finalized delete. `FakeK8s` deletes
@@ -786,10 +1005,23 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         fresh.status = None;
         self.api.apply(&fresh).await?;
 
+        // Re-establishment of the session-plane stream (#112) happens through the
+        // #113 observe-`Running` re-attach in the shared poll loop: the fresh CR
+        // has no endpoint yet (status reset to `None`), so there is nothing to
+        // attach *now* — the operator must first reconcile it back to `Running`.
+        // Because we cleared the stale `attached` entry above, the poll loop's
+        // ownership-gated `attach` fires as soon as the new endpoint appears,
+        // rather than blocking this call for up to the poll deadline waiting on
+        // the operator. (If you'd rather `restart_agent` re-attach directly, a
+        // bounded wait-for-`Running`-then-`start_agent_stream` — mirroring
+        // `ensure_agent`'s tail — would be the change.)
         Ok(AgentId::from(old_name))
     }
 
     async fn remove_agent(&self, id: &AgentId, _force: bool) -> Result<()> {
+        // Stop the live attach so it doesn't keep dialing the removed endpoint
+        // (and stops counting in `metrics()`) (#112).
+        self.stop_agent_stream(id.as_str()).await;
         // k8s: forgetting an agent is deleting its CalibanTask CR.
         self.api.delete(id.as_str()).await
     }
@@ -818,7 +1050,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // Ready iff the store accepts writes AND the kube API is reachable
         // (a `list` doubles as the reachability probe). No per-workspace poll
         // health under k8s — report the single synthetic namespace workspace.
-        let store_writable = self.emitter.store().writable().await;
+        let store_writable = self.session.emitter.store().writable().await;
         let api_ok = self.api.list().await.is_ok();
         crate::model::Readiness {
             ready: store_writable && api_ok,
@@ -831,12 +1063,8 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 
     fn metrics(&self) -> crate::metrics::MetricsSnapshot {
         // Poison-tolerant (#126): a metrics scrape must never panic.
-        let active = self
-            .attached
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len() as u64;
-        self.emitter.metrics_snapshot(active)
+        let active = self.session.active_count();
+        self.session.emitter.metrics_snapshot(active)
     }
 
     async fn send_input(
@@ -862,8 +1090,11 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
                 "k8s agent endpoint is not Tcp".to_string(),
             ));
         };
-        let client =
-            CalibandClient::connect_tcp(addr.clone(), self.tls.clone(), self.token.clone());
+        let client = CalibandClient::connect_tcp(
+            addr.clone(),
+            self.session.tls.clone(),
+            self.session.token.clone(),
+        );
         client.send_inbound(&handle.endpoint, &input).await
     }
 }
@@ -1490,5 +1721,234 @@ mod tests {
                 "each live subscriber sees Gone once: {ev:?}"
             );
         }
+    }
+
+    // ---- #108 / #112 / #113: ownership-gated session plane ----
+
+    /// A fake [`Ownership`] with a shared backing map (key → owner replica id):
+    /// first replica to claim a key wins, a peer's `try_acquire` returns `None`,
+    /// and `release` frees it — enough to prove the #108 attach gate elects one
+    /// replica without a Postgres `LeasedOwnership`.
+    struct FakeOwnership {
+        replica: String,
+        shared: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    #[async_trait]
+    impl Ownership for FakeOwnership {
+        async fn try_acquire(&self, stream_key: &str) -> Option<crate::ownership::Lease> {
+            let mut m = self.shared.lock().unwrap();
+            match m.get(stream_key) {
+                Some(owner) if owner != &self.replica => None,
+                _ => {
+                    m.insert(stream_key.to_string(), self.replica.clone());
+                    Some(crate::ownership::Lease {
+                        stream_key: stream_key.to_string(),
+                        epoch: 1,
+                    })
+                }
+            }
+        }
+        async fn renew(&self, _lease: &crate::ownership::Lease) -> Result<()> {
+            Ok(())
+        }
+        async fn release(&self, stream_key: &str) {
+            let mut m = self.shared.lock().unwrap();
+            if m.get(stream_key) == Some(&self.replica) {
+                m.remove(stream_key);
+            }
+        }
+        fn owns(&self, stream_key: &str) -> bool {
+            self.shared.lock().unwrap().get(stream_key) == Some(&self.replica)
+        }
+    }
+
+    fn session_with_ownership(ownership: Arc<dyn Ownership>) -> SessionPlane {
+        let (bus, store) = test_seams();
+        SessionPlane {
+            emitter: Emitter::new(bus, store),
+            tls: None,
+            token: None,
+            attached: Arc::new(Mutex::new(HashMap::new())),
+            ownership,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// #108 CORE: two replicas sharing one lease backing both try to attach the
+    /// same agent; exactly one wins (the lease owner), so only that replica
+    /// streams — no duplicate SSE / racing seq. The reservation entry is
+    /// inserted synchronously before the (doomed) dial spawns, so the counts are
+    /// deterministic right after `attach`.
+    #[tokio::test]
+    async fn attach_is_gated_by_ownership_so_only_one_replica_streams() {
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        let a = session_with_ownership(Arc::new(FakeOwnership {
+            replica: "a".into(),
+            shared: shared.clone(),
+        }));
+        let b = session_with_ownership(Arc::new(FakeOwnership {
+            replica: "b".into(),
+            shared: shared.clone(),
+        }));
+        let ep = Endpoint::Tcp {
+            addr: "127.0.0.1:1".into(),
+        };
+
+        a.attach("repo-a", "agent-1", &ep).await;
+        b.attach("repo-a", "agent-1", &ep).await;
+
+        assert_eq!(
+            a.active_count() + b.active_count(),
+            1,
+            "exactly one replica (the lease owner) attaches the agent"
+        );
+    }
+
+    /// #108: `SelfOwnsAll` (the standalone default) always acquires, so the
+    /// attach happens exactly as before — non-clustered behavior is unchanged.
+    #[tokio::test]
+    async fn self_owns_all_attaches_unconditionally() {
+        let plane = session_with_ownership(Arc::new(SelfOwnsAll));
+        let ep = Endpoint::Tcp {
+            addr: "127.0.0.1:1".into(),
+        };
+        plane.attach("repo-a", "agent-1", &ep).await;
+        assert_eq!(plane.active_count(), 1);
+        // Idempotent: a second attach for the same id is a no-op, not a dupe.
+        plane.attach("repo-a", "agent-1", &ep).await;
+        assert_eq!(plane.active_count(), 1);
+    }
+
+    /// #112: `stop` promptly tears the attach task down and clears bookkeeping,
+    /// so `metrics()` stops over-reporting and a re-attach isn't suppressed.
+    #[tokio::test]
+    async fn stop_agent_stops_the_attach_task() {
+        // A real lease-tracking ownership (not `SelfOwnsAll`, whose `owns()` is
+        // always true) so the release is observable.
+        let plane = session_with_ownership(Arc::new(FakeOwnership {
+            replica: "a".into(),
+            shared: Arc::new(Mutex::new(HashMap::new())),
+        }));
+        let ep = Endpoint::Tcp {
+            addr: "127.0.0.1:1".into(),
+        };
+        plane.attach("repo-a", "agent-1", &ep).await;
+        assert_eq!(plane.active_count(), 1);
+
+        plane.stop("agent-1").await;
+        assert_eq!(plane.active_count(), 0, "stop clears the attach entry");
+        assert!(
+            !plane.ownership.owns("agent-1"),
+            "stop releases the per-agent lease for prompt failover"
+        );
+
+        // After a stop the id can be re-attached (bookkeeping was cleared).
+        plane.attach("repo-a", "agent-1", &ep).await;
+        assert_eq!(
+            plane.active_count(),
+            1,
+            "re-attach after stop is not a no-op"
+        );
+    }
+
+    /// #112: `remove_agent` stops the live attach (not just deletes the CR), so
+    /// the task stops dialing the dead endpoint and the active gauge drops.
+    #[tokio::test]
+    async fn remove_agent_stops_the_attach() {
+        let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
+        let ep = Endpoint::Tcp {
+            addr: "127.0.0.1:1".into(),
+        };
+        fleet.start_agent_stream("repo-a", "agent-x", &ep).await;
+        assert_eq!(fleet.session.active_count(), 1);
+
+        fleet
+            .remove_agent(&AgentId::from("agent-x"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet.session.active_count(),
+            0,
+            "remove_agent stops the session-plane attach (#112)"
+        );
+    }
+
+    /// #113: an agent this replica never spawned (operator/peer-created), once
+    /// observed `Running` by the shared poll loop, gets attached by the lease
+    /// owner — so its `/stream` isn't permanently empty. Uses `SelfOwnsAll` (the
+    /// owner) + a short watch cadence and waits for the attach to land.
+    #[tokio::test]
+    async fn poll_loop_attaches_observed_running_agent_not_spawned_here() {
+        let api = MemTaskApi::new();
+        // Operator-created: applied + marked Running WITHOUT ensure_agent.
+        api.apply(&build_calibantask(
+            &spec("repo-a", "p", None),
+            "operator-agent",
+        ))
+        .await
+        .unwrap();
+        api.set_running("operator-agent", "127.0.0.1:1");
+
+        let (bus, store) = test_seams();
+        let fleet =
+            K8sFleet::new(api, bus, store).with_watch_poll_interval(Duration::from_millis(20));
+
+        // The poll loop should observe it Running and attach it.
+        let attached = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fleet.session.active_count() == 1 {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            attached,
+            "the lease owner attaches an observed-Running agent it never spawned (#113)"
+        );
+    }
+
+    /// #108 + #113 compose: with a peer already holding the agent's lease, this
+    /// replica's poll loop observes the same Running agent but does NOT attach —
+    /// only the lease owner streams it.
+    #[tokio::test]
+    async fn poll_loop_does_not_attach_when_a_peer_owns_the_lease() {
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        // A peer already owns the agent's per-agent lease.
+        shared
+            .lock()
+            .unwrap()
+            .insert("operator-agent".to_string(), "peer".to_string());
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(
+            &spec("repo-a", "p", None),
+            "operator-agent",
+        ))
+        .await
+        .unwrap();
+        api.set_running("operator-agent", "127.0.0.1:1");
+
+        let (bus, store) = test_seams();
+        let ours: Arc<dyn Ownership> = Arc::new(FakeOwnership {
+            replica: "ours".into(),
+            shared: shared.clone(),
+        });
+        let fleet = K8sFleet::new(api, bus, store)
+            .with_ownership(ours)
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        // Give the poll loop several cycles; it must never attach a peer-owned agent.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            fleet.session.active_count(),
+            0,
+            "a peer owns the lease, so this replica must not attach (#108)"
+        );
     }
 }
