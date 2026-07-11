@@ -165,7 +165,7 @@ async fn readyz_returns_200_when_store_writable() {
     let v = json_body(resp).await;
     assert_eq!(v["ready"], true);
     assert_eq!(v["store_writable"], true);
-    assert_eq!(v["repos_total"], 1);
+    assert_eq!(v["workspaces_total"], 1);
 }
 
 #[tokio::test]
@@ -309,6 +309,26 @@ async fn get_unknown_agent_is_404_not_500() {
         .oneshot(
             Request::builder()
                 .uri("/api/agents/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v = json_body(resp).await;
+    assert_eq!(v["kind"], "not_found");
+}
+
+#[tokio::test]
+async fn get_events_for_unknown_agent_is_404() {
+    // Mirrors the projection endpoint: an unknown id → 404, not `200 []` (#118).
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/nope/events")
                 .body(Body::empty())
                 .unwrap(),
         )

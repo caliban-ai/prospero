@@ -538,8 +538,8 @@ impl FleetManager {
     pub async fn readiness(&self) -> crate::model::Readiness {
         let store_writable = self.inner.emitter.store.writable().await;
         let snap = self.inner.snapshot.read().await;
-        let repos_total = snap.workspaces.len();
-        let repos_healthy = snap
+        let workspaces_total = snap.workspaces.len();
+        let workspaces_healthy = snap
             .workspaces
             .iter()
             .filter(|r| matches!(r.health, WorkspaceHealth::Healthy))
@@ -547,9 +547,9 @@ impl FleetManager {
         crate::model::Readiness {
             ready: store_writable,
             store_writable,
-            repos_total,
-            repos_healthy,
-            repos_unreachable: repos_total - repos_healthy,
+            workspaces_total,
+            workspaces_healthy,
+            workspaces_unreachable: workspaces_total - workspaces_healthy,
         }
     }
 

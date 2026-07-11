@@ -53,8 +53,8 @@ pub enum CoreError {
     #[error("event seq conflict")]
     SeqConflict,
 
-    /// A repo name was not registered.
-    #[error("repo not registered: {0}")]
+    /// A workspace name was not registered.
+    #[error("workspace not registered: {0}")]
     WorkspaceNotFound(String),
 
     /// The repo's selected provider is missing a required credential, so a
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(CoreError::Store("s".into()).to_string(), "store error: s");
         assert_eq!(
             CoreError::WorkspaceNotFound("r".into()).to_string(),
-            "repo not registered: r"
+            "workspace not registered: r"
         );
         assert_eq!(
             CoreError::Fleet("timed out".into()).to_string(),

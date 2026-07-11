@@ -771,9 +771,9 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         crate::model::Readiness {
             ready: store_writable && api_ok,
             store_writable,
-            repos_total: 1,
-            repos_healthy: usize::from(api_ok),
-            repos_unreachable: usize::from(!api_ok),
+            workspaces_total: 1,
+            workspaces_healthy: usize::from(api_ok),
+            workspaces_unreachable: usize::from(!api_ok),
         }
     }
 
@@ -1320,7 +1320,7 @@ mod tests {
         let r = fleet.readiness().await;
         assert!(r.store_writable);
         assert!(r.ready);
-        assert_eq!(r.repos_healthy, 1);
+        assert_eq!(r.workspaces_healthy, 1);
     }
 
     // ---- #77 M2: single shared poll loop ----

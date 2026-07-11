@@ -51,11 +51,11 @@ pub struct Readiness {
     /// Whether the durable event store can accept writes.
     pub store_writable: bool,
     /// Total managed workspaces.
-    pub repos_total: usize,
-    /// Repos whose caliband responded to the last poll.
-    pub repos_healthy: usize,
-    /// Repos whose caliband was unreachable at the last poll.
-    pub repos_unreachable: usize,
+    pub workspaces_total: usize,
+    /// Workspaces whose caliband responded to the last poll.
+    pub workspaces_healthy: usize,
+    /// Workspaces whose caliband was unreachable at the last poll.
+    pub workspaces_unreachable: usize,
 }
 
 /// Lifecycle state of an agent. Mirrors caliban's `AgentStatus` wire enum exactly
