@@ -141,7 +141,18 @@ pub async fn get_agent_events(
     Query(q): Query<FromSeq>,
 ) -> Result<Json<Vec<prospero_core::FleetEvent>>, ApiError> {
     // An agent's stream key is its own id (see `event::stream_key_for`).
-    Ok(Json(st.store.replay(&id, q.from).await?))
+    let events = st.store.replay(&id, q.from).await?;
+    // A truly unknown agent id → 404, mirroring `GET /api/agents/{id}`. But a
+    // *known* agent with an empty replay (spawned-but-no-events-yet, or a
+    // `from` past its last seq) still returns `200 []`. Distinguish them: a
+    // known agent has durable history (high_water > 0) or is live in the fleet.
+    if events.is_empty()
+        && st.store.high_water(&id).await? == 0
+        && st.fleet.snapshot().await.find_agent(&id).is_none()
+    {
+        return Err(prospero_core::CoreError::AgentNotFound(id).into());
+    }
+    Ok(Json(events))
 }
 
 /// `POST /api/agents/{id}/kill`.
