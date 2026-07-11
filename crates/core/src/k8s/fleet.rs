@@ -1824,7 +1824,12 @@ mod tests {
     /// so `metrics()` stops over-reporting and a re-attach isn't suppressed.
     #[tokio::test]
     async fn stop_agent_stops_the_attach_task() {
-        let plane = session_with_ownership(Arc::new(SelfOwnsAll));
+        // A real lease-tracking ownership (not `SelfOwnsAll`, whose `owns()` is
+        // always true) so the release is observable.
+        let plane = session_with_ownership(Arc::new(FakeOwnership {
+            replica: "a".into(),
+            shared: Arc::new(Mutex::new(HashMap::new())),
+        }));
         let ep = Endpoint::Tcp {
             addr: "127.0.0.1:1".into(),
         };
