@@ -107,6 +107,33 @@ pub fn validate_provider_env(
     })
 }
 
+/// Statically validate a repo's provider config for internal coherence,
+/// independent of the runtime environment — so settings that would be silently
+/// dropped at spawn/poll time are rejected at config-set time with an
+/// actionable message instead.
+///
+/// Today this catches an `api_key_from_env` on a provider that has no api-key
+/// env var (ollama, bedrock, vertex, unknown): [`resolve_env`] only `warn!`s
+/// `"api_key_from_env set but provider has no api-key env var; ignored"` and
+/// proceeds, so the setting looks accepted but never takes effect. Surfacing it
+/// here lets the config-set path return a `400` (#120).
+///
+/// An unset provider always passes (nothing to validate).
+pub fn validate_provider_config(cfg: &RepoProviderConfig) -> std::result::Result<(), String> {
+    let Some(provider) = &cfg.provider else {
+        return Ok(());
+    };
+    let (_base_var, key_var) = provider_vars(provider);
+    if cfg.api_key_from_env.is_some() && key_var.is_none() {
+        return Err(format!(
+            "provider '{provider}' has no api-key env var, so api_key_from_env \
+             would be ignored; remove api_key_from_env for this provider (it is \
+             only meaningful for anthropic/openai/google)"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +286,46 @@ mod tests {
     fn validate_accepts_no_provider() {
         let resolved = resolve_env(&BTreeMap::new(), &cfg(), &no_env);
         assert!(validate_provider_env(&cfg(), &resolved).is_ok());
+    }
+
+    #[test]
+    fn validate_config_rejects_api_key_on_keyless_provider() {
+        let mut c = cfg();
+        c.provider = Some("ollama".into());
+        c.api_key_from_env = Some("SOME_VAR".into());
+        let err = validate_provider_config(&c).unwrap_err();
+        assert!(err.contains("ollama"), "message names provider: {err}");
+        assert!(
+            err.contains("api_key_from_env"),
+            "message names the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_api_key_on_provider_only_backend() {
+        let mut c = cfg();
+        c.provider = Some("bedrock".into());
+        c.api_key_from_env = Some("SOME_VAR".into());
+        assert!(validate_provider_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_config_accepts_api_key_on_keyed_provider() {
+        let mut c = cfg();
+        c.provider = Some("anthropic".into());
+        c.api_key_from_env = Some("ANTHROPIC_KEY_VAR".into());
+        assert!(validate_provider_config(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_config_accepts_keyless_provider_without_api_key() {
+        let mut c = cfg();
+        c.provider = Some("ollama".into());
+        assert!(validate_provider_config(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_config_accepts_no_provider() {
+        assert!(validate_provider_config(&cfg()).is_ok());
     }
 }

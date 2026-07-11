@@ -672,6 +672,165 @@ async fn put_config_unknown_repo_returns_404() {
 }
 
 #[tokio::test]
+async fn put_config_api_key_on_keyless_provider_returns_400() {
+    // #120: `api_key_from_env` on ollama (no api-key env var) would be silently
+    // ignored at spawn time. It must be rejected at config-set with a clear 400.
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/workspaces/repo/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"provider":"ollama","api_key_from_env":"SOME_VAR"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert_eq!(v["kind"], "provider_misconfigured");
+    assert!(
+        v["error"].as_str().unwrap().contains("api_key_from_env"),
+        "error explains the offending field: {v}"
+    );
+}
+
+#[tokio::test]
+async fn rm_immediately_after_spawn_does_not_404() {
+    // #122: a DELETE issued right after spawn — before any poll lands the agent
+    // in the snapshot — must resolve via the spawn-tracking fallback, not 404.
+    let h = setup().await;
+    let spawn_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workspaces/repo/agents")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"prompt":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spawn_resp.status(), StatusCode::CREATED);
+    let id = json_body(spawn_resp).await["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No poll in between: the snapshot has not observed the agent yet.
+    let rm_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/agents/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rm_resp.status(),
+        StatusCode::NO_CONTENT,
+        "rm right after spawn must not 404 on the registration race"
+    );
+}
+
+#[tokio::test]
+async fn rm_drops_agent_from_fleet_immediately() {
+    // #123: after a 204 rm, `/api/fleet` must not still list the agent while
+    // waiting for the next poll — the served snapshot is pruned optimistically.
+    let h = setup().await;
+    let spawn_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workspaces/repo/agents")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"prompt":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let id = json_body(spawn_resp).await["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Poll so the agent is in the served snapshot (sanity-checked below).
+    h.manager.poll_repo_once("repo").await;
+    let fleet = json_body(
+        h.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let agents_listed = |fleet: &serde_json::Value| -> Vec<String> {
+        fleet["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| w["agents"].as_array().unwrap().clone())
+            .map(|a| a["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(
+        agents_listed(&fleet).contains(&id),
+        "agent should be listed after a poll: {fleet}"
+    );
+
+    // Remove it, then re-read the fleet WITHOUT polling again.
+    let rm_resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/agents/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rm_resp.status(), StatusCode::NO_CONTENT);
+
+    let fleet_after = json_body(
+        h.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !agents_listed(&fleet_after).contains(&id),
+        "removed agent must be gone from /api/fleet immediately, not after the next poll: {fleet_after}"
+    );
+}
+
+#[tokio::test]
 async fn agent_input_and_end_input_and_404() {
     use prospero_core::model::AgentStatus;
     use prospero_core::testkit::test_record;
