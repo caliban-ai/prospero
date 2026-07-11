@@ -542,7 +542,7 @@ impl SessionPlane {
         // (and replaced or cleared) our reservation while we were spawning.
         {
             let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(task) = attached.get_mut(&agent_id)
+            if let Some(task) = attached.get_mut(agent_id)
                 && task.generation == generation
             {
                 task.abort = Some(handle.abort_handle());
