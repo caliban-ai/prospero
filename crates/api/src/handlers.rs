@@ -122,7 +122,18 @@ pub async fn spawn_agent(
     ))
 }
 
-/// `GET /api/agents/{id}` — one agent's current projection.
+/// `GET /api/agents/{id}` — one agent's current state.
+///
+/// This reads the **live fleet snapshot** — the exact same source as
+/// `GET /api/fleet` — so the two are always consistent: an agent that has been
+/// `rm`'d, or whose id was replaced by `respawn`, disappears from *both* the
+/// fleet listing and this endpoint (404) as soon as the registry no longer
+/// tracks it (immediately for `rm` via the optimistic snapshot prune, or at the
+/// next poll for a respawn's old id). It is deliberately **not** served from the
+/// event-sourced projection: the immutable per-agent history of a replaced or
+/// removed agent remains reachable via `GET /api/agents/{id}/events`, which
+/// replays from the durable store and therefore intentionally outlives the
+/// agent's presence in the live registry (#124).
 pub async fn get_agent(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -166,7 +177,13 @@ pub async fn kill_agent(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// `POST /api/agents/{id}/respawn`.
+/// `POST /api/agents/{id}/respawn` — replace an agent with a fresh one.
+///
+/// Returns the **new** agent id. The old id is retired from caliban's registry,
+/// so once the next poll reconciles it disappears from both `GET /api/fleet` and
+/// `GET /api/agents/{id}` (they share the live snapshot). Its history is not
+/// destroyed: `GET /api/agents/{old_id}/events` still replays the retired
+/// agent's immutable event stream from the durable store (#124).
 pub async fn respawn_agent(
     State(st): State<AppState>,
     Path(id): Path<String>,

@@ -389,6 +389,13 @@ struct Inner {
     clients: Mutex<HashMap<String, CalibandClient>>,
     /// Agent ids with a running attach task.
     attached: Mutex<HashSet<String>>,
+    /// Recently-spawned agent ids → their repo, populated at spawn time and
+    /// consulted by [`Self::repo_of`] to bridge the gap before the first poll
+    /// lands the agent in the snapshot. Without it a `DELETE`/`kill` issued
+    /// immediately after `spawn` would `AgentNotFound` (404) because the cached
+    /// snapshot has not caught up yet (#122). Entries are pruned once the poll
+    /// observes the agent (snapshot becomes authoritative) or on `rm`.
+    recent_spawns: Mutex<HashMap<String, String>>,
     emitter: Emitter,
     ownership: Arc<dyn Ownership>,
     /// Broadcast shutdown signal: `true` once a graceful drain has begun. The
@@ -466,6 +473,7 @@ impl FleetManager {
                 config_store,
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
+                recent_spawns: Mutex::new(HashMap::new()),
                 emitter,
                 ownership,
                 shutdown: watch::channel(false).0,
@@ -601,6 +609,11 @@ impl FleetManager {
     ) -> Result<()> {
         let name = name.into();
         let root = root.into();
+        // Same coherence check as the config-set path (#120): a keyless provider
+        // with `api_key_from_env` is rejected at registration rather than silently
+        // ignored at spawn time.
+        crate::provider_env::validate_provider_config(&config)
+            .map_err(CoreError::ProviderMisconfigured)?;
         // Canonicalize so symlink aliases (e.g. `/tmp` vs `/private/tmp`)
         // collapse to one root — both for the duplicate-alias guard in the
         // registry and so the stored root matches the one caliband hashes for
@@ -686,6 +699,12 @@ impl FleetManager {
         repo: &str,
         config: crate::registry::RepoProviderConfig,
     ) -> Result<()> {
+        // Reject an internally-incoherent config up front (e.g. `api_key_from_env`
+        // on a keyless provider, which would otherwise be silently ignored at
+        // spawn time) so the config-set path surfaces a 400 rather than persisting
+        // a setting that never takes effect (#120).
+        crate::provider_env::validate_provider_config(&config)
+            .map_err(CoreError::ProviderMisconfigured)?;
         // Hold the registry write lock across the durable upsert so a concurrent
         // `refresh_registry_from_store` (poll loop) cannot read stale durable
         // state and clobber this write back. The registry RwLock is async, so
@@ -776,6 +795,14 @@ impl FleetManager {
         // caliband daemon env (see `provider_env::resolve_env`).
         spec.provider = self.repo_config(repo).await.and_then(|c| c.provider);
         let (id, endpoint) = client.spawn(spec).await?;
+        // Record the id→repo mapping before the first poll so a `rm`/`kill`
+        // issued immediately after this returns can still resolve the repo
+        // instead of racing the snapshot to a spurious 404 (#122).
+        self.inner
+            .recent_spawns
+            .lock()
+            .unwrap()
+            .insert(id.clone(), repo.to_string());
         self.inner
             .emitter
             .emit(repo, &id, EventKind::AgentSpawned)
@@ -920,18 +947,75 @@ impl FleetManager {
     }
 
     /// Remove an agent from caliban's registry.
+    ///
+    /// On success the agent is optimistically dropped from the served snapshot
+    /// so `GET /api/fleet` reflects the removal immediately, rather than
+    /// continuing to list it for up to one poll interval until the next poll
+    /// reconciles (#123). The next poll remains authoritative and idempotent.
     pub async fn rm_agent(&self, agent_id: &str, force: bool) -> Result<()> {
         let repo = self.repo_of(agent_id).await?;
-        self.client_for(&repo).await?.rm(agent_id, force).await
+        self.client_for(&repo).await?.rm(agent_id, force).await?;
+
+        // Drop any spawn-tracking fallback: an agent removed before its first
+        // poll never appears in `records`, so `reconcile` can't prune it (#122).
+        self.inner.recent_spawns.lock().unwrap().remove(agent_id);
+
+        // Optimistically prune the removed agent from the served snapshot (#123).
+        let removed = {
+            let mut snap = self.inner.snapshot.write().await;
+            match snap.workspaces.iter_mut().find(|r| r.name == repo) {
+                Some(r) => {
+                    let before = r.agents.len();
+                    r.agents.retain(|a| a.id != agent_id);
+                    r.agents.len() != before
+                }
+                None => false,
+            }
+        };
+
+        // Preserve the `AgentGone` the next poll's `reconcile` would have emitted:
+        // since we pruned the agent from the snapshot baseline, that poll's
+        // `prior` no longer contains it, so it would otherwise be lost from the
+        // event log / `watch_changes` feed. Only the repo lifecycle-lease owner
+        // emits it, matching `reconcile`, so clustered peers don't double-write
+        // (and a peer that still holds the lease will emit it from its own poll,
+        // since only this replica's snapshot was pruned). (#59, #123)
+        if removed
+            && self
+                .inner
+                .ownership
+                .try_acquire(&crate::event::stream_key_for(&repo, ""))
+                .await
+                .is_some()
+        {
+            self.inner
+                .emitter
+                .emit(&repo, agent_id, EventKind::AgentGone)
+                .await;
+        }
+        Ok(())
     }
 
     async fn repo_of(&self, agent_id: &str) -> Result<String> {
-        self.inner
+        if let Some(repo) = self
+            .inner
             .snapshot
             .read()
             .await
             .find_agent(agent_id)
             .map(|(repo, _)| repo.to_string())
+        {
+            return Ok(repo);
+        }
+        // Not in the snapshot yet: a just-spawned agent the poll hasn't observed.
+        // Fall back to the spawn-tracking map so `rm`/`kill` right after `spawn`
+        // resolve instead of 404ing on the registration race (#122).
+        self.inner
+            .recent_spawns
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()
             .ok_or_else(|| CoreError::AgentNotFound(agent_id.to_string()))
     }
 
@@ -1157,6 +1241,14 @@ impl FleetManager {
                     }
                 }
             }
+        }
+
+        // The snapshot is now authoritative for every agent in this poll's
+        // records, so drop their spawn-tracking fallbacks (#122). Fast
+        // spawn→rm agents that never appear in a poll are pruned by `rm_agent`.
+        if !records.is_empty() {
+            let mut recent = self.inner.recent_spawns.lock().unwrap();
+            recent.retain(|id, _| !records.iter().any(|r| &r.id == id));
         }
 
         for id in to_attach {
