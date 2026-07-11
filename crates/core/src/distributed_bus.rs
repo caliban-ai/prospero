@@ -250,7 +250,13 @@ mod tests {
     /// `DATABASE_URL` guard (an unset-DB skip never contends).
     static BUS_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    #[tokio::test]
+    // Multi-threaded runtime: these tests spawn a consumer task and the bus
+    // spawns a pg_notify task per publish, all of which must make progress
+    // concurrently with the publish loop. On the default current-thread runtime
+    // they contend cooperatively on one thread and — under the slow, instrumented
+    // coverage build especially — can starve the listener so no doorbell is ever
+    // processed. Real threads keep the listener draining while we publish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn doorbell_delivers_a_live_event_to_a_subscriber() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP doorbell_delivers_a_live_event_to_a_subscriber: DATABASE_URL unset");
@@ -304,7 +310,13 @@ mod tests {
     /// reader replica's history read and its first poll) must still be
     /// delivered. Seeding `last_seq` from 0 replays it; a late `high_water` seed
     /// would skip it forever.
-    #[tokio::test]
+    // Multi-threaded runtime: these tests spawn a consumer task and the bus
+    // spawns a pg_notify task per publish, all of which must make progress
+    // concurrently with the publish loop. On the default current-thread runtime
+    // they contend cooperatively on one thread and — under the slow, instrumented
+    // coverage build especially — can starve the listener so no doorbell is ever
+    // processed. Real threads keep the listener draining while we publish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delivers_an_event_that_predates_the_first_doorbell() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!(
@@ -356,7 +368,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Multi-threaded runtime: these tests spawn a consumer task and the bus
+    // spawns a pg_notify task per publish, all of which must make progress
+    // concurrently with the publish loop. On the default current-thread runtime
+    // they contend cooperatively on one thread and — under the slow, instrumented
+    // coverage build especially — can starve the listener so no doorbell is ever
+    // processed. Real threads keep the listener draining while we publish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn doorbell_ignores_other_streams() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP doorbell_ignores_other_streams: DATABASE_URL unset");
@@ -393,7 +411,13 @@ mod tests {
     /// DIFFERENT streams must both reach one unfiltered subscription, and
     /// ringing either doorbell repeatedly must not re-deliver an already-seen
     /// event on either key (per-key high-water advances independently).
-    #[tokio::test]
+    // Multi-threaded runtime: these tests spawn a consumer task and the bus
+    // spawns a pg_notify task per publish, all of which must make progress
+    // concurrently with the publish loop. On the default current-thread runtime
+    // they contend cooperatively on one thread and — under the slow, instrumented
+    // coverage build especially — can starve the listener so no doorbell is ever
+    // processed. Real threads keep the listener draining while we publish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn subscribe_all_delivers_events_from_multiple_streams() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!(
