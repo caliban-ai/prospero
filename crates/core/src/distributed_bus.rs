@@ -424,7 +424,10 @@ mod tests {
     // `cargo test` job. `cargo llvm-cov` sets `--cfg coverage`; the `subscribe()`
     // doorbell path stays covered by the other three tests, which pass under
     // instrumentation.
-    #[cfg_attr(coverage, ignore = "live doorbell timing is unreliable under llvm-cov instrumentation")]
+    #[cfg_attr(
+        coverage,
+        ignore = "live doorbell timing is unreliable under llvm-cov instrumentation"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn subscribe_all_delivers_events_from_multiple_streams() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
