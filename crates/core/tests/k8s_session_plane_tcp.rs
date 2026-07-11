@@ -77,13 +77,15 @@ async fn k8s_fleet_streams_a_network_agent_stream_over_tcp() {
 
     // Dial control over the network; `attach` returns a TCP stream endpoint;
     // `open_stream` dials THAT over TCP+TLS; frames land in the store.
-    fleet.start_agent_stream(
-        repo,
-        agent_id,
-        &Endpoint::Tcp {
-            addr: tls_fixture.addr,
-        },
-    );
+    fleet
+        .start_agent_stream(
+            repo,
+            agent_id,
+            &Endpoint::Tcp {
+                addr: tls_fixture.addr,
+            },
+        )
+        .await;
 
     let key = stream_key_for(repo, agent_id);
     let history = wait_for_history(&store, &key, 2, Duration::from_secs(5)).await;
