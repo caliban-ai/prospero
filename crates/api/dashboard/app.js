@@ -367,7 +367,7 @@ function renderFleet(fleet) {
   const agentTotal = fleet.workspaces.reduce((n, r) => n + r.agents.length, 0);
   const rc = fleet.workspaces.length;
   document.getElementById("fleet-count").textContent =
-    `fleet ·  workspace · ${agentTotal} agent${agentTotal === 1 ? "" : "s"}`;
+    `fleet · ${rc} workspace${rc === 1 ? "" : "s"} · ${agentTotal} agent${agentTotal === 1 ? "" : "s"}`;
   if (!fleet.workspaces.length) {
     fleetListEl.innerHTML = `<div class="muted">no workspaces registered</div>`;
     return;
@@ -556,14 +556,16 @@ function paintStreamHead() {
   const c = streamCtx;
   const badge = `<span class="badge ${c.status}">${escapeHtml(c.status)}</span>`;
   const model = c.model ? `<span class="sh-meta">${escapeHtml(c.model)}</span>` : "";
-  const cost = c.cost != null && c.turns != null
-    ? `<span class="sh-meta">· ${escapeHtml(c.outcome || "done")} · ${c.turns} turns · $${c.cost.toFixed(4)}</span>`
+  // No cost: caliban reports token usage, not USD, so the normalizer leaves
+  // cost_usd at 0.0 — showing "$0.0000" was misleading. Surface outcome + turns.
+  const meta = c.turns != null
+    ? `<span class="sh-meta">· ${escapeHtml(c.outcome || "done")} · ${c.turns} turns</span>`
     : `<span class="sh-meta">· running</span>`;
   const dot = streamIsLive()
     ? `<span class="sh-conn live">● live</span>` : `<span class="sh-conn closed">⚠ closed</span>`;
   streamHeadEl.innerHTML =
     `<button class="sh-back" title="back to fleet">← fleet</button>` +
-    `<span class="sh-name">${escapeHtml(c.name)}</span> ${badge} ${model} ${cost} ${dot}`;
+    `<span class="sh-name">${escapeHtml(c.name)}</span> ${badge} ${model} ${meta} ${dot}`;
   streamHeadEl.querySelector(".sh-back").onclick = () => document.body.classList.remove("show-stream");
   streamHeadEl.classList.remove("hidden");
 }
@@ -734,7 +736,7 @@ function renderTimeline() {
     } else if (s.kind === "status") {
       html += `<div class="tl-status muted">${escapeHtml(s.from)} → ${escapeHtml(s.to)}</div>`;
     } else if (s.kind === "finished") {
-      html += `<div class="tl-fin fin">● ${escapeHtml(s.outcome)} · ${s.turns} turns · $${s.cost.toFixed(4)}</div>`;
+      html += `<div class="tl-fin fin">● ${escapeHtml(s.outcome)} · ${s.turns} turns</div>`;
     } else if (s.kind === "sys") {
       html += `<div class="tl-status muted">⚠ ${escapeHtml(s.text)}</div>`;
     } else {
