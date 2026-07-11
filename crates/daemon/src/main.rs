@@ -517,6 +517,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::parse_key_val;
     use super::read_token_file;
+    use super::require_token_tls;
     use super::{heartbeat_interval, resolve_replica_id};
     use std::time::Duration;
 
