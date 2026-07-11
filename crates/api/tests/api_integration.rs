@@ -563,6 +563,23 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
         .unwrap();
     assert_eq!(post_resp.status(), StatusCode::CREATED);
 
+    // A second workspace on the SAME root (a permanent conflict, not a transient
+    // reachability failure) → 409 Conflict, not 503 unreachable (#111).
+    let dup = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workspaces")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"q","root":"/tmp/p"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(dup).await["kind"], "conflict");
+
     // GET /api/workspaces should include the config fields.
     let get_resp = app
         .clone()

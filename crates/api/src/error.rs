@@ -54,6 +54,7 @@ impl IntoResponse for ApiError {
                         (StatusCode::NOT_FOUND, "not_found")
                     }
                     CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state"),
+                    CoreError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
                     CoreError::ProviderMisconfigured(_) => {
                         (StatusCode::BAD_REQUEST, "provider_misconfigured")
                     }

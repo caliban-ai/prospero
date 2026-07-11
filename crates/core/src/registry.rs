@@ -73,7 +73,7 @@ impl Registry {
             if existing.root == root {
                 return Ok(());
             }
-            return Err(CoreError::Discovery(format!(
+            return Err(CoreError::Conflict(format!(
                 "workspace name '{name}' already registered with a different root"
             )));
         }
@@ -83,7 +83,7 @@ impl Registry {
         // before they reach here (see `FleetManager::add_workspace_with_config`),
         // so this also catches symlink aliases like `/tmp` vs `/private/tmp`. (#47)
         if let Some(other) = self.workspaces.iter().find(|r| r.root == root) {
-            return Err(CoreError::Discovery(format!(
+            return Err(CoreError::Conflict(format!(
                 "root {} is already registered as workspace '{}'",
                 root.display(),
                 other.name
