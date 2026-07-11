@@ -73,7 +73,9 @@ pub fn tls_client_from_pem(ca_pem: &[u8], server_name: &str) -> std::io::Result<
 }
 
 /// Bearer-token preamble: `{"bearer":"<token>"}\n`, sent after the TLS
-/// handshake so it travels encrypted. TCP only; Unix never sends it.
+/// handshake so it travels encrypted. TCP only; Unix never sends it. The daemon
+/// refuses to start with a token but no TLS (see `require_token_tls` in
+/// `prosperod`), so this preamble is never written over a plaintext socket.
 #[derive(Serialize, Deserialize)]
 struct TokenPreamble {
     bearer: String,
