@@ -127,6 +127,60 @@ pub struct WorkspaceConfig {
     pub local: RepoProviderConfig,
 }
 
+/// A provider as surfaced on the read side (`GET /api/workspaces`): enough for
+/// the dashboard's launch-modal provider picker and a "has credentials" pill,
+/// without exposing the Secret reference itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInfo {
+    /// Provider name (what an agent binds by `providerRef`).
+    pub name: String,
+    /// Provider kind (e.g. `ollama`, `anthropic`).
+    pub kind: String,
+    /// Default model for this provider, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Whether the provider references a credential Secret (keyless providers
+    /// like ollama are `false`). The Secret name/key is intentionally not
+    /// surfaced on the read side.
+    pub has_credentials: bool,
+}
+
+/// Reconciliation status of a workspace, surfaced for the dashboard's status
+/// pill + failure tooltip. Backend-neutral (local workspaces report `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceStatusInfo {
+    /// Lifecycle phase (`Pending` / `Reconciling` / `Ready` / `Failed`).
+    pub phase: String,
+    /// Human-readable detail (e.g. a missing-Secret message), when `Failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A workspace as seen by the config plane's read side: the persisted
+/// configuration plus reconciliation status. Returned by
+/// `FleetAdmin::list_workspaces` and merged into `GET /api/workspaces` so a
+/// configured-but-agentless workspace is still visible with its status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    /// Workspace object name (agents bind it via `workspaceRef`).
+    pub name: String,
+    /// Human-friendly display label, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The workspace's source checkouts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<WorkspaceSourceSpec>,
+    /// Named providers agents can bind to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderInfo>,
+    /// Provider bound when an agent requests none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Reconciliation status, if the backend reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorkspaceStatusInfo>,
+}
+
 /// Aggregate readiness of prosperod, distinct from mere liveness.
 ///
 /// `ready` gates traffic/restarts: it is `true` only when the durable store can

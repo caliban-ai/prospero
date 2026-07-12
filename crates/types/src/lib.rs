@@ -11,7 +11,7 @@ mod model;
 
 pub use event::{EventKind, FleetEvent, OutputStream, stream_key_for};
 pub use model::{
-    Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, ProviderSpec,
-    Readiness, RepoProviderConfig, Source, Workspace, WorkspaceConfig, WorkspaceHealth,
-    WorkspaceSourceSpec,
+    Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, ProviderInfo,
+    ProviderSpec, Readiness, RepoProviderConfig, Source, Workspace, WorkspaceConfig,
+    WorkspaceHealth, WorkspaceInfo, WorkspaceSourceSpec, WorkspaceStatusInfo,
 };

@@ -161,6 +161,24 @@ pub trait FleetAdmin: Send + Sync {
         name: &str,
         config: crate::registry::WorkspaceConfig,
     ) -> Result<()>;
+
+    /// List configured workspaces with reconciliation status, for the read side
+    /// (`GET /api/workspaces`). The default returns empty: backends whose
+    /// workspaces already appear in the fleet snapshot (local) need not
+    /// duplicate them here. `K8sWorkspaceAdmin` overrides this to return its
+    /// `Workspace` CRs, so a configured-but-agentless workspace is still
+    /// visible with its status. (#142)
+    async fn list_workspaces(&self) -> Result<Vec<crate::registry::WorkspaceInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether workspace create/config completes asynchronously (the caller
+    /// should treat success as *accepted, reconciling* rather than *done*).
+    /// Local applies config synchronously (`false`); the k8s config plane hands
+    /// off to the operator's reconcile loop (`true` → the API answers `202`).
+    fn workspace_ops_are_async(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]

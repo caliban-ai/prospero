@@ -53,6 +53,11 @@ pub struct SpawnRequest {
     /// Optional agent-template / frontmatter markdown file, forwarded to
     /// caliband's `SpawnSpec.frontmatter_path`. `None` ⇒ no template (#6).
     pub frontmatter_path: Option<PathBuf>,
+    /// Which of the target workspace's named providers to bind, under the k8s
+    /// config plane (→ `CalibanTask.spec.providerRef`). `None` ⇒ the operator
+    /// picks the workspace's `defaultProvider`. Ignored by `LocalFleet`, whose
+    /// provider comes from the repo's stored config. (#142)
+    pub provider_ref: Option<String>,
 }
 
 impl SpawnRequest {
@@ -66,6 +71,7 @@ impl SpawnRequest {
             tool_allowlist: None,
             interactive: false,
             frontmatter_path: None,
+            provider_ref: None,
         }
     }
 

@@ -66,22 +66,24 @@ pub fn task_name(spec: &TaskSpec) -> String {
 /// `spec.workspace` — today's implicit per-repo identity, preserved until the
 /// Phase D launch modal supplies an explicit workspace/provider.
 ///
-/// MVP simplification (documented): `providerRef` and per-run `isolation`/`tools`
-/// overrides are left unset here; Task 5 (spawn emits refs/overrides) widens
-/// `TaskSpec`/`SpawnRequest` to carry them.
+/// The task binds the workspace's provider named by `spec.request.provider_ref`
+/// (or the operator's `defaultProvider` when unset) and carries the per-run tool
+/// allow-list override. Per-run `isolation` and a per-run model stay unset:
+/// isolation defaults live on the `Workspace`, and a model override is expressed
+/// by provider selection (the frozen CRD has no per-task model field).
 #[must_use]
 pub fn build_calibantask(spec: &TaskSpec, name: &str) -> CalibanTask {
     let crd_spec = CalibanTaskSpec {
         workspace_ref: WorkspaceRef {
             name: spec.workspace.clone(),
         },
-        provider_ref: None,
+        provider_ref: spec.request.provider_ref.clone(),
         task: CrdTaskSpec {
             prompt: spec.request.prompt.clone(),
             agent_type: None,
         },
         isolation: None,
-        tools: None,
+        tools: spec.request.tool_allowlist.clone(),
     };
     CalibanTask::new(name, crd_spec)
 }
@@ -196,24 +198,17 @@ pub fn phase_to_status(phase: &str) -> AgentStatus {
 /// - `session_dir` is always an empty `PathBuf` — a k8s-backed agent has no
 ///   prosperod-local session directory; `LocalFleet`'s meaning for that
 ///   field (a path on the daemon's own disk) doesn't apply here.
-/// - `repo` prefers the first source of the operator-pinned
-///   `status.resolvedWorkspace`, falling back to the `spec.workspaceRef.name`
-///   the task references (which `build_calibantask` sets to the workspace/repo
-///   identity) before the operator has reconciled — so the label is correct
-///   both pre- and post-admission.
+/// - `workspace` is the `spec.workspaceRef.name` the task references — i.e. the
+///   `Workspace` object the agent belongs to. This is what groups agents under
+///   their workspace on the read side (`GET /api/workspaces`); the workspace's
+///   *sources* live inside `status.resolvedWorkspace` and are a different axis.
 /// - `started_at` comes from `metadata.creationTimestamp` (RFC-3339 via
 ///   `Display`), or `""` if unset (a CR that hasn't round-tripped through
 ///   the apiserver yet, e.g. straight out of `MemTaskApi` in tests).
 #[must_use]
 pub fn agent_from_task(task: &CalibanTask) -> Agent {
     let name = task.metadata.name.clone().unwrap_or_default();
-    let repo = task
-        .status
-        .as_ref()
-        .and_then(|s| s.resolved_workspace.as_ref())
-        .and_then(|rw| rw.sources.first())
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| task.spec.workspace_ref.name.clone());
+    let repo = task.spec.workspace_ref.name.clone();
     let phase = task
         .status
         .as_ref()
@@ -1234,6 +1229,20 @@ mod tests {
         // resolves + pins sources at admission); no inline source list here.
         assert_eq!(ct.spec.workspace_ref.name, "my-repo");
         assert!(ct.spec.provider_ref.is_none());
+    }
+
+    #[test]
+    fn build_calibantask_emits_provider_ref_and_tools() {
+        let mut s = spec("my-ws", "do it", None);
+        s.request.provider_ref = Some("workers".to_string());
+        s.request.tool_allowlist = Some(vec!["Read".to_string(), "Edit".to_string()]);
+        let ct = build_calibantask(&s, "ct-x");
+        assert_eq!(ct.spec.workspace_ref.name, "my-ws");
+        assert_eq!(ct.spec.provider_ref.as_deref(), Some("workers"));
+        assert_eq!(
+            ct.spec.tools.as_deref(),
+            Some(["Read".to_string(), "Edit".to_string()].as_slice())
+        );
     }
 
     #[tokio::test]
