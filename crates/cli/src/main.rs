@@ -114,6 +114,9 @@ struct SpawnArgs {
     /// Restrict the agent to these tools (repeat the flag per tool). Empty = no restriction.
     #[arg(long = "tool-allowlist", value_name = "TOOL")]
     tool_allowlist: Vec<String>,
+    /// Path to an agent-template / frontmatter markdown file for the agent.
+    #[arg(long = "frontmatter", value_name = "PATH")]
+    frontmatter: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -196,6 +199,9 @@ fn main() -> Result<()> {
             }
             if !a.tool_allowlist.is_empty() {
                 body["tool_allowlist"] = a.tool_allowlist.into();
+            }
+            if let Some(frontmatter) = a.frontmatter {
+                body["frontmatter_path"] = frontmatter.into();
             }
             let resp =
                 client.post_json(&format!("/api/workspaces/{}/agents", a.workspace), body)?;
@@ -396,6 +402,22 @@ mod tests {
                     "shared_tree must default to false (worktree on)"
                 );
             }
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_frontmatter_flag_parses() {
+        let cli = Cli::parse_from([
+            "prospero",
+            "spawn",
+            "myrepo",
+            "do it",
+            "--frontmatter",
+            "/tpl.md",
+        ]);
+        match cli.command {
+            Command::Spawn(a) => assert_eq!(a.frontmatter.as_deref(), Some("/tpl.md")),
             other => panic!("expected spawn, got {other:?}"),
         }
     }

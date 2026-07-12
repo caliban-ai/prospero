@@ -50,6 +50,9 @@ pub struct SpawnRequest {
     /// Run in interactive mode (the worker awaits operator input instead of
     /// finishing). Defaults to `false` via [`SpawnRequest::new`].
     pub interactive: bool,
+    /// Optional agent-template / frontmatter markdown file, forwarded to
+    /// caliband's `SpawnSpec.frontmatter_path`. `None` ⇒ no template (#6).
+    pub frontmatter_path: Option<PathBuf>,
 }
 
 impl SpawnRequest {
@@ -62,13 +65,14 @@ impl SpawnRequest {
             isolation_worktree: true,
             tool_allowlist: None,
             interactive: false,
+            frontmatter_path: None,
         }
     }
 
     fn into_spec(self) -> SpawnSpec {
         SpawnSpec {
             label: self.label,
-            frontmatter_path: None,
+            frontmatter_path: self.frontmatter_path,
             initial_prompt: self.prompt,
             model: self.model,
             // Filled in `spawn_agent` from the repo's stored provider config —
@@ -1730,6 +1734,18 @@ mod tests {
         });
         let client = cfg.network_client().unwrap().expect("network client");
         assert!(matches!(client.endpoint(), Endpoint::Tcp { .. }));
+    }
+
+    #[test]
+    fn spawn_request_forwards_frontmatter_to_spec() {
+        // #6: a template path on the request reaches caliband's SpawnSpec.
+        let mut req = SpawnRequest::new("p");
+        assert_eq!(req.clone().into_spec().frontmatter_path, None);
+        req.frontmatter_path = Some(std::path::PathBuf::from("/tpl.md"));
+        assert_eq!(
+            req.into_spec().frontmatter_path,
+            Some(std::path::PathBuf::from("/tpl.md"))
+        );
     }
 
     #[test]
