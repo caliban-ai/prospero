@@ -59,6 +59,10 @@ pub struct SpawnBody {
     /// Optional agent-template / frontmatter markdown file path (#6).
     #[serde(default)]
     pub frontmatter_path: Option<String>,
+    /// Which named workspace provider to bind (k8s config plane →
+    /// `CalibanTask.providerRef`). `None` ⇒ the workspace's default (#142).
+    #[serde(default)]
+    pub provider_ref: Option<String>,
 }
 
 impl SpawnBody {
@@ -74,6 +78,7 @@ impl SpawnBody {
             tool_allowlist: self.tool_allowlist,
             interactive: self.interactive,
             frontmatter_path: self.frontmatter_path.map(std::path::PathBuf::from),
+            provider_ref: self.provider_ref,
         }
     }
 }
@@ -112,6 +117,10 @@ pub struct RespawnedResponse {
 }
 
 /// A workspace summary (no agents) for `GET /api/workspaces`.
+///
+/// The tail fields are populated by the k8s config plane (from `Workspace` CRs)
+/// and skipped for the local backend, so local responses are byte-for-byte
+/// unchanged.
 #[derive(Debug, Serialize)]
 pub struct WorkspaceSummary {
     /// Registry name.
@@ -126,6 +135,18 @@ pub struct WorkspaceSummary {
     pub agent_count: usize,
     /// Provider/environment config for this workspace.
     pub config: RepoProviderConfig,
+    /// Human-friendly label (k8s config plane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Named providers agents can bind to (k8s config plane).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<prospero_core::registry::ProviderInfo>,
+    /// Provider bound when an agent requests none (k8s config plane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Reconciliation status (k8s config plane); absent for local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<prospero_core::registry::WorkspaceStatusInfo>,
 }
 
 #[cfg(test)]
@@ -164,6 +185,10 @@ mod tests {
             health: prospero_core::WorkspaceHealth::Healthy,
             agent_count: 0,
             config: RepoProviderConfig::default(),
+            display_name: None,
+            providers: Vec::new(),
+            default_provider: None,
+            status: None,
         };
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["sources"][0]["name"], "a");

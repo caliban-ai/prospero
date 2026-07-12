@@ -194,6 +194,81 @@ async fn capabilities_reports_admin_false_without_admin() {
     assert_eq!(v["admin"], false, "no admin plane ⇒ admin=false: {v}");
 }
 
+/// The k8s config plane (#142): configuring a workspace persists a `Workspace`
+/// CR (no 405), the create is async (`202`), and `GET /api/workspaces` surfaces
+/// the real CR — providers + reconciliation status — even with no agents yet.
+#[cfg(feature = "k8s")]
+#[tokio::test]
+async fn k8s_config_plane_creates_and_surfaces_workspace() {
+    use prospero_core::k8s::fake::{FakeK8s, FakeWorkspaceApi};
+    use prospero_core::{K8sFleet, K8sWorkspaceAdmin};
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let bus: Arc<dyn prospero_core::bus::EventBus> =
+        Arc::new(prospero_core::bus::InProcessBus::new(64));
+    let ws_api = Arc::new(FakeWorkspaceApi::new());
+    let admin = Arc::new(K8sWorkspaceAdmin::new(Arc::clone(&ws_api)));
+    let fleet = Arc::new(K8sFleet::new(FakeK8s::new(), bus.clone(), store.clone()));
+    let app = router(
+        fleet,
+        Some(admin as Arc<dyn prospero_core::FleetAdmin>),
+        store,
+        bus,
+    );
+
+    // Configuring a workspace on k8s is accepted asynchronously (202), not 405.
+    let body = r#"{"name":"team-a-ws","config":{
+        "display_name":"Team A",
+        "sources":[{"name":"caliban","repo":"git@x:caliban","path":"/work/caliban"}],
+        "providers":[
+            {"name":"planner","kind":"anthropic","model":"claude-opus-4-8","credentials_ref":{"secret_name":"anthropic-key","key":"api-key"}},
+            {"name":"workers","kind":"ollama","base_url":"http://h:11434"}
+        ],
+        "default_provider":"planner"}}"#;
+    let post = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workspaces")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post.status(), StatusCode::ACCEPTED, "async create ⇒ 202");
+
+    // The operator reconciles the CR (simulated) → status surfaces on the read side.
+    ws_api.set_status("team-a-ws", "Ready", None);
+
+    let get = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/workspaces")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let v = json_body(get).await;
+    let ws = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "team-a-ws")
+        .expect("configured workspace is visible even with no agents");
+    assert_eq!(ws["display_name"], "Team A");
+    assert_eq!(ws["default_provider"], "planner");
+    assert_eq!(ws["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(ws["providers"][0]["has_credentials"], true);
+    assert_eq!(ws["providers"][1]["has_credentials"], false);
+    assert_eq!(ws["agent_count"], 0);
+    assert_eq!(ws["status"]["phase"], "Ready");
+}
+
 #[tokio::test]
 async fn readyz_returns_200_when_store_writable() {
     let h = setup().await;

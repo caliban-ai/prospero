@@ -21,16 +21,72 @@ pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
 /// `GET /api/workspaces` — managed workspaces with health, sources, agent counts.
 pub async fn get_workspaces(State(st): State<AppState>) -> Json<Vec<WorkspaceSummary>> {
     let snap = st.fleet.snapshot().await;
-    let out = snap
-        .workspaces
+
+    // The k8s config plane surfaces real `Workspace` CRs (config + reconciliation
+    // status), including configured-but-agentless ones the fleet snapshot can't
+    // see. `list_workspaces` is empty for the local backend, so local falls
+    // through to the snapshot projection unchanged. (#142)
+    let records = match st.admin.as_ref() {
+        Some(admin) => admin.list_workspaces().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    if records.is_empty() {
+        let out = snap
+            .workspaces
+            .into_iter()
+            .map(|r| WorkspaceSummary {
+                name: r.name,
+                root: r.root.display().to_string(),
+                sources: r.sources,
+                health: r.health,
+                agent_count: r.agents.len(),
+                config: r.config,
+                display_name: None,
+                providers: Vec::new(),
+                default_provider: None,
+                status: None,
+            })
+            .collect();
+        return Json(out);
+    }
+
+    // Regroup the snapshot's agents by the workspace they belong to
+    // (`agent.workspace` == the `Workspace` object name), so each config-plane
+    // workspace reports its own agent count.
+    let mut agent_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for w in &snap.workspaces {
+        for a in &w.agents {
+            *agent_counts.entry(a.workspace.as_str()).or_default() += 1;
+        }
+    }
+
+    let out = records
         .into_iter()
-        .map(|r| WorkspaceSummary {
-            name: r.name,
-            root: r.root.display().to_string(),
-            sources: r.sources,
-            health: r.health,
-            agent_count: r.agents.len(),
-            config: r.config,
+        .map(|wi| {
+            let agent_count = agent_counts.get(wi.name.as_str()).copied().unwrap_or(0);
+            let sources = wi
+                .sources
+                .iter()
+                .map(|s| prospero_core::Source {
+                    name: s.name.clone(),
+                    path: std::path::PathBuf::from(&s.path),
+                })
+                .collect();
+            WorkspaceSummary {
+                name: wi.name,
+                root: String::new(),
+                sources,
+                // Reconciliation status (below) is the real health signal under
+                // k8s; the poll-based `health` field doesn't apply.
+                health: prospero_core::WorkspaceHealth::Healthy,
+                agent_count,
+                config: prospero_core::registry::RepoProviderConfig::default(),
+                display_name: wi.display_name,
+                providers: wi.providers,
+                default_provider: wi.default_provider,
+                status: wi.status,
+            }
         })
         .collect();
     Json(out)
@@ -45,10 +101,17 @@ pub async fn add_workspace(
         .admin
         .as_ref()
         .ok_or_else(ApiError::unsupported_on_backend)?;
+    let async_ops = admin.workspace_ops_are_async();
     admin
         .add_workspace(body.name, body.root.into(), body.config)
         .await?;
-    Ok(StatusCode::CREATED)
+    // Async backends (k8s) only enqueued a reconcile → 202 Accepted; local
+    // applied synchronously → 201 Created.
+    Ok(if async_ops {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::CREATED
+    })
 }
 
 /// `PUT /api/workspaces/{name}/config` — set provider config and restart caliband.
@@ -61,8 +124,14 @@ pub async fn set_workspace_config(
         .admin
         .as_ref()
         .ok_or_else(ApiError::unsupported_on_backend)?;
+    let async_ops = admin.workspace_ops_are_async();
     admin.set_workspace_config(&name, body.0).await?;
-    Ok(StatusCode::NO_CONTENT)
+    // k8s: the operator re-reconciles → 202 Accepted; local: applied now → 204.
+    Ok(if async_ops {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::NO_CONTENT
+    })
 }
 
 /// `DELETE /api/workspaces/{name}` — unregister a workspace.

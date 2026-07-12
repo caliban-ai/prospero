@@ -200,6 +200,55 @@ impl<W: WorkspaceApi> FleetAdmin for K8sWorkspaceAdmin<W> {
         // touch the status subresource, so reconciliation state is preserved.
         self.api.apply(&workspace_from_config(name, &config)).await
     }
+
+    async fn list_workspaces(&self) -> Result<Vec<crate::registry::WorkspaceInfo>> {
+        Ok(self.api.list().await?.iter().map(workspace_info).collect())
+    }
+
+    fn workspace_ops_are_async(&self) -> bool {
+        // Applying a Workspace CR only enqueues the operator's reconcile; the
+        // config isn't live until it reaches `Ready`. The API answers `202`.
+        true
+    }
+}
+
+/// Project a `Workspace` CR onto the read-side [`WorkspaceInfo`]: config plus
+/// reconciliation status, with credentials reduced to a `has_credentials` flag
+/// (the Secret reference itself is never surfaced on the read side).
+#[must_use]
+fn workspace_info(ws: &Workspace) -> crate::registry::WorkspaceInfo {
+    use crate::registry::{ProviderInfo, WorkspaceSourceSpec, WorkspaceStatusInfo};
+    crate::registry::WorkspaceInfo {
+        name: ws.metadata.name.clone().unwrap_or_default(),
+        display_name: (!ws.spec.display_name.is_empty()).then(|| ws.spec.display_name.clone()),
+        sources: ws
+            .spec
+            .sources
+            .iter()
+            .map(|s| WorkspaceSourceSpec {
+                name: s.name.clone(),
+                repo: s.repo.clone(),
+                r#ref: Some(s.r#ref.clone()),
+                path: s.path.clone(),
+            })
+            .collect(),
+        providers: ws
+            .spec
+            .providers
+            .iter()
+            .map(|p| ProviderInfo {
+                name: p.name.clone(),
+                kind: p.kind.clone(),
+                model: p.model.clone(),
+                has_credentials: p.credentials_ref.is_some(),
+            })
+            .collect(),
+        default_provider: ws.spec.default_provider.clone(),
+        status: ws.status.as_ref().map(|s| WorkspaceStatusInfo {
+            phase: s.phase.clone(),
+            message: s.message.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +351,39 @@ mod tests {
         // remove reports prior existence; a second remove reports absence.
         assert!(admin.remove_workspace("team-a-ws").await.unwrap());
         assert!(!admin.remove_workspace("team-a-ws").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_projects_config_and_status_for_the_read_side() {
+        let api = Arc::new(FakeWorkspaceApi::new());
+        let admin = K8sWorkspaceAdmin::new(Arc::clone(&api));
+        admin
+            .add_workspace("team-a-ws".to_string(), "/ignored".into(), rich_config())
+            .await
+            .unwrap();
+        api.set_status(
+            "team-a-ws",
+            "Failed",
+            Some("secret 'anthropic-key' not found"),
+        );
+
+        let infos = admin.list_workspaces().await.unwrap();
+        assert_eq!(infos.len(), 1);
+        let wi = &infos[0];
+        assert_eq!(wi.name, "team-a-ws");
+        assert_eq!(wi.display_name.as_deref(), Some("Team A"));
+        assert_eq!(wi.default_provider.as_deref(), Some("planner"));
+        assert_eq!(wi.providers.len(), 2);
+        // Credentials reduced to a bool; the Secret ref is not surfaced.
+        assert!(wi.providers[0].has_credentials);
+        assert!(!wi.providers[1].has_credentials);
+        assert_eq!(wi.providers[1].kind, "ollama");
+        // Reconciliation status flows through for the dashboard pill/tooltip.
+        let status = wi.status.as_ref().unwrap();
+        assert_eq!(status.phase, "Failed");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("secret 'anthropic-key' not found")
+        );
     }
 }

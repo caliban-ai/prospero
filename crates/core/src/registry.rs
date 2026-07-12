@@ -15,7 +15,8 @@ use crate::error::{CoreError, Result};
 // WASM dashboard, prospero #98); re-exported here from its original path.
 pub use prospero_types::RepoProviderConfig;
 pub use prospero_types::{
-    CredentialsRef, IsolationConfig, ProviderSpec, WorkspaceConfig, WorkspaceSourceSpec,
+    CredentialsRef, IsolationConfig, ProviderInfo, ProviderSpec, WorkspaceConfig, WorkspaceInfo,
+    WorkspaceSourceSpec, WorkspaceStatusInfo,
 };
 
 /// A single managed workspace's *persisted* identity: name + root + config.
