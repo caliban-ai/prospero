@@ -272,7 +272,7 @@ impl KubeTaskApi {
 }
 
 #[cfg(feature = "k8s")]
-fn map_kube_err(op: &str, e: kube::Error) -> CoreError {
+pub(crate) fn map_kube_err(op: &str, e: kube::Error) -> CoreError {
     CoreError::Fleet(format!("{op}: {e}"))
 }
 
