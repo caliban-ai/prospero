@@ -15,6 +15,12 @@ pub struct Capabilities {
     /// k8s (a `Workspace`-CR editor). Only `false` if a backend leaves the
     /// `admin` seam unwired.
     pub admin: bool,
+    /// Whether workspace create/config completes asynchronously — the dashboard
+    /// uses this to (a) render the k8s config UI (named-provider list +
+    /// Secret-reference credentials, vs the local single-provider env-var form)
+    /// and (b) treat a save as *accepted, reconciling* rather than *done*.
+    /// `false` for local, `true` for k8s. (#143)
+    pub async_workspace_ops: bool,
 }
 
 /// Body for `POST /api/workspaces`.

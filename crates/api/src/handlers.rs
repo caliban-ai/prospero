@@ -311,6 +311,10 @@ pub async fn get_metrics(State(st): State<AppState>) -> Json<prospero_core::Metr
 pub async fn get_capabilities(State(st): State<AppState>) -> Json<crate::dto::Capabilities> {
     Json(crate::dto::Capabilities {
         admin: st.admin.is_some(),
+        async_workspace_ops: st
+            .admin
+            .as_ref()
+            .is_some_and(|a| a.workspace_ops_are_async()),
     })
 }
 
