@@ -6,6 +6,10 @@
 
 - [Changelog](./changelog.md)
 
+# Design
+
+- [Guiding Principles & Invariants](./principles.md)
+
 # Architecture Decisions
 
 - [ADR Index](./adr/index.md)
