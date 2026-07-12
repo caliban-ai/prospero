@@ -1,0 +1,23 @@
+# Vendored verbatim from caliban-operator deploy/samples/workspace.yaml
+# (caliban-operator #11, merged 2026-07-12). This is the ADR 0008 §1 coupling
+# snapshot: prospero's Workspace mirror is golden-tested against it. If the
+# operator changes the CRD, re-vendor this file and update the mirror in lockstep.
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: Workspace
+metadata:
+  name: team-a-ws
+  namespace: team-a
+spec:
+  displayName: Team A
+  sources:
+    - { name: caliban, repo: "git@example:caliban", ref: main, path: /work/caliban }
+  providers:
+    - name: planner
+      kind: anthropic
+      model: claude-opus-4-8
+      credentialsRef: { secretName: anthropic-key, key: api-key }
+    - name: workers
+      kind: ollama
+      baseUrl: "http://192.168.1.240:11434"
+      model: qwen2.5-coder
+  defaultProvider: planner

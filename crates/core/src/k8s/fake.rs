@@ -103,6 +103,10 @@ impl CalibanTaskApi for FakeK8s {
             sandbox_ref: Some(NamedRef {
                 name: format!("{name}-sandbox"),
             }),
+            // The fake plays operator but doesn't resolve a Workspace CR; leave
+            // the pinned resolvedWorkspace unset. `agent_from_task` falls back to
+            // `spec.workspaceRef.name` for the workspace label, which suffices.
+            resolved_workspace: None,
         });
 
         self.store.lock().unwrap().insert(name, reconciled);
