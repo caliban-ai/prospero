@@ -9,6 +9,56 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-12
+
+The **Kubernetes config plane**: deploying with `PROSPERO_FLEET=k8s` is now a
+real control plane — create and configure workspaces, and launch provider-bound
+agents, from the dashboard — instead of a read-only viewer that returned
+`405 Method Not Allowed` on Save. Workspaces are first-class `Workspace` custom
+resources reconciled by `caliban-operator`, and the dashboard is backend-aware.
+Local behavior is unchanged.
+
+### Added
+
+- **Kubernetes config plane (core + API).** Under `PROSPERO_FLEET=k8s`,
+  `K8sFleet` now wires a `FleetAdmin` over operator-owned `Workspace` custom
+  resources, so `POST` / `PUT` / `DELETE` on `/api/workspaces` persist and
+  manage real configuration — multi-source workspaces, a named-provider list,
+  and per-provider credentials referenced by Kubernetes `Secret` name (prospero
+  never reads the Secret) — instead of returning `405`. A backend-neutral
+  `WorkspaceConfig` DTO lets one API serve both backends (local projects its
+  single-provider subset, unchanged); `GET /api/workspaces` returns the real
+  `Workspace` CRs with reconciliation status; async workspace writes answer
+  `202 Accepted`; and a spawned agent binds a named provider via `providerRef`
+  ([#142](https://github.com/caliban-ai/prospero/issues/142))
+  ([#144](https://github.com/caliban-ai/prospero/pull/144),
+  [#145](https://github.com/caliban-ai/prospero/pull/145)).
+- **Backend-aware dashboard.** The dashboard fetches `GET /api/capabilities` and
+  adapts. On k8s it renders a workspace editor (git sources + a named-provider
+  list with `secretName` / `key` Secret references and a default marker),
+  reconciliation status pills (`pending` / `reconciling` / `ready` / `failed`
+  with the failure message on hover), and a launch-modal provider picker; on
+  local it is byte-for-byte unchanged
+  ([#143](https://github.com/caliban-ai/prospero/issues/143))
+  ([#146](https://github.com/caliban-ai/prospero/pull/146)).
+- **`GET /api/capabilities`** — a backend capability seam the dashboard gates its
+  controls on ([#99](https://github.com/caliban-ai/prospero/issues/99))
+  ([#101](https://github.com/caliban-ai/prospero/pull/101)).
+- **Frontmatter / agent-template support through spawn** — a spawn can forward an
+  agent-template markdown file to caliband's `SpawnSpec.frontmatter_path`
+  ([#6](https://github.com/caliban-ai/prospero/issues/6))
+  ([#102](https://github.com/caliban-ai/prospero/pull/102)).
+- **Guiding Principles & Invariants** guide page synthesizing ADRs 0002–0009
+  ([#74](https://github.com/caliban-ai/prospero/issues/74))
+  ([#104](https://github.com/caliban-ai/prospero/pull/104)).
+
+### Changed
+
+- The `CalibanTask` CRD mirror moved from an inline `workspace` to a
+  `workspaceRef` (plus an operator-pinned `status.resolvedWorkspace`), matching
+  caliban-operator's frozen `v1alpha1` contract. Pre-v1; existing cluster CRs
+  are recreated under the new schema.
+
 ## [0.2.0] - 2026-07-11
 
 Kubernetes high-availability, a reworked dashboard, and a full QA sweep. A
@@ -128,7 +178,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/caliban-ai/prospero/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caliban-ai/prospero/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/caliban-ai/prospero/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/caliban-ai/prospero/releases/tag/v0.1.0
