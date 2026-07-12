@@ -1,7 +1,7 @@
 //! Request/response payloads for the HTTP API.
 
 use prospero_core::fleet::SpawnRequest;
-use prospero_core::registry::RepoProviderConfig;
+use prospero_core::registry::{RepoProviderConfig, WorkspaceConfig};
 use serde::{Deserialize, Serialize};
 
 /// Backend capability signal for the dashboard (`GET /api/capabilities`). Fixed
@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 /// backend can't serve. (#99)
 #[derive(Debug, Serialize)]
 pub struct Capabilities {
-    /// Whether the workspace admin/registry plane (add / remove / set-config) is
-    /// available. `true` for the local backend; `false` under k8s, where
-    /// workspaces are `CalibanTask`/namespace-driven.
+    /// Whether the workspace admin/config plane (add / remove / set-config) is
+    /// available. `true` for the local backend (registry) and, as of #142, for
+    /// k8s (a `Workspace`-CR editor). Only `false` if a backend leaves the
+    /// `admin` seam unwired.
     pub admin: bool,
 }
 
@@ -21,16 +22,19 @@ pub struct Capabilities {
 pub struct AddWorkspaceBody {
     /// Operator-chosen short name.
     pub name: String,
-    /// Workspace root path.
-    pub root: String,
-    /// Optional initial provider config.
+    /// LocalFleet checkout path. Ignored under k8s (sources come from `config`),
+    /// so k8s requests may omit it.
     #[serde(default)]
-    pub config: RepoProviderConfig,
+    pub root: String,
+    /// Backend-neutral initial configuration. Local reads the flattened
+    /// single-provider/env subset; k8s reads sources/providers/etc.
+    #[serde(default)]
+    pub config: WorkspaceConfig,
 }
 
 /// Body for `PUT /api/workspaces/{name}/config`.
 #[derive(Debug, Deserialize)]
-pub struct SetConfigBody(pub RepoProviderConfig);
+pub struct SetConfigBody(pub WorkspaceConfig);
 
 /// Body for `POST /api/workspaces/{repo}/agents`.
 #[derive(Debug, Deserialize)]

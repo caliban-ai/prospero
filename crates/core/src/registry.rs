@@ -14,6 +14,9 @@ use crate::error::{CoreError, Result};
 // The per-repo provider config DTO now lives in `prospero-types` (shared with the
 // WASM dashboard, prospero #98); re-exported here from its original path.
 pub use prospero_types::RepoProviderConfig;
+pub use prospero_types::{
+    CredentialsRef, IsolationConfig, ProviderSpec, WorkspaceConfig, WorkspaceSourceSpec,
+};
 
 /// A single managed workspace's *persisted* identity: name + root + config.
 /// Sources are discovered from the filesystem at snapshot-build time (they are

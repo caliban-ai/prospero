@@ -1,0 +1,13 @@
+# Vendored verbatim from caliban-operator deploy/samples/calibantask.yaml
+# (caliban-operator #11, merged 2026-07-12). ADR 0008 §1 coupling snapshot for
+# prospero's CalibanTask mirror. Note the post-#11 shape: workspaceRef (not the
+# removed inline `workspace`) + providerRef.
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: CalibanTask
+metadata:
+  name: refactor-auth
+  namespace: team-a
+spec:
+  workspaceRef: { name: team-a-ws }
+  providerRef: workers
+  task: { prompt: "refactor the auth module", agentType: general-purpose }

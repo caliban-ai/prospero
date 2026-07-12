@@ -32,7 +32,7 @@ use crate::caliband::wire::Endpoint;
 use crate::error::{CoreError, Result};
 use crate::fleet::{AttachBackoff, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
-use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, Source, TaskSpec as CrdTaskSpec, Workspace};
+use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, TaskSpec as CrdTaskSpec, WorkspaceRef};
 use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::store::Store;
@@ -60,32 +60,28 @@ pub fn task_name(spec: &TaskSpec) -> String {
 
 /// Map a `TaskSpec` onto the `CalibanTask` CR that expresses it.
 ///
-/// MVP simplification (documented per the plan): the workspace gets exactly
-/// **one** [`Source`] built from `spec.workspace`, checked out at `main` and
-/// mounted at `/work/<repo>`. Multi-source workspaces, non-`main` refs, and
-/// isolation-from-request mapping are out of scope until a later task widens
-/// `TaskSpec`/`SpawnRequest` to carry that information explicitly.
+/// Post-#11 shape: the task carries a `workspaceRef` naming the `Workspace` CR
+/// it runs against (the operator resolves + pins its sources/provider at
+/// admission), not an inline source list. The referenced workspace name is
+/// `spec.workspace` — today's implicit per-repo identity, preserved until the
+/// Phase D launch modal supplies an explicit workspace/provider.
+///
+/// MVP simplification (documented): `providerRef` and per-run `isolation`/`tools`
+/// overrides are left unset here; Task 5 (spawn emits refs/overrides) widens
+/// `TaskSpec`/`SpawnRequest` to carry them.
 #[must_use]
 pub fn build_calibantask(spec: &TaskSpec, name: &str) -> CalibanTask {
-    let source = Source {
-        name: spec.workspace.clone(),
-        repo: spec.workspace.clone(),
-        r#ref: "main".to_string(),
-        path: format!("/work/{}", spec.workspace),
-    };
     let crd_spec = CalibanTaskSpec {
-        workspace: Workspace {
-            sources: vec![source],
-            services: Vec::new(),
+        workspace_ref: WorkspaceRef {
+            name: spec.workspace.clone(),
         },
+        provider_ref: None,
         task: CrdTaskSpec {
             prompt: spec.request.prompt.clone(),
             agent_type: None,
         },
-        // No isolation knob on `SpawnRequest`/`TaskSpec` yet beyond the
-        // worktree bool, which the operator's `IsolationSpec` doesn't model
-        // 1:1 — leave unset for MVP (documented simplification).
         isolation: None,
+        tools: None,
     };
     CalibanTask::new(name, crd_spec)
 }
@@ -200,10 +196,11 @@ pub fn phase_to_status(phase: &str) -> AgentStatus {
 /// - `session_dir` is always an empty `PathBuf` — a k8s-backed agent has no
 ///   prosperod-local session directory; `LocalFleet`'s meaning for that
 ///   field (a path on the daemon's own disk) doesn't apply here.
-/// - `repo` prefers the first workspace source's name, falling back to the
-///   task's own name if the workspace is somehow sourceless (shouldn't
-///   happen for a `K8sFleet`-applied CR, but `list()` can also observe CRs
-///   this process didn't create).
+/// - `repo` prefers the first source of the operator-pinned
+///   `status.resolvedWorkspace`, falling back to the `spec.workspaceRef.name`
+///   the task references (which `build_calibantask` sets to the workspace/repo
+///   identity) before the operator has reconciled — so the label is correct
+///   both pre- and post-admission.
 /// - `started_at` comes from `metadata.creationTimestamp` (RFC-3339 via
 ///   `Display`), or `""` if unset (a CR that hasn't round-tripped through
 ///   the apiserver yet, e.g. straight out of `MemTaskApi` in tests).
@@ -211,12 +208,12 @@ pub fn phase_to_status(phase: &str) -> AgentStatus {
 pub fn agent_from_task(task: &CalibanTask) -> Agent {
     let name = task.metadata.name.clone().unwrap_or_default();
     let repo = task
-        .spec
-        .workspace
-        .sources
-        .first()
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved_workspace.as_ref())
+        .and_then(|rw| rw.sources.first())
         .map(|s| s.name.clone())
-        .unwrap_or_else(|| name.clone());
+        .unwrap_or_else(|| task.spec.workspace_ref.name.clone());
     let phase = task
         .status
         .as_ref()
@@ -275,7 +272,7 @@ impl KubeTaskApi {
 }
 
 #[cfg(feature = "k8s")]
-fn map_kube_err(op: &str, e: kube::Error) -> CoreError {
+pub(crate) fn map_kube_err(op: &str, e: kube::Error) -> CoreError {
     CoreError::Fleet(format!("{op}: {e}"))
 }
 
@@ -1127,6 +1124,7 @@ impl MemTaskApi {
             phase: "Running".to_string(),
             caliband_endpoint: Some(endpoint.to_string()),
             sandbox_ref: None,
+            resolved_workspace: None,
         });
     }
 }
@@ -1232,10 +1230,10 @@ mod tests {
 
         assert_eq!(ct.metadata.name.as_deref(), Some(name.as_str()));
         assert_eq!(ct.spec.task.prompt, "refactor the thing");
-        assert_eq!(ct.spec.workspace.sources.len(), 1);
-        assert_eq!(ct.spec.workspace.sources[0].name, "my-repo");
-        assert_eq!(ct.spec.workspace.sources[0].repo, "my-repo");
-        assert_eq!(ct.spec.workspace.sources[0].path, "/work/my-repo");
+        // Post-#11: the task references its workspace by name (the operator
+        // resolves + pins sources at admission); no inline source list here.
+        assert_eq!(ct.spec.workspace_ref.name, "my-repo");
+        assert!(ct.spec.provider_ref.is_none());
     }
 
     #[tokio::test]
@@ -1415,6 +1413,7 @@ mod tests {
                 phase: "Running".to_string(),
                 caliband_endpoint: Some(endpoint.to_string()),
                 sandbox_ref: None,
+                resolved_workspace: None,
             });
             ct
         };
@@ -1462,6 +1461,7 @@ mod tests {
             phase: "Running".to_string(),
             caliband_endpoint: Some("10.0.0.5:9443".to_string()),
             sandbox_ref: None,
+            resolved_workspace: None,
         });
 
         let agent = agent_from_task(&ct);

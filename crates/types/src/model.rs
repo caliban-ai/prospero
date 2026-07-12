@@ -39,6 +39,94 @@ pub struct RepoProviderConfig {
     pub env: BTreeMap<String, String>,
 }
 
+/// A source checkout spec for a workspace: a git remote and where to mount it.
+/// Used by the k8s config plane to build a `Workspace` CR's `sources[]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSourceSpec {
+    /// Source identifier (matches caliband's workspace source name).
+    pub name: String,
+    /// Git remote to clone.
+    pub repo: String,
+    /// Git ref to check out (defaults to `main` when omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    /// Absolute mount path in the pod (e.g. `/work/caliban`).
+    pub path: String,
+}
+
+/// A named model provider within a workspace. Each agent binds one by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSpec {
+    /// Provider identifier, unique within the workspace (e.g. `planner`).
+    pub name: String,
+    /// Provider kind (e.g. `ollama`, `anthropic`, `openai`).
+    pub kind: String,
+    /// Override base URL (e.g. `http://192.168.1.240:11434`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Default model for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reference to an existing Secret holding this provider's API key. Keyless
+    /// providers (e.g. ollama) omit it. Prospero only *names* the Secret — it
+    /// never reads it (the operator validates existence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_ref: Option<CredentialsRef>,
+}
+
+/// A by-name reference to a key within an existing Secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialsRef {
+    /// Name of the Secret (same namespace).
+    pub secret_name: String,
+    /// Key within the Secret's data.
+    pub key: String,
+}
+
+/// Isolation defaults for agents launched against a workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationConfig {
+    /// RuntimeClass (e.g. `gvisor`, `kata`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
+    /// Worktree isolation strategy (e.g. `per-source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<String>,
+}
+
+/// Backend-neutral workspace configuration accepted at the API boundary
+/// (`POST /api/workspaces`, `PUT /api/workspaces/{name}/config`).
+///
+/// The rich fields (`sources`/`providers`/`default_provider`/`isolation`) drive a
+/// k8s `Workspace` CR; the flattened [`RepoProviderConfig`] carries the
+/// `LocalFleet` single-provider/env shape. Each backend **projects out the
+/// subset it uses**, so one endpoint serves both: `#[serde(flatten)]` keeps
+/// legacy local bodies (`{provider, base_url, api_key_from_env, env}`)
+/// deserializing unchanged, while k8s reads the named-provider list + Secret
+/// references it needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Human-friendly dashboard label (k8s `displayName`; local ignores it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Git source checkouts (k8s only; local derives its sources from `root`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<WorkspaceSourceSpec>,
+    /// Named providers (k8s only; local uses the flattened single provider).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderSpec>,
+    /// Provider name agents get when they don't request one (k8s only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Default isolation for agents (k8s only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationConfig>,
+    /// LocalFleet single-provider/env configuration. Flattened so the existing
+    /// local request shape is unchanged.
+    #[serde(flatten)]
+    pub local: RepoProviderConfig,
+}
+
 /// Aggregate readiness of prosperod, distinct from mere liveness.
 ///
 /// `ready` gates traffic/restarts: it is `true` only when the durable store can

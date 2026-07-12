@@ -135,27 +135,31 @@ impl FleetProvider for LocalFleet {
 }
 
 /// The workspace-registry / provider-config plane — a prospero concept
-/// (`Registry` of managed workspaces). `LocalFleet` implements it; k8s has no
-/// analogue (workspaces are `CalibanTask`/namespace-driven), so `K8sFleet` does
-/// NOT implement it and the API returns 405 for these routes under k8s. (#76)
+/// (`Registry` of managed workspaces). Both backends implement it: `LocalFleet`
+/// projects the backend-neutral [`WorkspaceConfig`] onto its internal
+/// single-provider `RepoProviderConfig` path (unchanged); `K8sFleet` maps the
+/// rich fields onto a `Workspace` custom resource. The API returns 405 only
+/// where a backend leaves the `admin` seam unwired. (#76, #142)
 #[async_trait]
 pub trait FleetAdmin: Send + Sync {
-    /// Register a workspace and persist it.
+    /// Register a workspace and persist it. `root` is the LocalFleet checkout
+    /// path; k8s ignores it and uses `config.sources` instead.
     async fn add_workspace(
         &self,
         name: String,
         root: std::path::PathBuf,
-        config: crate::registry::RepoProviderConfig,
+        config: crate::registry::WorkspaceConfig,
     ) -> Result<()>;
 
     /// Unregister a workspace; returns whether one existed.
     async fn remove_workspace(&self, name: &str) -> Result<bool>;
 
-    /// Replace a workspace's provider config (restarts its caliband).
+    /// Replace a workspace's configuration (local: restarts its caliband;
+    /// k8s: patches the `Workspace` CR, operator reconciles).
     async fn set_workspace_config(
         &self,
         name: &str,
-        config: crate::registry::RepoProviderConfig,
+        config: crate::registry::WorkspaceConfig,
     ) -> Result<()>;
 }
 
@@ -165,10 +169,12 @@ impl FleetAdmin for LocalFleet {
         &self,
         name: String,
         root: std::path::PathBuf,
-        config: crate::registry::RepoProviderConfig,
+        config: crate::registry::WorkspaceConfig,
     ) -> Result<()> {
+        // LocalFleet uses only the single-provider/env subset; the rich k8s
+        // fields (sources/providers/…) don't apply to a local checkout.
         self.inner
-            .add_workspace_with_config(name, root, config)
+            .add_workspace_with_config(name, root, config.local)
             .await
     }
 
@@ -179,9 +185,9 @@ impl FleetAdmin for LocalFleet {
     async fn set_workspace_config(
         &self,
         name: &str,
-        config: crate::registry::RepoProviderConfig,
+        config: crate::registry::WorkspaceConfig,
     ) -> Result<()> {
-        self.inner.set_repo_config(name, config).await
+        self.inner.set_repo_config(name, config.local).await
     }
 }
 

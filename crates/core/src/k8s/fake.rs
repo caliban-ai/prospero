@@ -35,8 +35,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{CoreError, Result};
-use crate::k8s::crd::{CalibanTask, CalibanTaskStatus, NamedRef};
+use crate::k8s::crd::{CalibanTask, CalibanTaskStatus, NamedRef, Workspace, WorkspaceStatus};
 use crate::k8s::fleet::CalibanTaskApi;
+use crate::k8s::workspace_api::WorkspaceApi;
 use crate::testkit::FakeBackend;
 
 /// A nominal round-trip delay `apply`/`delete` incur, standing in for real
@@ -103,6 +104,10 @@ impl CalibanTaskApi for FakeK8s {
             sandbox_ref: Some(NamedRef {
                 name: format!("{name}-sandbox"),
             }),
+            // The fake plays operator but doesn't resolve a Workspace CR; leave
+            // the pinned resolvedWorkspace unset. `agent_from_task` falls back to
+            // `spec.workspaceRef.name` for the workspace label, which suffices.
+            resolved_workspace: None,
         });
 
         self.store.lock().unwrap().insert(name, reconciled);
@@ -140,11 +145,126 @@ impl FakeBackend for FakeK8s {
     }
 }
 
+/// An in-memory [`WorkspaceApi`] standing in for a real apiserver, so the k8s
+/// config plane (`FleetAdmin` under k8s) can be exercised against the same
+/// admin-seam conformance suite `LocalFleet` runs — no cluster involved
+/// (ADR 0007). Unlike [`FakeK8s`], writes here are latency-free: the admin-seam
+/// tests don't race a watch loop, so the scheduling asymmetry `FakeK8s`
+/// documents isn't needed.
+///
+/// A real cluster needs the caliban-operator to write `status`; this fake lets
+/// a test simulate that via [`FakeWorkspaceApi::set_status`], so list-with-status
+/// (reconciliation phase on the dashboard) is exercisable without an operator.
+#[derive(Clone, Default)]
+pub struct FakeWorkspaceApi {
+    store: Arc<Mutex<std::collections::BTreeMap<String, Workspace>>>,
+}
+
+impl FakeWorkspaceApi {
+    /// A fresh, empty fake with no `Workspace`s yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Simulate the operator writing reconciliation status onto a workspace.
+    /// No-op if the named workspace doesn't exist.
+    pub fn set_status(&self, name: &str, phase: &str, message: Option<&str>) {
+        if let Some(ws) = self.store.lock().unwrap().get_mut(name) {
+            ws.status = Some(WorkspaceStatus {
+                phase: phase.to_string(),
+                observed_generation: None,
+                message: message.map(str::to_string),
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl WorkspaceApi for FakeWorkspaceApi {
+    async fn apply(&self, ws: &Workspace) -> Result<()> {
+        let name = ws
+            .metadata
+            .name
+            .clone()
+            .ok_or_else(|| CoreError::Fleet("Workspace missing metadata.name".to_string()))?;
+        // Server-side-apply is create-or-update; preserve any operator-written
+        // status across a spec re-apply (a real subresource wouldn't be
+        // clobbered by a spec patch).
+        let mut store = self.store.lock().unwrap();
+        let mut next = ws.clone();
+        if next.status.is_none()
+            && let Some(existing) = store.get(&name)
+        {
+            next.status = existing.status.clone();
+        }
+        store.insert(name, next);
+        Ok(())
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<Workspace>> {
+        Ok(self.store.lock().unwrap().get(name).cloned())
+    }
+
+    async fn list(&self) -> Result<Vec<Workspace>> {
+        Ok(self.store.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn delete(&self, name: &str) -> Result<bool> {
+        Ok(self.store.lock().unwrap().remove(name).is_some())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::k8s::crd::WorkspaceSpec;
     use crate::k8s::fleet::{K8sFleet, PollConfig};
     use std::time::Duration;
+
+    fn ws(name: &str) -> Workspace {
+        Workspace::new(
+            name,
+            WorkspaceSpec {
+                display_name: name.to_string(),
+                sources: Vec::new(),
+                providers: Vec::new(),
+                default_provider: None,
+                env: Vec::new(),
+                isolation: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn fake_workspace_api_crud_round_trip() {
+        let api = FakeWorkspaceApi::new();
+        assert!(api.get("w").await.unwrap().is_none());
+
+        api.apply(&ws("w")).await.unwrap();
+        assert_eq!(api.get("w").await.unwrap().unwrap().spec.display_name, "w");
+        assert_eq!(api.list().await.unwrap().len(), 1);
+
+        // delete reports prior existence; a second delete reports absence.
+        assert!(api.delete("w").await.unwrap());
+        assert!(!api.delete("w").await.unwrap());
+        assert!(api.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fake_workspace_api_surfaces_operator_status_in_list() {
+        let api = FakeWorkspaceApi::new();
+        api.apply(&ws("w")).await.unwrap();
+        api.set_status("w", "Failed", Some("secret 'k' not found"));
+
+        // A spec re-apply must not clobber operator-written status.
+        api.apply(&ws("w")).await.unwrap();
+
+        let listed = api.list().await.unwrap();
+        let status = listed[0].status.as_ref().expect("status surfaced");
+        assert_eq!(status.phase, "Failed");
+        assert_eq!(status.message.as_deref(), Some("secret 'k' not found"));
+    }
 
     /// ADR 0008 §4 / Task B5 acceptance: `K8sFleet` satisfies the same
     /// backend-agnostic conformance suite `LocalFleet` does

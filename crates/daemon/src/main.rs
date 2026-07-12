@@ -309,9 +309,10 @@ async fn main() -> anyhow::Result<()> {
     // Phase 2 — select the serving backend over the shared store/bus. `local`
     // builds the full FleetManager (registry + ownership + poll loop); `k8s`
     // serves K8sFleet with NO manager, poll loop, config store, ownership, or
-    // heartbeat — those are local-only machinery, inert under k8s (#83). The
-    // `FleetAdmin` (workspace registry) is likewise `Some` only for local; its
-    // routes return 405 under k8s, where workspaces are `CalibanTask`-driven.
+    // heartbeat — those are local-only machinery, inert under k8s (#83). Both
+    // backends now wire a `FleetAdmin`: local's is the registry-backed manager;
+    // k8s's is a `K8sWorkspaceAdmin` over `Workspace` CRs (#142), so the config
+    // routes work under k8s instead of returning 405.
     // The match yields the serving fleet/admin plus the background handles this
     // backend owns (poll loop, heartbeat, manager for graceful shutdown) — all
     // `None` under k8s, which starts none of them (#83).
@@ -406,7 +407,15 @@ async fn main() -> anyhow::Result<()> {
             let client = build_kube_client(args.kubeconfig.as_deref()).await?;
             let ns =
                 std::env::var("PROSPERO_K8S_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-            let api = prospero_core::KubeTaskApi::new(client, &ns);
+            let api = prospero_core::KubeTaskApi::new(client.clone(), &ns);
+
+            // The k8s config plane (#142): a `FleetAdmin` over `Workspace` CRs so
+            // the dashboard can create/configure workspaces under k8s. Wiring this
+            // as `admin = Some(..)` is what removes the 405 those routes returned
+            // (and flips `GET /api/capabilities` `admin` to `true` on k8s).
+            let workspace_admin = Arc::new(prospero_core::K8sWorkspaceAdmin::new(Arc::new(
+                prospero_core::KubeWorkspaceApi::new(client, &ns),
+            )));
 
             // Session-plane security (ADR 0051): trust caliband's serving cert
             // via the mounted-Secret CA, and present the shared bearer token.
@@ -474,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
             );
             (
                 Arc::new(k8s) as Arc<dyn prospero_core::FleetProvider>,
-                None,
+                Some(workspace_admin as Arc<dyn prospero_core::FleetAdmin>),
                 None,
                 heartbeat_handle,
                 None,
