@@ -165,6 +165,10 @@ async fn capabilities_reports_admin_true_with_local_admin() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     assert_eq!(v["admin"], true, "local backend has an admin plane: {v}");
+    assert_eq!(
+        v["async_workspace_ops"], false,
+        "local config applies synchronously: {v}"
+    );
 }
 
 #[tokio::test]
@@ -216,6 +220,22 @@ async fn k8s_config_plane_creates_and_surfaces_workspace() {
         store,
         bus,
     );
+
+    // Capabilities advertise the async config plane, so the dashboard renders
+    // the k8s config UI + reconciling save semantics.
+    let caps = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cv = json_body(caps).await;
+    assert_eq!(cv["admin"], true);
+    assert_eq!(cv["async_workspace_ops"], true, "k8s config is async: {cv}");
 
     // Configuring a workspace on k8s is accepted asynchronously (202), not 405.
     let body = r#"{"name":"team-a-ws","config":{

@@ -114,6 +114,8 @@
                display: flex; align-items: flex-start; justify-content: center; z-index: 50; }
       .modal { margin-top: 80px; width: 340px; background: #13161c; border: 1px solid #3a4256;
                border-radius: 10px; padding: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.6); }
+      /* The k8s config editor's sources/provider rows need more room. */
+      .modal.wide { width: min(640px, 92vw); }
       .form-title { color: #8ab4f8; font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
                     margin-bottom: 10px; }
       .fl { display: block; font-size: 11px; color: #9aa0aa; margin-bottom: 8px; }
@@ -135,6 +137,20 @@
       .env-row button { font: 11px ui-monospace, monospace; border: 1px solid #3a2424; background: #1b1f27;
                         color: #ef9a9a; border-radius: 5px; cursor: pointer; padding: 0 8px; }
       .env-add { font: 11px ui-monospace, monospace; color: #8ab4f8; cursor: pointer; }
+      /* --- k8s config plane (#143) --- */
+      .repo > .ws-status { font-size: 11px; }
+      .ws-status.ready { color: #6bd968; }
+      .ws-status.reconciling, .ws-status.pending { color: #e0c56b; }
+      .ws-status.failed { color: #ef5350; cursor: help; }
+      .cfg-section-label { font-size: 10px; color: #9aa0aa; margin: 10px 0 4px;
+                           text-transform: uppercase; letter-spacing: .05em; }
+      .cfg-rows { display: flex; flex-direction: column; gap: 6px; }
+      .cfg-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      .cfg-row .in { margin-top: 0; flex: 1 1 90px; min-width: 80px; }
+      .cfg-row .rm { font: 11px ui-monospace, monospace; border: 1px solid #3a2424; background: #1b1f27;
+                     color: #ef9a9a; border-radius: 5px; cursor: pointer; padding: 2px 8px; }
+      .cfg-row .prov-def { display: flex; align-items: center; gap: 3px; font-size: 11px;
+                           margin-bottom: 0; white-space: nowrap; flex: 0 0 auto; }
       .agent-input { display: flex; gap: 6px; margin: 4px 0 8px; }
       .agent-input .in { margin-top: 0; flex: 1; }
       .agent-input button { font: 10px ui-monospace, monospace; padding: 2px 8px; border-radius: 5px;

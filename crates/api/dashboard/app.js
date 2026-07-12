@@ -19,6 +19,32 @@ let streamEvents = []; // accumulated events for the selected agent (folded into
 let reconnectTimer = null; // pending manual SSE reconnect (see openAgentStream)
 const expandedTools = new Set(); // tool span keys (event seq) the user expanded
 
+// Backend capabilities (GET /api/capabilities), fetched once before the first
+// render. `admin` gates registry controls; `async_workspace_ops` selects the
+// k8s config UI (named-provider list + Secret refs) over the local single-
+// provider env-var form, and the "reconciling" save semantics. Defaults are the
+// local shape, so a failed fetch degrades to today's behavior. (#143)
+let caps = { admin: true, async_workspace_ops: false };
+// True when the active backend is the k8s config plane.
+function isK8s() { return !!caps.async_workspace_ops; }
+
+async function loadCapabilities() {
+  try {
+    const c = await api("GET", "/api/capabilities");
+    if (c) caps = c;
+  } catch (_) {
+    // Keep the local-shaped defaults; the dashboard still functions.
+  }
+}
+
+// Apply capability gating to the static chrome (the per-workspace gear/remove
+// are gated inside renderFleet). Hide the add-workspace button when no admin
+// plane is wired.
+function applyCapabilities() {
+  const addBtn = document.getElementById("add-repo-btn");
+  if (addBtn) addBtn.classList.toggle("hidden", !caps.admin);
+}
+
 function findAgent(id) {
   if (!lastFleet) return null;
   for (const r of lastFleet.workspaces) {
@@ -84,10 +110,15 @@ function closeModal() {
 
 function openAddRepoModal() {
   const form = document.createElement("div");
+  // The local backend needs a checkout path; the k8s config plane derives
+  // sources from the config editor instead, so it omits the path field.
+  const pathField = isK8s()
+    ? ""
+    : `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/workspace"></label>`;
   form.innerHTML =
     `<div class="form-title">add workspace</div>` +
     `<label class="fl">name<input class="in" id="ar-name" placeholder="my-workspace"></label>` +
-    `<label class="fl">path<input class="in" id="ar-root" placeholder="/path/to/workspace"></label>`;
+    pathField;
   openModal(form);
   appendProviderFields(form, {});
   const err = document.createElement("div");
@@ -104,12 +135,16 @@ function openAddRepoModal() {
   const submit = form.querySelector("#ar-submit");
   submit.onclick = async () => {
     const name = form.querySelector("#ar-name").value.trim();
-    const root = form.querySelector("#ar-root").value.trim();
+    const rootEl = form.querySelector("#ar-root");
+    const root = rootEl ? rootEl.value.trim() : "";
     err.textContent = "";
-    if (!name || !root) { err.textContent = "name and path are required"; return; }
+    if (!name) { err.textContent = "name is required"; return; }
+    if (!isK8s() && !root) { err.textContent = "name and path are required"; return; }
     submit.disabled = true;
     try {
-      await api("POST", "/api/workspaces", { name, root, config: readProviderConfig(form) });
+      const body = { name, config: readProviderConfig(form) };
+      if (root) body.root = root;
+      await api("POST", "/api/workspaces", body);
       closeModal();
       refreshFleet();
     } catch (e) {
@@ -119,12 +154,27 @@ function openAddRepoModal() {
   };
 }
 
-// --- Provider-config form fields (shared by add-repo + repo-settings) --------
+// --- Provider/workspace config form (backend-aware) -------------------------
+//
+// Local backend: a single provider (provider/base_url/api_key_from_env) + env.
+// k8s config plane: a named-provider *list* + git *sources* + Secret-reference
+// credentials + env — mapped to the WorkspaceConfig the config plane accepts.
+// `appendProviderFields`/`readProviderConfig` dispatch on the active backend.
 
 const PROVIDERS = ["", "ollama", "anthropic", "openai", "google", "bedrock", "vertex"];
+const PROVIDER_KINDS = ["ollama", "anthropic", "openai", "google", "bedrock", "vertex"];
+
+function appendProviderFields(form, cfg) {
+  if (isK8s()) appendK8sWorkspaceFields(form, cfg);
+  else appendLocalProviderFields(form, cfg);
+}
+
+function readProviderConfig(form) {
+  return isK8s() ? readK8sWorkspaceConfig(form) : readLocalProviderConfig(form);
+}
 
 // Append provider/base_url/api-key/raw-env fields to `form`, prefilled from `cfg`.
-function appendProviderFields(form, cfg) {
+function appendLocalProviderFields(form, cfg) {
   cfg = cfg || {};
   const opts = PROVIDERS.map((p) =>
     `<option value="${p}"${p === (cfg.provider || "") ? " selected" : ""}>${p || "(default)"}</option>`
@@ -162,8 +212,7 @@ function appendProviderFields(form, cfg) {
   if (Object.keys(cfg.env || {}).length) adv.classList.remove("hidden");
 }
 
-// Read the provider config object back out of the fields appendProviderFields added.
-function readProviderConfig(form) {
+function readLocalProviderConfig(form) {
   const cfg = {};
   const provider = form.querySelector("#pc-provider").value.trim();
   const baseUrl = form.querySelector("#pc-baseurl").value.trim();
@@ -181,14 +230,167 @@ function readProviderConfig(form) {
   return cfg;
 }
 
+// k8s config-plane editor: display name + sources[] + named providers[] (with
+// Secret-reference credentials) + env. `cfg` prefills from a workspace summary
+// (display_name/sources/providers/default_provider). Note: Secret references
+// are never returned by the API, so on *edit* the secretName/key fields start
+// blank — re-enter them to keep a provider's credentials (leaving them blank
+// makes the provider keyless).
+function appendK8sWorkspaceFields(form, cfg) {
+  cfg = cfg || {};
+  // The sources/provider row editors need more width than the default modal.
+  const modalBox = form.closest(".modal");
+  if (modalBox) modalBox.classList.add("wide");
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    `<label class="fl">display name<input class="in" id="wc-display" placeholder="Team A"></label>` +
+    `<div class="cfg-section-label">sources</div><div id="wc-sources" class="cfg-rows"></div>` +
+    `<span class="env-add" id="wc-src-add">+ add source</span>` +
+    `<div class="cfg-section-label">providers</div><div id="wc-providers" class="cfg-rows"></div>` +
+    `<span class="env-add" id="wc-prov-add">+ add provider</span>` +
+    `<div class="adv-toggle" id="wc-adv-toggle">▸ advanced env</div>` +
+    `<div class="hidden" id="wc-adv"><div id="wc-env-rows"></div>` +
+      `<span class="env-add" id="wc-env-add">+ add env var</span></div>`;
+  form.appendChild(wrap);
+  form.querySelector("#wc-display").value = cfg.display_name || "";
+
+  const srcRows = form.querySelector("#wc-sources");
+  const addSrc = (s) => {
+    s = s || {};
+    const row = document.createElement("div");
+    row.className = "cfg-row src-row";
+    row.innerHTML =
+      `<input class="in src-name" placeholder="name">` +
+      `<input class="in src-repo" placeholder="git remote">` +
+      `<input class="in src-ref" placeholder="ref (main)">` +
+      `<input class="in src-path" placeholder="/work/name">` +
+      `<button type="button" class="rm">×</button>`;
+    row.querySelector(".src-name").value = s.name || "";
+    row.querySelector(".src-repo").value = s.repo || "";
+    row.querySelector(".src-ref").value = s.ref || "";
+    row.querySelector(".src-path").value = s.path || "";
+    row.querySelector(".rm").onclick = () => row.remove();
+    srcRows.appendChild(row);
+  };
+  ((cfg.sources && cfg.sources.length) ? cfg.sources : [{}]).forEach(addSrc);
+  form.querySelector("#wc-src-add").onclick = () => addSrc({});
+
+  const provRows = form.querySelector("#wc-providers");
+  const addProv = (p) => {
+    p = p || {};
+    const row = document.createElement("div");
+    row.className = "cfg-row prov-row";
+    const kindOpts = PROVIDER_KINDS.map((k) =>
+      `<option value="${k}"${k === (p.kind || "") ? " selected" : ""}>${k}</option>`).join("");
+    // On edit, a provider may have credentials that the API never returns; hint
+    // that leaving the Secret fields blank clears them.
+    const hasCreds = !!p.has_credentials;
+    const secretPh = hasCreds ? "secretName (set — re-enter to keep)" : "secretName (optional)";
+    row.innerHTML =
+      `<input class="in prov-name" placeholder="name (e.g. planner)">` +
+      `<select class="in prov-kind">${kindOpts}</select>` +
+      `<input class="in prov-url" placeholder="base URL (optional)">` +
+      `<input class="in prov-model" placeholder="model (optional)">` +
+      `<input class="in prov-secret" placeholder="${secretPh}">` +
+      `<input class="in prov-key" placeholder="key (optional)">` +
+      `<label class="chk prov-def"><input type="radio" name="wc-default"> default</label>` +
+      `<button type="button" class="rm">×</button>`;
+    row.querySelector(".prov-name").value = p.name || "";
+    row.querySelector(".prov-url").value = p.base_url || "";
+    row.querySelector(".prov-model").value = p.model || "";
+    if (p.credentials_ref) {
+      row.querySelector(".prov-secret").value = p.credentials_ref.secret_name || "";
+      row.querySelector(".prov-key").value = p.credentials_ref.key || "";
+    }
+    if (p.name && p.name === cfg.default_provider) {
+      row.querySelector(".prov-def input").checked = true;
+    }
+    row.querySelector(".rm").onclick = () => row.remove();
+    provRows.appendChild(row);
+  };
+  ((cfg.providers && cfg.providers.length) ? cfg.providers : [{}]).forEach(addProv);
+  form.querySelector("#wc-prov-add").onclick = () => addProv({});
+
+  const envRows = form.querySelector("#wc-env-rows");
+  const addEnv = (k, v) => {
+    const row = document.createElement("div");
+    row.className = "env-row";
+    row.innerHTML = `<input class="in pc-k" placeholder="KEY"><input class="in pc-v" placeholder="VALUE"><button type="button">×</button>`;
+    row.querySelector(".pc-k").value = k || "";
+    row.querySelector(".pc-v").value = v || "";
+    row.querySelector("button").onclick = () => row.remove();
+    envRows.appendChild(row);
+  };
+  for (const [k, v] of Object.entries(cfg.env || {})) addEnv(k, v);
+  const adv = form.querySelector("#wc-adv");
+  const advToggle = form.querySelector("#wc-adv-toggle");
+  advToggle.onclick = () => {
+    adv.classList.toggle("hidden");
+    advToggle.textContent = adv.classList.contains("hidden") ? "▸ advanced env" : "▾ advanced env";
+  };
+  form.querySelector("#wc-env-add").onclick = () => addEnv("", "");
+  if (Object.keys(cfg.env || {}).length) adv.classList.remove("hidden");
+}
+
+function readK8sWorkspaceConfig(form) {
+  const cfg = {};
+  const dn = form.querySelector("#wc-display").value.trim();
+  if (dn) cfg.display_name = dn;
+
+  const sources = [];
+  for (const row of form.querySelectorAll(".src-row")) {
+    const name = row.querySelector(".src-name").value.trim();
+    const repo = row.querySelector(".src-repo").value.trim();
+    const path = row.querySelector(".src-path").value.trim();
+    const ref = row.querySelector(".src-ref").value.trim();
+    if (!name && !repo && !path) continue;
+    const s = { name, repo, path };
+    if (ref) s.ref = ref;
+    sources.push(s);
+  }
+  if (sources.length) cfg.sources = sources;
+
+  const providers = [];
+  let defaultProvider = null;
+  for (const row of form.querySelectorAll(".prov-row")) {
+    const name = row.querySelector(".prov-name").value.trim();
+    if (!name) continue;
+    const p = { name, kind: row.querySelector(".prov-kind").value };
+    const url = row.querySelector(".prov-url").value.trim();
+    const model = row.querySelector(".prov-model").value.trim();
+    const secret = row.querySelector(".prov-secret").value.trim();
+    const key = row.querySelector(".prov-key").value.trim();
+    if (url) p.base_url = url;
+    if (model) p.model = model;
+    if (secret) p.credentials_ref = { secret_name: secret, key };
+    if (row.querySelector(".prov-def input").checked) defaultProvider = name;
+    providers.push(p);
+  }
+  if (providers.length) cfg.providers = providers;
+  if (defaultProvider) cfg.default_provider = defaultProvider;
+
+  const env = {};
+  for (const row of form.querySelectorAll(".env-row")) {
+    const k = row.querySelector(".pc-k").value.trim();
+    const v = row.querySelector(".pc-v").value.trim();
+    if (k) env[k] = v;
+  }
+  if (Object.keys(env).length) cfg.env = env;
+  return cfg;
+}
+
 // --- Repo-settings modal ----------------------------------------------------
 
 async function openRepoSettings(repo) {
+  // Prefill: local reads the flat provider `config`; k8s reads the workspace
+  // summary's top-level config (display_name/sources/providers/default_provider).
+  // On k8s, Secret references and env are not returned by the API — re-enter
+  // them to keep them (see the editor's hint).
   let cfg = {};
   try {
     const repos = await api("GET", "/api/workspaces");
     const found = (repos || []).find((r) => r.name === repo.name);
-    cfg = (found && found.config) || {};
+    cfg = isK8s() ? (found || {}) : ((found && found.config) || {});
   } catch (e) { showBanner(String(e.message || e)); return; }
 
   const runningCount = (repo.agents || []).filter((a) => isActive(a.status)).length;
@@ -206,7 +408,10 @@ async function openRepoSettings(repo) {
   form.querySelector("#rs-cancel").onclick = closeModal;
   const save = form.querySelector("#rs-save");
   save.onclick = async () => {
-    if (runningCount > 0 &&
+    // Local applies synchronously and restarts the workspace's caliband; k8s
+    // patches the Workspace CR and the operator re-reconciles (running agents
+    // keep their pinned config), so no restart warning there.
+    if (!isK8s() && runningCount > 0 &&
         !window.confirm(`Restart caliban for ${repo.name}? This stops ${runningCount} running agent(s).`)) {
       return;
     }
@@ -226,9 +431,14 @@ async function openRepoSettings(repo) {
 
 function openLaunchModal(repoName) {
   const form = document.createElement("div");
+  // k8s: an agent binds one of the workspace's named providers.
+  const providerField = isK8s()
+    ? `<label class="fl" id="la-provider-wrap">provider<select class="in" id="la-provider"></select></label>`
+    : "";
   form.innerHTML =
     `<div class="form-title">launch agent</div>` +
     `<label class="fl">workspace<select class="in" id="la-repo"></select></label>` +
+    providerField +
     `<label class="fl">task<textarea class="in" id="la-task" rows="3" placeholder="describe the task"></textarea></label>` +
     `<label class="chk"><input type="checkbox" id="la-wt" checked> worktree isolation</label>` +
     `<label class="chk"><input type="checkbox" id="la-interactive"> interactive (awaits your input)</label>` +
@@ -256,6 +466,32 @@ function openLaunchModal(repoName) {
     repoSel.appendChild(opt);
   }
 
+  // k8s: populate the provider picker from the selected workspace's providers,
+  // and keep it in sync when the workspace changes. Built via the DOM so
+  // provider names are never interpolated into markup.
+  const provSel = form.querySelector("#la-provider");
+  const fillProviders = (wsName) => {
+    if (!provSel) return;
+    provSel.innerHTML = "";
+    const ws = (lastFleet ? lastFleet.workspaces : []).find((w) => w.name === wsName);
+    const providers = (ws && ws.providers) || [];
+    const def = document.createElement("option");
+    def.value = "";
+    def.textContent = providers.length ? "(workspace default)" : "(default)";
+    provSel.appendChild(def);
+    for (const p of providers) {
+      const opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = p.model ? `${p.name} · ${p.kind} · ${p.model}` : `${p.name} · ${p.kind}`;
+      if (p.name === (ws && ws.default_provider)) opt.selected = true;
+      provSel.appendChild(opt);
+    }
+  };
+  if (provSel) {
+    fillProviders(repoSel.value);
+    repoSel.addEventListener("change", () => fillProviders(repoSel.value));
+  }
+
   const adv = form.querySelector("#la-adv");
   const advToggle = form.querySelector("#la-adv-toggle");
   advToggle.onclick = () => {
@@ -275,6 +511,7 @@ function openLaunchModal(repoName) {
     const body = { prompt };
     if (!form.querySelector("#la-wt").checked) body.isolation = "shared";
     if (form.querySelector("#la-interactive").checked) body.interactive = true;
+    if (provSel && provSel.value) body.provider_ref = provSel.value;
     const label = form.querySelector("#la-label").value.trim();
     const model = form.querySelector("#la-model").value.trim();
     const tools = form.querySelector("#la-tools").value.trim();
@@ -359,10 +596,16 @@ function agentMeta(agent) {
   return ` · ${agent.status} ${e} ago`;
 }
 
+// A workspace can accept new agents when it's reconciled Ready (k8s) or its
+// caliband is reachable (local).
+function workspaceLaunchable(r) {
+  return r.status ? r.status.phase === "Ready" : r.health.state === "healthy";
+}
+
 function renderFleet(fleet) {
   lastFleet = fleet;
   healthyWorkspaces = fleet.workspaces
-    .filter((r) => r.health.state === "healthy")
+    .filter(workspaceLaunchable)
     .map((r) => r.name);
   const agentTotal = fleet.workspaces.reduce((n, r) => n + r.agents.length, 0);
   const rc = fleet.workspaces.length;
@@ -398,21 +641,37 @@ function renderFleet(fleet) {
     head.appendChild(name);
     const acts = document.createElement("div");
     acts.className = "repo-head-actions";
-    const gear = document.createElement("button");
-    gear.className = "gear";
-    gear.textContent = "⚙";
-    gear.onclick = () => openRepoSettings(repo);
-    acts.appendChild(gear);
-    acts.appendChild(actionBtn("remove", "danger", (b) =>
-      rowAction("DELETE", `/api/workspaces/${encodeURIComponent(repo.name)}`,
-                `Remove workspace ${repo.name}?`, b)));
+    // Registry controls (configure, remove) only when the backend has an admin
+    // plane wired.
+    if (caps.admin) {
+      const gear = document.createElement("button");
+      gear.className = "gear";
+      gear.textContent = "⚙";
+      gear.onclick = () => openRepoSettings(repo);
+      acts.appendChild(gear);
+      acts.appendChild(actionBtn("remove", "danger", (b) =>
+        rowAction("DELETE", `/api/workspaces/${encodeURIComponent(repo.name)}`,
+                  `Remove workspace ${repo.name}?`, b)));
+    }
     head.appendChild(acts);
     box.appendChild(head);
 
-    const health = document.createElement("div");
-    health.className = `health ${healthy ? "healthy" : "unreachable"}`;
-    health.textContent = healthTxt;
-    box.appendChild(health);
+    // k8s workspaces carry a reconciliation status (pending/reconciling/ready/
+    // failed) — shown as a pill with the failure message on hover. Local
+    // workspaces show caliband reachability instead.
+    if (repo.status) {
+      const phase = (repo.status.phase || "").toLowerCase();
+      const pill = document.createElement("div");
+      pill.className = `ws-status ${phase}`;
+      pill.textContent = phase;
+      if (repo.status.message) pill.title = repo.status.message;
+      box.appendChild(pill);
+    } else {
+      const health = document.createElement("div");
+      health.className = `health ${healthy ? "healthy" : "unreachable"}`;
+      health.textContent = healthTxt;
+      box.appendChild(health);
+    }
 
     const sourceNames = (repo.sources || []).map((s) => s.name);
     if (sourceNames.length) {
@@ -422,7 +681,17 @@ function renderFleet(fleet) {
       box.appendChild(src);
     }
 
-    if (healthy) {
+    // k8s: the workspace's named providers, marking the default with *.
+    const providerNames = (repo.providers || [])
+      .map((p) => p.name + (p.name === repo.default_provider ? "*" : ""));
+    if (providerNames.length) {
+      const prov = document.createElement("div");
+      prov.className = "sources";
+      prov.textContent = `providers: ${providerNames.join(", ")}`;
+      box.appendChild(prov);
+    }
+
+    if (workspaceLaunchable(repo)) {
       const launch = document.createElement("button");
       launch.className = "ctl-btn launch";
       launch.textContent = "＋ launch agent";
@@ -760,5 +1029,11 @@ function escapeHtml(s) {
 
 document.getElementById("add-repo-btn").onclick = openAddRepoModal;
 openEmptyStream();
-refreshFleet();
+// Fetch backend capabilities once, gate the chrome, then render. On k8s this
+// switches the config UI to the named-provider/Secret-reference form and the
+// reconciliation-status pills. (#143)
+loadCapabilities().then(() => {
+  applyCapabilities();
+  refreshFleet();
+});
 setInterval(refreshFleet, 3000);
