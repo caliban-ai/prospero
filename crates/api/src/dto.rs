@@ -4,6 +4,18 @@ use prospero_core::fleet::SpawnRequest;
 use prospero_core::registry::RepoProviderConfig;
 use serde::{Deserialize, Serialize};
 
+/// Backend capability signal for the dashboard (`GET /api/capabilities`). Fixed
+/// for the process lifetime — the dashboard fetches it once and gates its
+/// admin/registry controls on it, so it never offers operations the active
+/// backend can't serve. (#99)
+#[derive(Debug, Serialize)]
+pub struct Capabilities {
+    /// Whether the workspace admin/registry plane (add / remove / set-config) is
+    /// available. `true` for the local backend; `false` under k8s, where
+    /// workspaces are `CalibanTask`/namespace-driven.
+    pub admin: bool,
+}
+
 /// Body for `POST /api/workspaces`.
 #[derive(Debug, Deserialize)]
 pub struct AddWorkspaceBody {

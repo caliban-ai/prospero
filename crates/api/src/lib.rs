@@ -57,6 +57,7 @@ pub fn router(
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/api/metrics", get(handlers::get_metrics))
+        .route("/api/capabilities", get(handlers::get_capabilities))
         // Fleet + workspaces.
         .route("/api/fleet", get(handlers::get_fleet))
         .route(
