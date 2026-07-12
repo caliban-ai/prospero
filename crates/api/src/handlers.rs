@@ -236,6 +236,15 @@ pub async fn get_metrics(State(st): State<AppState>) -> Json<prospero_core::Metr
     Json(st.fleet.metrics())
 }
 
+/// `GET /api/capabilities` — what the active fleet backend supports, so the
+/// dashboard can render backend-aware controls (#99). `admin` mirrors whether an
+/// admin/registry plane is wired (`Some` for local, `None` for k8s).
+pub async fn get_capabilities(State(st): State<AppState>) -> Json<crate::dto::Capabilities> {
+    Json(crate::dto::Capabilities {
+        admin: st.admin.is_some(),
+    })
+}
+
 /// `GET /healthz` — daemon liveness (always 200 while the process is up).
 pub async fn healthz() -> &'static str {
     "ok"

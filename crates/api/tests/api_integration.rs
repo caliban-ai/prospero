@@ -148,6 +148,53 @@ async fn get_metrics_returns_operational_counters() {
 }
 
 #[tokio::test]
+async fn capabilities_reports_admin_true_with_local_admin() {
+    // The `setup()` harness builds the router with a `Some(admin)` (LocalFleet).
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["admin"], true, "local backend has an admin plane: {v}");
+}
+
+#[tokio::test]
+async fn capabilities_reports_admin_false_without_admin() {
+    // A router built with `admin: None`, mirroring the k8s composition (#76).
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let config = FleetConfig::new("test-host", data_dir.path());
+    let manager = FleetManager::new(config, store).await.unwrap();
+    let app = router(
+        Arc::new(LocalFleet::new(manager.clone())),
+        None,
+        manager.store(),
+        manager.bus(),
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["admin"], false, "no admin plane ⇒ admin=false: {v}");
+}
+
+#[tokio::test]
 async fn readyz_returns_200_when_store_writable() {
     let h = setup().await;
     let resp = h
