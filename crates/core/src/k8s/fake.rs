@@ -193,10 +193,10 @@ impl WorkspaceApi for FakeWorkspaceApi {
         // clobbered by a spec patch).
         let mut store = self.store.lock().unwrap();
         let mut next = ws.clone();
-        if next.status.is_none() {
-            if let Some(existing) = store.get(&name) {
-                next.status = existing.status.clone();
-            }
+        if next.status.is_none()
+            && let Some(existing) = store.get(&name)
+        {
+            next.status = existing.status.clone();
         }
         store.insert(name, next);
         Ok(())

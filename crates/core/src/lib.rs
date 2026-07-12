@@ -42,6 +42,8 @@ pub use fleet::{FleetConfig, FleetManager, SpawnRequest};
 pub use fleet_provider::{FleetAdmin, FleetProvider, LocalFleet};
 #[cfg(feature = "k8s")]
 pub use k8s::fleet::{CalibanTaskApi, K8sFleet, KubeTaskApi};
+#[cfg(feature = "k8s")]
+pub use k8s::workspace_api::{K8sWorkspaceAdmin, KubeWorkspaceApi, WorkspaceApi};
 pub use leased_ownership::LeasedOwnership;
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Workspace, WorkspaceHealth};

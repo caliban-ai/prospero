@@ -83,7 +83,34 @@ Today `K8sFleet` does **not** implement `FleetAdmin`, so `AppState.admin` is `No
 
 The daemon wires `AppState.admin = Some(k8s_admin)` under the k8s backend arm. Run the new impl through the existing **admin-seam conformance suite** (the one `LocalFleet` already passes), extended to construct a k8s admin over `FakeWorkspaceApi`.
 
-**Config DTO ↔ CR mapping:** the existing `RepoProviderConfig`/workspace-config DTO carries a *single* env-var-style provider today. The frozen `Workspace` has a *named provider list* + `credentialsRef`. Phase C maps what the current DTO can express and **carries the provider list through additively** (the dashboard's provider-list editor is Phase D). The precise DTO shape is settled in the plan against the current `RepoProviderConfig` definition; the invariant is: a round-trip `add_workspace` → `list` returns the providers and reconciliation status.
+**Config DTO ↔ CR mapping — DECISION (2026-07-12): Option B, k8s-native config DTO.**
+The existing `RepoProviderConfig` (single provider, `api_key_from_env`, local FS root)
+cannot express a k8s `Workspace` (sources[], named providers[], `credentialsRef`
+Secret refs) — and prospero has no `secrets` RBAC, so `api_key_from_env` has no
+faithful CR mapping. So we introduce a **backend-neutral `WorkspaceConfig`** in
+`prospero-types` (the wasm-shared DTO leaf, ADR 0006) and generalize the
+`FleetAdmin` trait to take it:
+
+```rust
+// prospero-types (snake_case, matching existing API convention)
+pub struct WorkspaceConfig {
+    pub display_name: Option<String>,
+    pub sources: Vec<WorkspaceSourceSpec>,     // {name, repo, ref?, path}
+    pub providers: Vec<ProviderSpec>,          // {name, kind, base_url?, model?, credentials_ref?}
+    pub default_provider: Option<String>,
+    pub isolation: Option<IsolationConfig>,
+    #[serde(flatten)] pub local: RepoProviderConfig,  // provider/base_url/api_key_from_env/env
+}
+```
+
+Each backend **projects out the subset it uses**: `LocalFleet` reads `config.local`
+(its internal `RepoProviderConfig` path is unchanged — legacy snake-case bodies
+deserialize into `local` via `#[serde(flatten)]`, so the current local dashboard
+keeps working); `K8sFleet` maps the rich fields 1:1 onto the `Workspace` CR
+(snake→camelCase). The API config endpoints accept `WorkspaceConfig`;
+backward-compatible for local, fully expressive for k8s. Phase D's dashboard is
+then pure UI over this shape. Invariant: a round-trip `set_workspace_config` →
+`list` returns the sources/providers/default + reconciliation status.
 
 ### 5. `GET /api/workspaces` returns real `Workspace` CRs — `crates/api/src/handlers.rs`
 
