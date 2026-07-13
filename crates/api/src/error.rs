@@ -58,6 +58,7 @@ impl IntoResponse for ApiError {
                     CoreError::ProviderMisconfigured(_) => {
                         (StatusCode::BAD_REQUEST, "provider_misconfigured")
                     }
+                    CoreError::InvalidConfig(_) => (StatusCode::BAD_REQUEST, "invalid_config"),
                     CoreError::CalibandUnreachable { .. }
                     | CoreError::Discovery(_)
                     | CoreError::Fleet(_) => (StatusCode::SERVICE_UNAVAILABLE, "unreachable"),

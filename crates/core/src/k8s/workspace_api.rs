@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::fleet_provider::FleetAdmin;
 use crate::k8s::crd::{
     CredentialsRef, EnvEntry, IsolationSpec, Provider, Source, Workspace, WorkspaceSpec,
@@ -102,6 +102,47 @@ impl WorkspaceApi for KubeWorkspaceApi {
     }
 }
 
+/// Validate that a k8s `WorkspaceConfig` will produce a `Workspace` CR the
+/// apiserver accepts (#150).
+///
+/// The Workspace CRD requires `spec.required: [displayName, providers, sources]`
+/// with `minItems: 1` on both lists, and each source needs a name/repo/path and
+/// each provider a name/kind. The dashboard's add-workspace form previously
+/// POSTed an empty config, so the apiserver rejected the apply with a `422`;
+/// checking here turns that into a clear `400 Bad Request` *before* apply — and
+/// stops the config-edit path from stripping a workspace down to an invalid CR.
+/// (`displayName` is defaulted from the workspace name in `workspace_from_config`,
+/// so it is always satisfied and needs no separate check.)
+fn validate_k8s_config(config: &WorkspaceConfig) -> Result<()> {
+    if config.sources.is_empty() {
+        return Err(CoreError::InvalidConfig(
+            "workspace requires at least one source".to_string(),
+        ));
+    }
+    for s in &config.sources {
+        if s.name.trim().is_empty() || s.repo.trim().is_empty() || s.path.trim().is_empty() {
+            return Err(CoreError::InvalidConfig(format!(
+                "source {:?} needs a name, repo, and path",
+                s.name
+            )));
+        }
+    }
+    if config.providers.is_empty() {
+        return Err(CoreError::InvalidConfig(
+            "workspace requires at least one provider".to_string(),
+        ));
+    }
+    for p in &config.providers {
+        if p.name.trim().is_empty() || p.kind.trim().is_empty() {
+            return Err(CoreError::InvalidConfig(format!(
+                "provider {:?} needs a name and kind",
+                p.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build a `Workspace` custom resource from the backend-neutral
 /// [`WorkspaceConfig`] (snake_case) — mapping the rich fields onto the CR's
 /// camelCase spec. `env` comes from the flattened `RepoProviderConfig.env`
@@ -187,7 +228,10 @@ impl<W: WorkspaceApi> FleetAdmin for K8sWorkspaceAdmin<W> {
         config: WorkspaceConfig,
     ) -> Result<()> {
         // k8s ignores `root` (a LocalFleet checkout path); sources come from
-        // `config`. Server-side-apply is create-or-update.
+        // `config`. Reject a config that would apply an invalid CR (empty
+        // providers/sources → apiserver 422) as a clean 400 first (#150).
+        validate_k8s_config(&config)?;
+        // Server-side-apply is create-or-update.
         self.api.apply(&workspace_from_config(&name, &config)).await
     }
 
@@ -198,6 +242,9 @@ impl<W: WorkspaceApi> FleetAdmin for K8sWorkspaceAdmin<W> {
     async fn set_workspace_config(&self, name: &str, config: WorkspaceConfig) -> Result<()> {
         // Patch the CR's spec; the operator re-reconciles. A spec apply doesn't
         // touch the status subresource, so reconciliation state is preserved.
+        // Guard the edit path too: it must not strip a workspace down to an
+        // invalid (no providers/sources) CR (#150).
+        validate_k8s_config(&config)?;
         self.api.apply(&workspace_from_config(name, &config)).await
     }
 
@@ -294,6 +341,76 @@ mod tests {
             .env
             .insert("LOG".to_string(), "debug".to_string());
         config
+    }
+
+    #[tokio::test]
+    async fn add_workspace_rejects_empty_config_as_invalid_not_422() {
+        // #150: the dashboard's add-workspace form previously POSTed a config
+        // with no sources/providers, so the apiserver rejected the applied CR
+        // with a 422 (Workspace CRD requires minItems:1 on both). Catch it as a
+        // clean InvalidConfig (→ 400) *before* apply, and apply nothing.
+        let api = Arc::new(FakeWorkspaceApi::new());
+        let admin = K8sWorkspaceAdmin::new(Arc::clone(&api));
+
+        let err = admin
+            .add_workspace("ws".into(), "/ignored".into(), WorkspaceConfig::default())
+            .await
+            .expect_err("empty config must be rejected before apply");
+        assert!(matches!(err, crate::error::CoreError::InvalidConfig(_)));
+        assert!(
+            api.list().await.unwrap().is_empty(),
+            "nothing applied when the config is invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_workspace_rejects_sources_without_providers() {
+        // Sources present but no provider is still invalid (providers minItems:1).
+        let api = Arc::new(FakeWorkspaceApi::new());
+        let admin = K8sWorkspaceAdmin::new(Arc::clone(&api));
+        let config = WorkspaceConfig {
+            sources: vec![WorkspaceSourceSpec {
+                name: "caliban".into(),
+                repo: "git@example:caliban".into(),
+                r#ref: None,
+                path: "/work/caliban".into(),
+            }],
+            ..Default::default()
+        };
+        let err = admin
+            .add_workspace("ws".into(), "/ignored".into(), config)
+            .await
+            .expect_err("a workspace with no provider must be rejected");
+        assert!(matches!(err, crate::error::CoreError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn add_workspace_accepts_valid_config() {
+        // A fully-specified config (>=1 source, >=1 provider) applies cleanly.
+        let api = Arc::new(FakeWorkspaceApi::new());
+        let admin = K8sWorkspaceAdmin::new(Arc::clone(&api));
+        admin
+            .add_workspace("team-a-ws".into(), "/ignored".into(), rich_config())
+            .await
+            .expect("valid config must apply");
+        assert_eq!(api.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_workspace_config_rejects_stripping_to_empty() {
+        // The edit path builds the same CR, so it must not be allowed to strip a
+        // workspace down to an invalid (no providers/sources) CR either (#150).
+        let api = Arc::new(FakeWorkspaceApi::new());
+        let admin = K8sWorkspaceAdmin::new(Arc::clone(&api));
+        admin
+            .add_workspace("team-a-ws".into(), "/ignored".into(), rich_config())
+            .await
+            .unwrap();
+        let err = admin
+            .set_workspace_config("team-a-ws", WorkspaceConfig::default())
+            .await
+            .expect_err("stripping to an empty config must be rejected");
+        assert!(matches!(err, crate::error::CoreError::InvalidConfig(_)));
     }
 
     #[test]

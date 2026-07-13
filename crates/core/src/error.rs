@@ -69,6 +69,13 @@ pub enum CoreError {
     #[error("provider misconfigured: {0}")]
     ProviderMisconfigured(String),
 
+    /// A request carried structurally invalid configuration that could never be
+    /// accepted downstream — e.g. a k8s workspace with no providers/sources,
+    /// which the apiserver would reject with a `422` (#150). Caught at the API
+    /// boundary so it surfaces as a clear `400 Bad Request` instead.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
     /// A `FleetProvider` backend's own control-plane operation failed (e.g.
     /// `K8sFleet`'s `kube` CRUD/apply against `CalibanTask`, or its
     /// wait-for-`Running` deadline).

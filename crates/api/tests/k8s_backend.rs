@@ -171,3 +171,13 @@ async fn fleet_and_workspaces_agree_on_registered_workspace_set() {
         "/api/fleet and /api/workspaces must agree on the workspace set"
     );
 }
+
+#[tokio::test]
+async fn add_workspace_with_empty_config_is_400_not_422() {
+    // #150: an add-workspace request with no providers/sources would apply an
+    // invalid `Workspace` CR (apiserver 422). With the config plane wired, the
+    // admin rejects it up front as a clean 400 (InvalidConfig) instead.
+    let app = k8s_router_with_registry("seed").await;
+    let status = status_of(app, "POST", "/api/workspaces", r#"{"name":"empty"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
