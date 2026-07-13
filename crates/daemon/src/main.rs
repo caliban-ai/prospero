@@ -413,9 +413,14 @@ async fn main() -> anyhow::Result<()> {
             // the dashboard can create/configure workspaces under k8s. Wiring this
             // as `admin = Some(..)` is what removes the 405 those routes returned
             // (and flips `GET /api/capabilities` `admin` to `true` on k8s).
-            let workspace_admin = Arc::new(prospero_core::K8sWorkspaceAdmin::new(Arc::new(
-                prospero_core::KubeWorkspaceApi::new(client, &ns),
-            )));
+            //
+            // The same `Workspace` registry is shared with `K8sFleet` below
+            // (#149/#151) so the fleet snapshot (`GET /api/fleet`) surfaces the
+            // registered `Workspace` CRs instead of a synthetic 'k8s' entry —
+            // keeping `/api/fleet` and `/api/workspaces` in agreement.
+            let workspace_api = Arc::new(prospero_core::KubeWorkspaceApi::new(client, &ns));
+            let workspace_admin =
+                Arc::new(prospero_core::K8sWorkspaceAdmin::new(workspace_api.clone()));
 
             // Session-plane security (ADR 0051): trust caliband's serving cert
             // via the mounted-Secret CA, and present the shared bearer token.
@@ -475,7 +480,8 @@ async fn main() -> anyhow::Result<()> {
             // session plane (#108).
             let k8s = prospero_core::K8sFleet::new(api, bus.clone(), store.clone())
                 .with_network(tls.clone(), token.clone())
-                .with_ownership(ownership);
+                .with_ownership(ownership)
+                .with_workspaces(workspace_api);
             tracing::info!(
                 target: "prosperod", backend = "k8s", namespace = %ns,
                 session_tls = tls.is_some(), session_token = token.is_some(),

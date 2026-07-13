@@ -83,3 +83,91 @@ async fn workspace_registry_routes_return_405_under_k8s() {
         StatusCode::METHOD_NOT_ALLOWED
     );
 }
+
+/// A k8s router with the config plane wired (`FleetAdmin` over a `Workspace`
+/// registry), sharing that same registry with `K8sFleet` — mirroring the real
+/// daemon wiring. Seeds one registered `Workspace` CR named `ws_name`.
+async fn k8s_router_with_registry(ws_name: &str) -> Router {
+    use prospero_core::k8s::crd::{Provider, Workspace, WorkspaceSpec};
+    use prospero_core::k8s::fake::FakeWorkspaceApi;
+    use prospero_core::{FleetAdmin, K8sWorkspaceAdmin, WorkspaceApi};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(JsonlStore::open(dir.path()).unwrap());
+    std::mem::forget(dir);
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(64));
+
+    let ws_api = Arc::new(FakeWorkspaceApi::new());
+    ws_api
+        .apply(&Workspace::new(
+            ws_name,
+            WorkspaceSpec {
+                display_name: format!("{ws_name} display"),
+                sources: Vec::new(),
+                providers: vec![Provider {
+                    name: "ollama".into(),
+                    kind: "ollama".into(),
+                    base_url: None,
+                    model: None,
+                    credentials_ref: None,
+                }],
+                default_provider: None,
+                env: Vec::new(),
+                isolation: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let fleet: Arc<dyn FleetProvider> = Arc::new(
+        K8sFleet::new(FakeK8s::new(), bus.clone(), store.clone()).with_workspaces(ws_api.clone()),
+    );
+    let admin: Arc<dyn FleetAdmin> = Arc::new(K8sWorkspaceAdmin::new(ws_api));
+    router(fleet, Some(admin), store, bus)
+}
+
+async fn json_of(app: Router, uri: &str) -> serde_json::Value {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn fleet_and_workspaces_agree_on_registered_workspace_set() {
+    // #149/#151: with the registry wired, `GET /api/fleet` surfaces the
+    // registered `Workspace` CR (no synthetic 'k8s' phantom), and it agrees with
+    // `GET /api/workspaces` on the workspace set.
+    let fleet = json_of(k8s_router_with_registry("team-a").await, "/api/fleet").await;
+    let workspaces = json_of(k8s_router_with_registry("team-a").await, "/api/workspaces").await;
+
+    let fleet_names: Vec<&str> = fleet["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap())
+        .collect();
+    let ws_names: Vec<&str> = workspaces
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        fleet_names,
+        ["team-a"],
+        "GET /api/fleet surfaces the registered workspace, not synthetic 'k8s'"
+    );
+    assert!(
+        !fleet_names.contains(&"k8s"),
+        "no synthetic 'k8s' phantom in /api/fleet"
+    );
+    assert_eq!(
+        fleet_names, ws_names,
+        "/api/fleet and /api/workspaces must agree on the workspace set"
+    );
+}
