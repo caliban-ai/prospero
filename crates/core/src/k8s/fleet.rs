@@ -33,6 +33,7 @@ use crate::error::{CoreError, Result};
 use crate::fleet::{AttachBackoff, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
 use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, TaskSpec as CrdTaskSpec, WorkspaceRef};
+use crate::k8s::workspace_api::WorkspaceApi;
 use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::store::Store;
@@ -232,6 +233,37 @@ pub fn agent_from_task(task: &CalibanTask) -> Agent {
     }
 }
 
+/// Project a registered `Workspace` CR plus the agents that reference it into
+/// the fleet's `model::Workspace` view (#149/#151).
+///
+/// `health` is reported `Healthy` here: under k8s the *reconciliation* status
+/// (`status.phase`/`message`, surfaced separately via `GET /api/workspaces`) is
+/// the real signal, not the poll-based control-socket health this field models
+/// for the local backend — so the read-side handler reports `Healthy` for k8s
+/// workspaces too, and this mirrors it. `root`/`config` don't apply to a k8s
+/// workspace (its config lives in the CR spec, read via the registry), so they
+/// stay empty/default.
+fn workspace_view(ws: &crate::k8s::crd::Workspace, agents: Vec<Agent>) -> crate::model::Workspace {
+    let name = ws.metadata.name.clone().unwrap_or_default();
+    let sources = ws
+        .spec
+        .sources
+        .iter()
+        .map(|s| crate::Source {
+            name: s.name.clone(),
+            path: std::path::PathBuf::from(&s.path),
+        })
+        .collect();
+    crate::model::Workspace {
+        name,
+        root: std::path::PathBuf::new(),
+        sources,
+        health: crate::model::WorkspaceHealth::Healthy,
+        config: crate::registry::RepoProviderConfig::default(),
+        agents,
+    }
+}
+
 /// The kube I/O seam: CRUD over `CalibanTask` custom resources. Abstracted so
 /// `K8sFleet`'s control logic can be exercised against an in-memory fake
 /// (`MemTaskApi`, below, and its generalization in Task B5's `FakeK8s`)
@@ -427,6 +459,13 @@ pub struct K8sFleet<A: CalibanTaskApi> {
     /// The shared poll-diff loop's task, aborted on drop so a dropped fleet
     /// (e.g. between tests) doesn't leak a forever-polling task.
     poll_task: tokio::task::JoinHandle<()>,
+    /// The k8s Workspace registry (#142), wired via [`Self::with_workspaces`].
+    /// When present, [`FleetProvider::snapshot`] surfaces the registered
+    /// `Workspace` CRs as the fleet's workspaces (#149/#151) instead of a single
+    /// synthetic 'k8s' entry. `None` for local/test wiring, which keeps the
+    /// synthetic fallback. Read-only in `snapshot`, so it never touches the poll
+    /// loop.
+    workspaces: Option<Arc<dyn WorkspaceApi>>,
 }
 
 impl<A: CalibanTaskApi> Drop for K8sFleet<A> {
@@ -804,6 +843,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
             known,
             changes,
             poll_task,
+            workspaces: None,
         }
     }
 
@@ -853,6 +893,17 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     pub fn with_ownership(mut self, ownership: Arc<dyn Ownership>) -> Self {
         self.session.ownership = ownership;
         self.respawn_watch_loop();
+        self
+    }
+
+    /// Wire the k8s Workspace registry (#142) so [`FleetProvider::snapshot`]
+    /// surfaces the registered `Workspace` CRs as the fleet's workspaces
+    /// (#149/#151) instead of a single synthetic 'k8s' entry. Unset (local/test)
+    /// keeps the synthetic fallback. `snapshot` reads the registry directly, so
+    /// this — unlike the session-plane builders — doesn't respawn the poll loop.
+    #[must_use]
+    pub fn with_workspaces(mut self, workspaces: Arc<dyn WorkspaceApi>) -> Self {
+        self.workspaces = Some(workspaces);
         self
     }
 }
@@ -1077,10 +1128,46 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 
     async fn snapshot(&self) -> crate::model::FleetSnapshot {
         // List the live CalibanTasks and project each into a prospero `Agent`.
-        // k8s has no prospero registry, so all agents group under one synthetic
-        // workspace named for the backend (namespace scoping is the api's).
+        // Each agent already carries its workspace (`agent.workspace` ==
+        // `spec.workspaceRef.name`), so grouping below is purely a regroup.
         let tasks = self.api.list().await.unwrap_or_default();
         let agents: Vec<crate::model::Agent> = tasks.iter().map(agent_from_task).collect();
+
+        // When the Workspace registry is wired (k8s config plane, #142), the
+        // fleet's workspaces ARE the registered `Workspace` CRs (#149/#151):
+        // surface each, grouping agents under the workspace they reference. This
+        // replaces the old single synthetic 'k8s' workspace, which collided with
+        // the registry ('workspace not registered: k8s', #149) and hid
+        // registered workspaces from `/api/fleet` (#151). It also keeps
+        // `/api/fleet` and `/api/workspaces` agreeing on the workspace set —
+        // both now derive from the same registry list.
+        if let Some(ws_api) = &self.workspaces
+            && let Ok(registered) = ws_api.list().await
+        {
+            let mut by_workspace: HashMap<String, Vec<crate::model::Agent>> = HashMap::new();
+            for agent in agents {
+                by_workspace
+                    .entry(agent.workspace.clone())
+                    .or_default()
+                    .push(agent);
+            }
+            let workspaces = registered
+                .iter()
+                .map(|ws| {
+                    let name = ws.metadata.name.clone().unwrap_or_default();
+                    let agents = by_workspace.remove(&name).unwrap_or_default();
+                    workspace_view(ws, agents)
+                })
+                .collect();
+            return crate::model::FleetSnapshot {
+                host: "k8s".into(),
+                workspaces,
+            };
+        }
+
+        // Fallback (no registry wired — local/test paths, or a registry that
+        // failed to list): one synthetic workspace named for the backend holds
+        // every agent, as before.
         let ws = crate::model::Workspace {
             name: "k8s".into(),
             root: std::path::PathBuf::new(),
@@ -1745,6 +1832,95 @@ mod tests {
         let agents: Vec<_> = snap.workspaces.iter().flat_map(|w| &w.agents).collect();
         assert_eq!(agents.len(), 2, "both CRs projected as agents");
         assert_eq!(snap.workspaces[0].name, "k8s");
+    }
+
+    /// Build a `Workspace` CR for the registry fake.
+    #[cfg(feature = "k8s")]
+    fn workspace_cr(name: &str) -> crate::k8s::crd::Workspace {
+        use crate::k8s::crd::{Provider, Source as CrdSource, Workspace, WorkspaceSpec};
+        Workspace::new(
+            name,
+            WorkspaceSpec {
+                display_name: format!("{name} display"),
+                sources: vec![CrdSource {
+                    name: "caliban".into(),
+                    repo: "git@example:caliban".into(),
+                    r#ref: "main".into(),
+                    path: "/work/caliban".into(),
+                }],
+                providers: vec![Provider {
+                    name: "ollama".into(),
+                    kind: "ollama".into(),
+                    base_url: None,
+                    model: None,
+                    credentials_ref: None,
+                }],
+                default_provider: None,
+                env: Vec::new(),
+                isolation: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn k8s_snapshot_surfaces_registered_workspaces_not_synthetic() {
+        // #149/#151: with a Workspace registry wired, the fleet snapshot must
+        // surface the registered `Workspace` CRs (agents grouped by the
+        // workspace they reference) — NOT a single synthetic 'k8s' workspace,
+        // which collides with the registry ('workspace not registered: k8s')
+        // and hides registered workspaces from `/api/fleet`.
+        use crate::k8s::fake::FakeWorkspaceApi;
+
+        let api = MemTaskApi::new();
+        // Two tasks referencing the registered workspace "team-ws".
+        api.apply(&build_calibantask(&spec("team-ws", "p", None), "a1"))
+            .await
+            .unwrap();
+        api.apply(&build_calibantask(&spec("team-ws", "p", Some("l")), "a2"))
+            .await
+            .unwrap();
+
+        let ws_api = Arc::new(FakeWorkspaceApi::new());
+        ws_api.apply(&workspace_cr("team-ws")).await.unwrap();
+
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store).with_workspaces(ws_api);
+
+        let snap = fleet.snapshot().await;
+        let names: Vec<&str> = snap.workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["team-ws"],
+            "surfaces the registered workspace, not synthetic 'k8s'"
+        );
+        assert!(
+            !names.contains(&"k8s"),
+            "no synthetic 'k8s' phantom when the registry is wired"
+        );
+        // Its agents are grouped under it, and its sources come from the CR.
+        assert_eq!(snap.workspaces[0].agents.len(), 2, "both agents grouped");
+        assert_eq!(snap.workspaces[0].sources.len(), 1);
+        assert_eq!(snap.workspaces[0].sources[0].name, "caliban");
+    }
+
+    #[tokio::test]
+    async fn k8s_snapshot_empty_registry_has_no_synthetic_workspace() {
+        // #149: a fresh deploy with zero Workspace CRs must NOT surface a
+        // synthetic 'k8s' workspace (which then errors 'workspace not
+        // registered: k8s'); it shows an empty workspace set until one is
+        // registered.
+        use crate::k8s::fake::FakeWorkspaceApi;
+
+        let api = MemTaskApi::new();
+        let ws_api = Arc::new(FakeWorkspaceApi::new());
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store).with_workspaces(ws_api);
+
+        let snap = fleet.snapshot().await;
+        assert!(
+            snap.workspaces.is_empty(),
+            "no phantom 'k8s' workspace when the registry is empty"
+        );
     }
 
     #[tokio::test]
