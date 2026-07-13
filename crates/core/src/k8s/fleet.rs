@@ -253,6 +253,10 @@ pub trait CalibanTaskApi: Send + Sync {
 #[cfg(feature = "k8s")]
 pub struct KubeTaskApi {
     api: kube::Api<CalibanTask>,
+    /// Same namespace + resource as `api`, but deserialized generically as
+    /// `DynamicObject` so `list` never fails on a single schema-skewed CR
+    /// (#148). Per-item typed decoding happens in `parse_calibantask_list`.
+    dyn_api: kube::Api<kube::api::DynamicObject>,
 }
 
 #[cfg(feature = "k8s")]
@@ -260,8 +264,12 @@ impl KubeTaskApi {
     /// A `CalibanTaskApi` scoped to `namespace` on `client`.
     #[must_use]
     pub fn new(client: kube::Client, namespace: &str) -> Self {
+        // Erase `CalibanTask`'s type into an `ApiResource` so we can also talk
+        // to the same CRD endpoint generically (for lenient listing, #148).
+        let ar = kube::api::ApiResource::erase::<CalibanTask>(&());
         Self {
-            api: kube::Api::namespaced(client, namespace),
+            api: kube::Api::namespaced(client.clone(), namespace),
+            dyn_api: kube::Api::namespaced_with(client, namespace, &ar),
         }
     }
 }
@@ -269,6 +277,42 @@ impl KubeTaskApi {
 #[cfg(feature = "k8s")]
 pub(crate) fn map_kube_err(op: &str, e: kube::Error) -> CoreError {
     CoreError::Fleet(format!("{op}: {e}"))
+}
+
+/// Decode a raw list of `CalibanTask` objects **leniently**: each item is
+/// deserialized independently, and any one that fails strict decoding is
+/// **skipped with a warning** instead of failing the whole list (#148).
+///
+/// A single incompatible CR — e.g. a stale `CalibanTask` predating a now-required
+/// field like `workspaceRef` (caliban-operator #11) — must not poison the fleet
+/// snapshot. `KubeTaskApi::list` therefore lists generically (`DynamicObject`,
+/// which never fails on schema skew) and hands the items here, so one bad CR
+/// no longer wedges the watch loop → keeps the fleet populated and `/readyz`
+/// out of a permanent 503 (the pod stays Ready).
+fn parse_calibantask_list(items: Vec<serde_json::Value>) -> Vec<CalibanTask> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let name = item
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string();
+            match serde_json::from_value::<CalibanTask>(item) {
+                Ok(task) => Some(task),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "prospero_k8s_fleet", cr = %name, error = %e,
+                        "list CalibanTask: skipping a CR that failed to deserialize \
+                         (schema skew?); it will not appear in the fleet, but the \
+                         rest of the list is unaffected"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "k8s")]
@@ -309,12 +353,25 @@ impl CalibanTaskApi for KubeTaskApi {
     }
 
     async fn list(&self) -> Result<Vec<CalibanTask>> {
+        // List generically so one malformed CR can't fail the whole poll
+        // (#148): `DynamicObject` deserializes any object shape, then each item
+        // is decoded into `CalibanTask` independently — the bad ones are
+        // skipped + logged, not fatal. See `parse_calibantask_list`.
         let list = self
-            .api
+            .dyn_api
             .list(&kube::api::ListParams::default())
             .await
             .map_err(|e| map_kube_err("list CalibanTask", e))?;
-        Ok(list.items)
+        let items = list
+            .items
+            .into_iter()
+            .map(|obj| {
+                serde_json::to_value(obj).map_err(|e| {
+                    CoreError::Fleet(format!("list CalibanTask: re-serialize item: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(parse_calibantask_list(items))
     }
 }
 
@@ -1215,6 +1272,42 @@ mod tests {
                 assert_ne!(names[i], names[j], "collision between spec {i} and {j}");
             }
         }
+    }
+
+    #[test]
+    fn parse_calibantask_list_skips_malformed_and_keeps_valid() {
+        // #148: one well-formed CR and one that predates the now-required
+        // `workspaceRef` field (the exact prod failure — a leftover CalibanTask
+        // created before caliban-operator #11 made `workspaceRef` required).
+        // The stale CR must be skipped, not fatal to the whole list, so the
+        // fleet snapshot (and thus /readyz) survives a single bad CR.
+        let good = serde_json::json!({
+            "apiVersion": "caliban.caliban-ai.dev/v1alpha1",
+            "kind": "CalibanTask",
+            "metadata": { "name": "good-task", "namespace": "caliban" },
+            "spec": {
+                "workspaceRef": { "name": "team-a-ws" },
+                "task": { "prompt": "do the thing" }
+            }
+        });
+        let stale = serde_json::json!({
+            "apiVersion": "caliban.caliban-ai.dev/v1alpha1",
+            "kind": "CalibanTask",
+            "metadata": { "name": "stale-task", "namespace": "caliban" },
+            // No `workspaceRef`: a CR from before the field became required.
+            "spec": { "task": { "prompt": "legacy" } }
+        });
+
+        // Order-independent: the bad CR sitting first must not drop the good one.
+        let tasks = parse_calibantask_list(vec![stale, good]);
+
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the malformed CR must be skipped, not fatal"
+        );
+        assert_eq!(tasks[0].metadata.name.as_deref(), Some("good-task"));
+        assert_eq!(tasks[0].spec.workspace_ref.name, "team-a-ws");
     }
 
     #[test]
