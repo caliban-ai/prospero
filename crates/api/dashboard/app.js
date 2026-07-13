@@ -140,9 +140,26 @@ function openAddRepoModal() {
     err.textContent = "";
     if (!name) { err.textContent = "name is required"; return; }
     if (!isK8s() && !root) { err.textContent = "name and path are required"; return; }
+    const config = readProviderConfig(form);
+    // k8s: the Workspace CRD requires >=1 source and >=1 provider (minItems:1),
+    // each fully specified — an empty config would be rejected as a 422 (#150).
+    // Validate up front so the user gets an inline error instead of a failed
+    // apply.
+    if (isK8s()) {
+      const sources = config.sources || [];
+      const providers = config.providers || [];
+      if (!sources.length || sources.some((s) => !s.name || !s.repo || !s.path)) {
+        err.textContent = "add at least one source with a name, repo, and path";
+        return;
+      }
+      if (!providers.length) {
+        err.textContent = "add at least one provider (name + kind)";
+        return;
+      }
+    }
     submit.disabled = true;
     try {
-      const body = { name, config: readProviderConfig(form) };
+      const body = { name, config };
       if (root) body.root = root;
       await api("POST", "/api/workspaces", body);
       closeModal();
