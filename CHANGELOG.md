@@ -9,6 +9,43 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-14
+
+Bug-fix follow-up to the 0.3.0 Kubernetes config plane, closing the four issues
+surfaced in k8s smoke testing on a fresh 0.3.0 deploy. The `PROSPERO_FLEET=k8s`
+fleet now stays `Ready` through a schema-skewed custom resource, surfaces the
+registered `Workspace` CRs it manages (instead of a synthetic phantom), and
+rejects an unregisterable workspace up front. Local behavior is unchanged.
+
+### Fixed
+
+- **A single un-deserializable `CalibanTask` no longer wedges the whole fleet.**
+  `K8sFleet`'s watch/readiness path listed `CalibanTask`s strictly, so one CR
+  that failed to deserialize (e.g. a stale task predating the now-required
+  `workspaceRef` field) failed the entire poll — the fleet never populated,
+  `/readyz` stuck at `503`, and the pod never became `Ready`. The list is now
+  decoded per-item, skipping and logging the bad CRs
+  ([#148](https://github.com/caliban-ai/prospero/issues/148))
+  ([#152](https://github.com/caliban-ai/prospero/pull/152)).
+- **The k8s fleet snapshot reconciles with the `Workspace` registry.**
+  `GET /api/fleet` synthesized a single phantom `k8s` workspace and never read
+  the registered `Workspace` CRs, so a registered workspace was invisible in the
+  dashboard while the synthetic `k8s` entry reported `workspace not registered`.
+  The snapshot now surfaces the registered `Workspace` CRs (agents grouped by the
+  workspace they reference), so `/api/fleet` and `/api/workspaces` agree and a
+  fresh deploy shows no phantom
+  ([#149](https://github.com/caliban-ai/prospero/issues/149),
+  [#151](https://github.com/caliban-ai/prospero/issues/151))
+  ([#153](https://github.com/caliban-ai/prospero/pull/153)).
+- **Add-workspace rejects an invalid workspace as `400`, not a raw apiserver
+  `422`.** The dashboard's `+ add workspace` posted a `Workspace` with empty
+  `providers`/`sources`, which the CRD (`minItems: 1` on both) rejected — so a
+  workspace could never be registered from the dashboard. The config plane now
+  validates at least one well-formed source and provider before apply (add and
+  edit paths), and the form validates the same client-side
+  ([#150](https://github.com/caliban-ai/prospero/issues/150))
+  ([#154](https://github.com/caliban-ai/prospero/pull/154)).
+
 ## [0.3.0] - 2026-07-12
 
 The **Kubernetes config plane**: deploying with `PROSPERO_FLEET=k8s` is now a
@@ -178,7 +215,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/caliban-ai/prospero/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/caliban-ai/prospero/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caliban-ai/prospero/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/caliban-ai/prospero/compare/v0.1.0...v0.1.1
