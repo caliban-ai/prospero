@@ -219,7 +219,7 @@ impl WorkspaceApi for FakeWorkspaceApi {
 mod tests {
     use super::*;
     use crate::k8s::crd::WorkspaceSpec;
-    use crate::k8s::fleet::{K8sFleet, PollConfig};
+    use crate::k8s::fleet::K8sFleet;
     use std::time::Duration;
 
     fn ws(name: &str) -> Workspace {
@@ -284,19 +284,13 @@ mod tests {
         let store: Arc<dyn crate::store::Store> =
             Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
         let bus: Arc<dyn crate::bus::EventBus> = Arc::new(crate::bus::InProcessBus::new(64));
-        let fleet = K8sFleet::with_poll_config(
-            fake.clone(),
-            PollConfig {
-                // `FakeK8s::apply` sets `Running` synchronously, so
-                // `ensure_agent`'s first poll already succeeds; a short
-                // deadline just bounds the "never happens" failure mode.
-                deadline: Duration::from_secs(2),
-                interval: Duration::from_millis(10),
-            },
-            bus,
-            store,
-        )
-        .with_watch_poll_interval(Duration::from_millis(20));
+        // `ensure_agent` no longer polls for `Running` (it returns on apply;
+        // the shared watch loop below surfaces/attaches the agent), so no
+        // poll-budget override is needed here anymore — just a short watch
+        // cadence so the conformance suite's change assertions don't wait on
+        // the production poll interval.
+        let fleet = K8sFleet::new(fake.clone(), bus, store)
+            .with_watch_poll_interval(Duration::from_millis(20));
 
         crate::testkit::fleet_provider_conformance(&fleet, &fake).await;
     }
