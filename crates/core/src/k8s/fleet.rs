@@ -134,12 +134,13 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
         return Ok(None);
     };
     validate_caliband_endpoint(endpoint_addr)?;
+    let ep = Endpoint::Tcp {
+        addr: endpoint_addr.clone(),
+    };
     Ok(Some(AgentHandle {
         id: AgentId::from(name),
         workspace: repo,
-        endpoint: Endpoint::Tcp {
-            addr: endpoint_addr.clone(),
-        },
+        endpoint: Some(ep),
     }))
 }
 
@@ -732,11 +733,13 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     // fatal to the poll loop.
                     match handle_from(task, agent.workspace.clone()) {
                         Ok(Some(handle)) => {
-                            to_attach.push((
-                                agent.workspace.clone(),
-                                handle.id.as_str().to_string(),
-                                handle.endpoint,
-                            ));
+                            if let Some(endpoint) = handle.endpoint {
+                                to_attach.push((
+                                    agent.workspace.clone(),
+                                    handle.id.as_str().to_string(),
+                                    endpoint,
+                                ));
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => tracing::warn!(
@@ -927,7 +930,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
         for task in tasks {
             let repo = task.spec.workspace_ref.name.clone();
             if let Ok(Some(handle)) = handle_from(task, repo)
-                && let Endpoint::Tcp { addr } = &handle.endpoint
+                && let Some(Endpoint::Tcp { addr }) = &handle.endpoint
                 && !endpoints.contains(addr)
             {
                 endpoints.push(addr.clone());
@@ -1027,8 +1030,12 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
                 // agent is attachable, start feeding its live output into the
                 // same bus/store `/stream` reads. Ownership-gated (#108) inside
                 // `attach`; the poll loop is the re-attach safety net (#113).
-                self.start_agent_stream(&repo, handle.id.as_str(), &handle.endpoint)
-                    .await;
+                // `handle_from` guarantees `endpoint: Some(_)` for the handle it
+                // returns here.
+                if let Some(endpoint) = &handle.endpoint {
+                    self.start_agent_stream(&repo, handle.id.as_str(), endpoint)
+                        .await;
+                }
                 return Ok(handle);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1289,7 +1296,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             id: id.as_str().to_string(),
             status: "not attachable".to_string(),
         })?;
-        let Endpoint::Tcp { addr } = &handle.endpoint else {
+        let Some(Endpoint::Tcp { addr }) = &handle.endpoint else {
             return Err(CoreError::Fleet(
                 "k8s agent endpoint is not Tcp".to_string(),
             ));
@@ -1536,9 +1543,9 @@ mod tests {
         assert_eq!(handle.workspace, "repo-a");
         assert_eq!(
             handle.endpoint,
-            Endpoint::Tcp {
+            Some(Endpoint::Tcp {
                 addr: "10.0.0.5:9443".to_string()
-            }
+            })
         );
     }
 
@@ -1703,9 +1710,9 @@ mod tests {
             .expect("valid endpoint yields a handle");
         assert_eq!(
             handle.endpoint,
-            Endpoint::Tcp {
+            Some(Endpoint::Tcp {
                 addr: "10.0.0.5:9443".to_string()
-            }
+            })
         );
 
         // Still provisioning (no status) is Ok(None), not an error.
