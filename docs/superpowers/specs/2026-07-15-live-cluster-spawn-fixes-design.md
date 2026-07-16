@@ -99,23 +99,30 @@ for operator/peer-created agents.
 
 **Contract change (the endpoint-shaped hole).** `AgentHandle.endpoint`
 (`prospero/crates/core/src/model.rs:26-31`) is a **required** field, but at spawn
-time the k8s endpoint is genuinely unknown (pod unscheduled). The only production
-caller — `spawn_agent` — reads only `handle.id` and echoes `workspace` from the
-path param, never `handle.endpoint`.
+time the k8s endpoint is genuinely unknown (pod unscheduled).
 
-- **Decision:** change `FleetProvider::ensure_agent` to return
-  `Result<AgentId>` instead of `Result<AgentHandle>`. This makes the spawn
-  contract honest ("accepted; here is the identity") and removes the endpoint
-  promise entirely rather than papering it with a placeholder. `LocalFleet`
-  returns its `id`; `K8sFleet` returns `AgentId::from(task_name)`. The
-  implementation plan sweeps all callers (handler, CLI, tests).
-- **Alternative considered:** make `endpoint: Option<Endpoint>`. Rejected —
-  weakens the type for the attach path (`handle_from`/`to_attach` always have a
-  concrete endpoint) to serve one caller that ignores the field.
+- **Decision:** make `AgentHandle.endpoint: Option<Endpoint>` and keep
+  `FleetProvider::ensure_agent -> Result<AgentHandle>`. `LocalFleet` fills
+  `Some(endpoint)` (it has the socket immediately); `K8sFleet::ensure_agent`
+  returns `endpoint: None`; `handle_from` (attach path) fills `Some(ep)`.
+  This is the **lower-blast-radius** choice, established by reading the callers:
+  the `fleet_provider_conformance` harness (`testkit.rs:746-855`) reads only
+  `.workspace` and `.id` and already converges via `wait_for_discovered` (the
+  watch loop), not synchronous attach — so it is **unchanged**; only the one
+  LocalFleet unit test that asserts the returned endpoint
+  (`fleet_provider.rs:274`) flips to `Some(expected)`, plus the handful of
+  endpoint construction/read sites.
+- **Alternative considered:** change the return type to `Result<AgentId>`.
+  Rejected — more disruptive: it breaks the conformance harness's `h.workspace`
+  read and the LocalFleet endpoint assertion, forcing them to fetch state
+  elsewhere, for no benefit over `Option`.
 
-**Dead plumbing.** `PollConfig.deadline` and the "poll until Running" budget
-become unused for spawn; remove the now-dead field/wiring (keep the
-`watch_poll_interval` cadence — a separate concern).
+**Dead plumbing.** `self.poll: PollConfig` is used *only* by the removed
+ensure_agent loop (both `deadline` and `interval`; the watch loop uses the
+separate `watch_poll_interval`). Remove the `PollConfig` struct, the `poll`
+field, and `with_poll_config`, folding construction into `K8sFleet::new`.
+Required, not optional: clippy `-D warnings` fails CI on the resulting dead
+code.
 
 **No other prospero changes.** The watch loop, session plane, ownership lease,
 and dashboard SSE are unchanged.
@@ -137,7 +144,7 @@ values:
 
 - **TLS (cert-manager):** self-signed `Issuer` → CA `Certificate` (`isCA: true`)
   → CA `Issuer` → serving `Certificate` `caliban-session-plane-tls` with
-  `dnsNames: [caliban]` (matching `prosperod`'s default
+  `dnsNames: [caliband]` (matching `prosperod`'s default
   `PROSPERO_K8S_CALIBAND_SERVER_NAME=caliband`). The two-tier chain keeps
   `ca.crt` **stable** across serving-cert rotation, so prosperod's trust anchor
   does not churn. Resulting Secret carries `tls.crt` / `tls.key` / `ca.crt`.
@@ -162,7 +169,7 @@ values:
 
 - Mount `ca.crt` (from the TLS secret) and `token` (from the token secret) as
   files; set `PROSPERO_K8S_CALIBAND_CA_FILE`, `PROSPERO_K8S_CALIBAND_TOKEN_FILE`,
-  and `PROSPERO_K8S_CALIBAND_SERVER_NAME=caliban`. The dial code already consumes
+  and `PROSPERO_K8S_CALIBAND_SERVER_NAME=caliband` (the prosperod default). The dial code already consumes
   these — no prospero Rust change for Bug 2.
 
 ## Testing
@@ -206,9 +213,10 @@ values:
   co-location, or a follow-up adds a `namespaceSelector` for prospero's
   namespace. Orthogonal to the bearer crash (which precedes any dial) but gates
   end-to-end success.
-- **SNI vs. dnsNames.** prosperod validates the cert against SNI `caliban`; the
-  cert-manager `Certificate.dnsNames` must include exactly that. Kept aligned
-  above; called out so a future SNI/name change updates both sides.
+- **SNI vs. dnsNames.** prosperod validates the cert against SNI `caliband`
+  (`PROSPERO_K8S_CALIBAND_SERVER_NAME` default, `daemon/src/main.rs:65`); the
+  cert-manager `Certificate.dnsNames` must include exactly that string. Kept
+  aligned above; called out so a future SNI/name change updates both sides.
 - **Token rotation** is a `helm upgrade` operation (all pods + prosperod remount;
   in-flight agents re-attach). Automatic token rotation is out of scope.
 - **cert-manager dependency.** The stack now requires cert-manager installed;
@@ -216,11 +224,12 @@ values:
 
 ## Files touched (per repo)
 
-- **prospero:** `crates/core/src/k8s/fleet.rs` (ensure_agent, PollConfig,
-  tests), `crates/core/src/fleet_provider.rs` (trait + LocalFleet return type),
-  `crates/api/src/handlers.rs` (use returned `AgentId`), CLI + any other
-  `ensure_agent` callers. `crates/core/src/model.rs` only if the alternative
-  (Option endpoint) is chosen — not with the recommended `AgentId` return.
+- **prospero:** `crates/core/src/model.rs` (`endpoint: Option<Endpoint>`),
+  `crates/core/src/k8s/fleet.rs` (ensure_agent early return, remove `PollConfig`
+  + `poll` field + `with_poll_config`, fix `handle_from` + `to_attach`, rewrite
+  the two ensure_agent tests), `crates/core/src/fleet_provider.rs` (LocalFleet
+  `Some(endpoint)` + its endpoint-assert test). No handler/CLI change: the
+  return type stays `AgentHandle`, callers read `.id`/`.workspace` as before.
 - **caliban-operator:** `src/config.rs`, `src/resources.rs` (+ tests).
 - **helm-charts:** `charts/caliban-system` (cert-manager chain + token Secret),
   `charts/caliban-operator` (Settings env for secret names),
