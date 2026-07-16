@@ -967,8 +967,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// version that proves network streaming into a `Store`).
     ///
     /// ## Where this is called from
-    /// Wired from [`FleetProvider::ensure_agent`] once a handle resolves, and —
-    /// as of #113 — from the shared poll loop for any agent observed `Running`
+    /// Called from the shared poll loop (#113) for any agent observed `Running`
     /// (including operator/peer-created ones this replica never spawned, and a
     /// restarted CR once it comes back up). The #108 ownership lease inside
     /// [`SessionPlane::attach`] ensures exactly one replica attaches.
@@ -1134,9 +1133,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // Because we cleared the stale `attached` entry above, the poll loop's
         // ownership-gated `attach` fires as soon as the new endpoint appears,
         // rather than blocking this call for up to the poll deadline waiting on
-        // the operator. (If you'd rather `restart_agent` re-attach directly, a
-        // bounded wait-for-`Running`-then-`start_agent_stream` — mirroring
-        // `ensure_agent`'s tail — would be the change.)
+        // the operator.
         Ok(AgentId::from(old_name))
     }
 
