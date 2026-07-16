@@ -909,6 +909,63 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
 }
 
 impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
+    /// #130: refine each projected agent's `interactive` + `status` from its pod
+    /// caliband's control `List`, in place. The CR only carries the coarse
+    /// reconciled phase; the pod caliband carries the interactive flag and the
+    /// fine-grained `Idle` ("awaiting input") state the dashboard reply box needs.
+    ///
+    /// Only `Running`, attachable CRs are consulted (via [`handle_from`], which
+    /// yields `Some` exactly for those). One `List` is issued per distinct pod
+    /// endpoint — a pod caliband may host more than one agent — and each returned
+    /// record overlays the agent sharing its id (the pod registers its agent under
+    /// the CR name; see [`Self::start_agent_stream`]'s agent-id note). A pod that
+    /// fails to answer is logged and skipped: that agent keeps its CR-phase
+    /// status rather than dropping out or failing the whole snapshot (#148).
+    async fn overlay_pod_status(&self, tasks: &[CalibanTask], agents: &mut [Agent]) {
+        // Distinct Running pod endpoints to query (dedup: one List per pod).
+        let mut endpoints: Vec<String> = Vec::new();
+        for task in tasks {
+            let repo = task.spec.workspace_ref.name.clone();
+            if let Ok(Some(handle)) = handle_from(task, repo)
+                && let Endpoint::Tcp { addr } = &handle.endpoint
+                && !endpoints.contains(addr)
+            {
+                endpoints.push(addr.clone());
+            }
+        }
+        if endpoints.is_empty() {
+            return;
+        }
+
+        // id -> live record, merged across every reachable pod.
+        let mut records: HashMap<String, crate::caliband::wire::AgentRecord> = HashMap::new();
+        for addr in endpoints {
+            let client = CalibandClient::connect_tcp(
+                addr.clone(),
+                self.session.tls.clone(),
+                self.session.token.clone(),
+            );
+            match client.list().await {
+                Ok(recs) => {
+                    for rec in recs {
+                        records.insert(rec.id.clone(), rec);
+                    }
+                }
+                Err(e) => tracing::debug!(
+                    target: "prospero_k8s_fleet", endpoint = %addr, error = %e,
+                    "snapshot overlay: pod caliband List failed; keeping CR-phase status"
+                ),
+            }
+        }
+
+        for agent in agents.iter_mut() {
+            if let Some(rec) = records.get(&agent.id) {
+                agent.interactive = rec.spec.interactive;
+                agent.status = rec.status;
+            }
+        }
+    }
+
     /// Dial `endpoint` (the agent's pod-caliband **control** endpoint) over
     /// #75's transport, attach to `agent_id`'s per-agent stream, and feed
     /// normalized frames into the same bus + `Store` `FleetManager`'s own
@@ -1131,7 +1188,18 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // Each agent already carries its workspace (`agent.workspace` ==
         // `spec.workspaceRef.name`), so grouping below is purely a regroup.
         let tasks = self.api.list().await.unwrap_or_default();
-        let agents: Vec<crate::model::Agent> = tasks.iter().map(agent_from_task).collect();
+        let mut agents: Vec<crate::model::Agent> = tasks.iter().map(agent_from_task).collect();
+
+        // #130: overlay live per-agent `interactive` + awaiting-input status from
+        // each pod caliband's control `List`. The CR carries only the coarse
+        // reconciled phase (`Pending`/`Running`/`Draining`) — never the
+        // interactive flag and never "awaiting input" (`Idle`), so from the CR
+        // alone the dashboard reply box (`interactive && idle`) can never appear.
+        // The pod caliband knows both; prospero already dials it for attach. The
+        // CR still supplies membership/lifecycle above; this only refines the
+        // per-turn detail of the Running agents (ADR 0004's hybrid-observability
+        // split applied to k8s).
+        self.overlay_pod_status(&tasks, &mut agents).await;
 
         // When the Workspace registry is wired (k8s config plane, #142), the
         // fleet's workspaces ARE the registered `Workspace` CRs (#149/#151):
@@ -1231,7 +1299,13 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             self.session.tls.clone(),
             self.session.token.clone(),
         );
-        client.send_inbound(&handle.endpoint, &input).await
+        // Resolve the agent's **per-agent** endpoint via an `Attach` control
+        // round-trip before delivering — `send_inbound` writes to the per-agent
+        // inbox endpoint `attach` returns, NOT the pod's control endpoint. This
+        // mirrors `LocalFleet::send_agent_input` and the streaming path
+        // (`attach_once`), both of which `attach` first (#130).
+        let per_agent = client.attach(id.as_str()).await?;
+        client.send_inbound(&per_agent, &input).await
     }
 }
 
@@ -1299,6 +1373,7 @@ impl CalibanTaskApi for MemTaskApi {
 mod tests {
     use super::*;
     use crate::fleet::SpawnRequest;
+    use crate::testkit::FakeCaliband;
     use futures::StreamExt as _;
 
     fn spec(repo: &str, prompt: &str, label: Option<&str>) -> TaskSpec {
@@ -1944,6 +2019,160 @@ mod tests {
                 .iter()
                 .all(|w| w.agents.is_empty()),
             "the CR is gone after remove_agent"
+        );
+    }
+
+    /// An `Ownership` that never wins a lease, so the background session-plane
+    /// attach loop (`session.attach`, gated by `try_acquire`) never dials an
+    /// agent. `send_input` is deliberately NOT ownership-gated, so this isolates
+    /// its own `attach` round-trip from the poll loop's.
+    #[cfg(feature = "k8s")]
+    struct OwnsNothing;
+    #[cfg(feature = "k8s")]
+    #[async_trait]
+    impl crate::ownership::Ownership for OwnsNothing {
+        async fn try_acquire(&self, _key: &str) -> Option<crate::ownership::Lease> {
+            None
+        }
+        async fn renew(&self, _lease: &crate::ownership::Lease) -> Result<()> {
+            Ok(())
+        }
+        async fn release(&self, _key: &str) {}
+        fn owns(&self, _key: &str) -> bool {
+            false
+        }
+    }
+
+    /// Find a single projected agent by id in a snapshot.
+    #[cfg(feature = "k8s")]
+    fn find_agent<'a>(
+        snap: &'a crate::model::FleetSnapshot,
+        id: &str,
+    ) -> Option<&'a crate::model::Agent> {
+        snap.workspaces
+            .iter()
+            .flat_map(|w| &w.agents)
+            .find(|a| a.id == id)
+    }
+
+    /// #130: a `Running` k8s agent that the pod caliband reports as `Idle` +
+    /// `interactive` must surface those from the pod's control `List` — not the
+    /// coarse CR phase — so the dashboard reply box (`interactive && idle`) can
+    /// appear. The CR still supplies membership; the pod supplies live detail.
+    #[tokio::test]
+    async fn k8s_snapshot_overlays_interactive_idle_from_pod_caliband() {
+        let token = "overlay-test-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        // The pod caliband's `List` reports this agent as awaiting input.
+        let id = "ct-interactive";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, AgentStatus::Idle);
+        fake.set_interactive(id, true);
+
+        // The CR: a Running task whose calibandEndpoint is the fake's control
+        // addr. From the CR alone, `agent_from_task` yields Running + !interactive.
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_ownership(Arc::new(OwnsNothing));
+
+        let snap = fleet.snapshot().await;
+        let agent = find_agent(&snap, id).expect("agent projected");
+        assert!(
+            agent.interactive,
+            "interactive must be overlaid from the pod caliband List, got {agent:?}"
+        );
+        assert_eq!(
+            agent.status,
+            AgentStatus::Idle,
+            "status must be overlaid from the pod caliband List (awaiting input), got {agent:?}"
+        );
+    }
+
+    /// #130: if the pod caliband is unreachable, the overlay must degrade —
+    /// keep the agent with its CR-phase status, never drop it or fail the whole
+    /// snapshot (mirrors the resilient-list posture, #148).
+    #[tokio::test]
+    async fn k8s_snapshot_overlay_degrades_when_pod_unreachable() {
+        let id = "ct-unreachable";
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        // Nothing is listening here; the overlay's List dial must fail fast.
+        api.set_running(id, "127.0.0.1:1");
+
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store).with_ownership(Arc::new(OwnsNothing));
+
+        let snap = fleet.snapshot().await;
+        let agent = find_agent(&snap, id).expect("agent still present despite unreachable pod");
+        assert_eq!(
+            agent.status,
+            AgentStatus::Running,
+            "falls back to the CR-phase status when the pod List fails"
+        );
+        assert!(
+            !agent.interactive,
+            "no interactive overlay when the pod List fails"
+        );
+    }
+
+    /// #130: `send_input` must resolve the agent's per-agent endpoint via an
+    /// `attach` control round-trip (as `LocalFleet` and the streaming path do)
+    /// before delivering the inbound frame — not fire it at the pod's control
+    /// endpoint. Proven by the fake recording the `Attach` for this id. With
+    /// `OwnsNothing`, the background poll loop never attaches, so the only
+    /// `Attach` the fake sees is `send_input`'s own.
+    #[tokio::test]
+    async fn k8s_send_input_resolves_per_agent_endpoint_via_attach() {
+        let token = "send-input-test-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-reply";
+        fake.add_agent_tcp(id, Vec::new()).await;
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_ownership(Arc::new(OwnsNothing));
+
+        fleet
+            .send_input(
+                &AgentId::from(id),
+                crate::caliband::wire::AttachInbound::UserMessage {
+                    text: "resume please".into(),
+                },
+            )
+            .await
+            .expect("send_input succeeds");
+
+        assert!(
+            fake.received_attach_ids().iter().any(|a| a == id),
+            "send_input must issue an Attach round-trip to resolve the per-agent \
+             endpoint; got attach ids {:?}",
+            fake.received_attach_ids()
         );
     }
 

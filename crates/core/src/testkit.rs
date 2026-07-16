@@ -240,6 +240,14 @@ impl FakeCaliband {
         }
     }
 
+    /// Set an agent's `spec.interactive` flag (to simulate an interactive agent
+    /// the `List` control reply advertises). No-op if the id isn't registered.
+    pub fn set_interactive(&self, id: &str, interactive: bool) {
+        if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
+            a.spec.interactive = interactive;
+        }
+    }
+
     /// Remove an agent (to simulate it disappearing from the registry).
     pub fn remove_agent(&self, id: &str) {
         self.state.lock().unwrap().agents.remove(id);
