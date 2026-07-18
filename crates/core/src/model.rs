@@ -26,8 +26,9 @@ pub struct TaskSpec {
 pub struct AgentHandle {
     pub id: AgentId,
     pub workspace: String,
-    /// Endpoint the agent's per-agent socket is reachable at.
-    pub endpoint: crate::caliband::wire::Endpoint,
+    /// Endpoint the agent's per-agent socket is reachable at. `None` until the
+    /// backend has resolved one — e.g. a k8s agent between spawn and Running.
+    pub endpoint: Option<crate::caliband::wire::Endpoint>,
 }
 
 /// How to stop an agent. `Kill` preserves today's unconditional behavior.

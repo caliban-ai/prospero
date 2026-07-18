@@ -85,7 +85,7 @@ impl FleetProvider for LocalFleet {
         Ok(AgentHandle {
             id: AgentId::from(id),
             workspace: spec.workspace,
-            endpoint,
+            endpoint: Some(endpoint),
         })
     }
 
@@ -271,7 +271,7 @@ mod local_fleet_tests {
         let expected = crate::caliband::wire::Endpoint::Unix {
             path: _dir.path().join(format!("{}.sock", handle.id.as_str())),
         };
-        assert_eq!(handle.endpoint, expected);
+        assert_eq!(handle.endpoint, Some(expected));
     }
 
     #[tokio::test]

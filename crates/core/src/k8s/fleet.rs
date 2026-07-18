@@ -134,12 +134,13 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
         return Ok(None);
     };
     validate_caliband_endpoint(endpoint_addr)?;
+    let ep = Endpoint::Tcp {
+        addr: endpoint_addr.clone(),
+    };
     Ok(Some(AgentHandle {
         id: AgentId::from(name),
         workspace: repo,
-        endpoint: Endpoint::Tcp {
-            addr: endpoint_addr.clone(),
-        },
+        endpoint: Some(ep),
     }))
 }
 
@@ -407,24 +408,12 @@ impl CalibanTaskApi for KubeTaskApi {
     }
 }
 
-/// How long `ensure_agent` polls for a `CalibanTask` to become `Running`
-/// before giving up, and how often it checks in between.
-#[derive(Debug, Clone, Copy)]
-pub struct PollConfig {
-    /// Total time budget before `ensure_agent` gives up.
-    pub deadline: Duration,
-    /// Interval between polls.
-    pub interval: Duration,
-}
-
-impl Default for PollConfig {
-    fn default() -> Self {
-        Self {
-            deadline: Duration::from_secs(30),
-            interval: Duration::from_millis(250),
-        }
-    }
-}
+/// How long [`K8sFleet::restart_agent`] polls for the old `CalibanTask` to
+/// finish deleting before re-applying the same name, and how often it checks
+/// in between. `FakeK8s` deletes synchronously, so this never matters in
+/// tests; real kube deletion with finalizers needs the wait.
+const RESTART_DELETE_DEADLINE: Duration = Duration::from_secs(30);
+const RESTART_DELETE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A Kubernetes `FleetProvider` backend: drives a fleet by CRUD + watch on
 /// `CalibanTask` custom resources, and (Task B4, ADR 0008 §3) bridges each
@@ -435,7 +424,6 @@ pub struct K8sFleet<A: CalibanTaskApi> {
     // `Arc` (not a bare `A`) so `watch_fleet` can hand a 'static-owned handle
     // to its background poll-diff task without requiring `A: Clone`.
     api: Arc<A>,
-    poll: PollConfig,
     /// How often `watch_fleet`'s background poll-diff loop calls `list()`.
     /// Production default is ~2s; tests override it much shorter (e.g. 20ms)
     /// via [`Self::with_watch_poll_interval`] so change assertions don't wait
@@ -732,11 +720,13 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     // fatal to the poll loop.
                     match handle_from(task, agent.workspace.clone()) {
                         Ok(Some(handle)) => {
-                            to_attach.push((
-                                agent.workspace.clone(),
-                                handle.id.as_str().to_string(),
-                                handle.endpoint,
-                            ));
+                            if let Some(endpoint) = handle.endpoint {
+                                to_attach.push((
+                                    agent.workspace.clone(),
+                                    handle.id.as_str().to_string(),
+                                    endpoint,
+                                ));
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => tracing::warn!(
@@ -793,26 +783,12 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
 }
 
 impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
-    /// A `K8sFleet` with the default (~30s) `ensure_agent` poll budget and
-    /// the default (~2s) `watch_fleet` poll cadence, feeding session-plane
-    /// events into `bus`/`store` (in-process defaults for the fake/test
-    /// wiring; production threads through the daemon's real seams — Task
-    /// B6).
+    /// A `K8sFleet` with the default (~2s) `watch_fleet` poll cadence,
+    /// feeding session-plane events into `bus`/`store` (in-process defaults
+    /// for the fake/test wiring; production threads through the daemon's
+    /// real seams — Task B6).
     #[must_use]
     pub fn new(api: A, bus: Arc<dyn EventBus>, store: Arc<dyn Store>) -> Self {
-        Self::with_poll_config(api, PollConfig::default(), bus, store)
-    }
-
-    /// A `K8sFleet` with an explicit `ensure_agent` poll budget — tests use a
-    /// short deadline so a never-Running CR fails fast instead of hanging
-    /// ~30s.
-    #[must_use]
-    pub fn with_poll_config(
-        api: A,
-        poll: PollConfig,
-        bus: Arc<dyn EventBus>,
-        store: Arc<dyn Store>,
-    ) -> Self {
         let api = Arc::new(api);
         let known: KnownAgents = Arc::new(Mutex::new(HashMap::new()));
         let (changes, _) = tokio::sync::broadcast::channel::<FleetChange>(256);
@@ -837,7 +813,6 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
         );
         Self {
             api,
-            poll,
             watch_poll_interval: DEFAULT_WATCH_POLL_INTERVAL,
             session,
             known,
@@ -927,7 +902,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
         for task in tasks {
             let repo = task.spec.workspace_ref.name.clone();
             if let Ok(Some(handle)) = handle_from(task, repo)
-                && let Endpoint::Tcp { addr } = &handle.endpoint
+                && let Some(Endpoint::Tcp { addr }) = &handle.endpoint
                 && !endpoints.contains(addr)
             {
                 endpoints.push(addr.clone());
@@ -992,8 +967,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// version that proves network streaming into a `Store`).
     ///
     /// ## Where this is called from
-    /// Wired from [`FleetProvider::ensure_agent`] once a handle resolves, and —
-    /// as of #113 — from the shared poll loop for any agent observed `Running`
+    /// Called from the shared poll loop (#113) for any agent observed `Running`
     /// (including operator/peer-created ones this replica never spawned, and a
     /// restarted CR once it comes back up). The #108 ownership lease inside
     /// [`SessionPlane::attach`] ensures exactly one replica attaches.
@@ -1016,28 +990,18 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         let name = task_name(&spec);
         let repo = spec.workspace.clone();
         let ct = build_calibantask(&spec, &name);
+        // `apply` runs the operator's admission webhook synchronously, so an
+        // invalid workspaceRef / empty providers still fails fast here (4xx).
+        // We deliberately do NOT wait for status.phase == "Running": the shared
+        // watch loop (spawn_watch_loop) surfaces the agent on the dashboard and
+        // #113-attaches its session when the pod becomes Running. Blocking here
+        // would couple the HTTP response to full reconcile latency (Bug 1).
         self.api.apply(&ct).await?;
-
-        let deadline = tokio::time::Instant::now() + self.poll.deadline;
-        loop {
-            if let Some(task) = self.api.get(&name).await?
-                && let Some(handle) = handle_from(&task, repo.clone())?
-            {
-                // Session-plane bridge (Task B4, ADR 0008 §3): as soon as the
-                // agent is attachable, start feeding its live output into the
-                // same bus/store `/stream` reads. Ownership-gated (#108) inside
-                // `attach`; the poll loop is the re-attach safety net (#113).
-                self.start_agent_stream(&repo, handle.id.as_str(), &handle.endpoint)
-                    .await;
-                return Ok(handle);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(CoreError::Fleet(format!(
-                    "timed out waiting for CalibanTask {name} to become Running"
-                )));
-            }
-            tokio::time::sleep(self.poll.interval).await;
-        }
+        Ok(AgentHandle {
+            id: AgentId::from(name),
+            workspace: repo,
+            endpoint: None,
+        })
     }
 
     fn watch_fleet(&self) -> BoxStream<'static, FleetChange> {
@@ -1147,14 +1111,14 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // Wait for the old CR to actually disappear before re-applying the same
         // name, so we never race a not-yet-finalized delete. `FakeK8s` deletes
         // synchronously; real kube deletion with finalizers needs this poll.
-        let deadline = tokio::time::Instant::now() + self.poll.deadline;
+        let deadline = tokio::time::Instant::now() + RESTART_DELETE_DEADLINE;
         while self.api.get(old_name).await?.is_some() {
             if tokio::time::Instant::now() >= deadline {
                 return Err(CoreError::Fleet(format!(
                     "restart: CalibanTask {old_name} did not delete within the budget"
                 )));
             }
-            tokio::time::sleep(self.poll.interval).await;
+            tokio::time::sleep(RESTART_DELETE_POLL_INTERVAL).await;
         }
 
         let mut fresh = CalibanTask::new(old_name, old.spec.clone());
@@ -1169,9 +1133,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // Because we cleared the stale `attached` entry above, the poll loop's
         // ownership-gated `attach` fires as soon as the new endpoint appears,
         // rather than blocking this call for up to the poll deadline waiting on
-        // the operator. (If you'd rather `restart_agent` re-attach directly, a
-        // bounded wait-for-`Running`-then-`start_agent_stream` — mirroring
-        // `ensure_agent`'s tail — would be the change.)
+        // the operator.
         Ok(AgentId::from(old_name))
     }
 
@@ -1289,7 +1251,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             id: id.as_str().to_string(),
             status: "not attachable".to_string(),
         })?;
-        let Endpoint::Tcp { addr } = &handle.endpoint else {
+        let Some(Endpoint::Tcp { addr }) = &handle.endpoint else {
             return Err(CoreError::Fleet(
                 "k8s agent endpoint is not Tcp".to_string(),
             ));
@@ -1501,66 +1463,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_agent_returns_handle_once_running() {
+    async fn ensure_agent_returns_immediately_without_waiting_for_running() {
         let api = MemTaskApi::new();
         let (bus, store) = test_seams();
-        let fleet = K8sFleet::with_poll_config(
-            api,
-            PollConfig {
-                deadline: Duration::from_secs(5),
-                interval: Duration::from_millis(10),
-            },
-            bus,
-            store,
-        );
+        let fleet = K8sFleet::new(api, bus, store);
 
         let s = spec("repo-a", "task", None);
         let expected_name = task_name(&s);
 
-        // Flip the CR to Running shortly after `ensure_agent` applies it, off
-        // the same task so the poll loop actually has to poll more than once.
-        let flip = async {
-            loop {
-                if fleet.api.get(&expected_name).await.unwrap().is_some() {
-                    fleet.api.set_running(&expected_name, "10.0.0.5:9443");
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        };
+        // The CR is never flipped to Running. ensure_agent must still return.
+        let handle = fleet.ensure_agent(s).await.expect("ensure_agent");
 
-        let (handle, ()) = tokio::join!(fleet.ensure_agent(s), flip);
-        let handle = handle.expect("ensure_agent");
-
-        assert_eq!(handle.id, AgentId::from(expected_name));
+        assert_eq!(handle.id, AgentId::from(expected_name.clone()));
         assert_eq!(handle.workspace, "repo-a");
-        assert_eq!(
-            handle.endpoint,
-            Endpoint::Tcp {
-                addr: "10.0.0.5:9443".to_string()
-            }
-        );
+        // No endpoint yet — the pod isn't Running.
+        assert_eq!(handle.endpoint, None);
+        // The CR was applied (admission happened synchronously).
+        assert!(fleet.api.get(&expected_name).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn ensure_agent_times_out_if_never_running() {
+    async fn ensure_agent_does_not_block_on_a_never_running_cr() {
         let api = MemTaskApi::new();
         let (bus, store) = test_seams();
-        let fleet = K8sFleet::with_poll_config(
-            api,
-            PollConfig {
-                deadline: Duration::from_millis(50),
-                interval: Duration::from_millis(10),
-            },
-            bus,
-            store,
-        );
+        let fleet = K8sFleet::new(api, bus, store);
 
-        let err = fleet
-            .ensure_agent(spec("repo-a", "task", None))
-            .await
-            .expect_err("must time out when the CR never reaches Running");
-        assert!(matches!(err, CoreError::Fleet(_)));
+        // A generous ceiling: the old code blocked ~30s here. The new code
+        // returns in well under a second regardless of CR phase.
+        let out = tokio::time::timeout(
+            Duration::from_secs(2),
+            fleet.ensure_agent(spec("repo-a", "task", None)),
+        )
+        .await;
+        assert!(out.is_ok(), "ensure_agent must not block on Running");
+        out.unwrap().expect("ensure_agent");
     }
 
     #[tokio::test]
@@ -1703,9 +1639,9 @@ mod tests {
             .expect("valid endpoint yields a handle");
         assert_eq!(
             handle.endpoint,
-            Endpoint::Tcp {
+            Some(Endpoint::Tcp {
                 addr: "10.0.0.5:9443".to_string()
-            }
+            })
         );
 
         // Still provisioning (no status) is Ok(None), not an error.
