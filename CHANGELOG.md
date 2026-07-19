@@ -9,6 +9,31 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-18
+
+Two fixes to the `PROSPERO_FLEET=k8s` control plane found in live-cluster use:
+spawning an agent no longer blocks the dashboard on the operator's reconcile,
+and an agent's interactive reply box now appears under the k8s backend. Local
+behavior is unchanged.
+
+### Fixed
+
+- **Spawning an agent no longer hangs the dashboard on reconcile.** Under the
+  k8s backend, `K8sFleet::ensure_agent` applied the `CalibanTask` CR and then
+  synchronously polled (up to ~30s) for `status.phase == "Running"` before
+  returning, coupling the HTTP response to the full `CR → operator reconcile →
+  pod schedule → Running` chain (and blocking the entire budget when the pod
+  never started). It now returns as soon as the CR is admitted; the background
+  watch loop surfaces the agent and attaches its session when it reaches
+  `Running` — the synchronous poll was redundant with that path
+  ([#157](https://github.com/caliban-ai/prospero/pull/157)).
+- **The interactive reply box now appears for k8s agents.** The dashboard shows
+  it only when an agent is `interactive` and `idle`, and under `PROSPERO_FLEET=k8s`
+  neither was sourced correctly — the status/interactive fields are now read from
+  the pod's caliband rather than the `CalibanTask` CR alone
+  ([#130](https://github.com/caliban-ai/prospero/issues/130))
+  ([#156](https://github.com/caliban-ai/prospero/pull/156)).
+
 ## [0.3.1] - 2026-07-14
 
 Bug-fix follow-up to the 0.3.0 Kubernetes config plane, closing the four issues
@@ -215,7 +240,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/caliban-ai/prospero/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/caliban-ai/prospero/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/caliban-ai/prospero/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caliban-ai/prospero/compare/v0.1.1...v0.2.0
