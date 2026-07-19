@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "prospero-api"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "prospero-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "prospero-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "prospero-daemon"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "prospero-types"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",

@@ -9,6 +9,28 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-19
+
+Completes the `PROSPERO_FLEET=k8s` control plane so a spawned agent actually
+runs: the previous two fixes let the caliband pod bind and decoupled spawn from
+reconcile, but nothing ever started the agent inside the pod. Local behavior is
+unchanged.
+
+### Fixed
+
+- **k8s agents now actually start (and stream).** Under the k8s backend,
+  spawning created the `CalibanTask` CR and a caliband pod but never started the
+  LLM run — caliband is a passive supervisor that begins an agent only on
+  `CtlRequest::Spawn`, and prospero's session plane only *attached*, so the
+  attach looped forever on `agent not found`. prospero now spawns the agent in
+  the pod's caliband (list-or-spawn, one agent per pod) from the `CalibanTask`
+  prompt, then attaches — idempotent across poll cycles and replicas
+  (ownership-lease-gated). Because caliband assigns the agent id itself, the
+  attach id is decoupled from prospero's stream key (the CR name) so output
+  still streams to the dashboard under the identity `/stream` expects
+  ([#159](https://github.com/caliban-ai/prospero/issues/159))
+  ([#160](https://github.com/caliban-ai/prospero/pull/160)).
+
 ## [0.3.2] - 2026-07-18
 
 Two fixes to the `PROSPERO_FLEET=k8s` control plane found in live-cluster use:
@@ -240,7 +262,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/caliban-ai/prospero/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/caliban-ai/prospero/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/caliban-ai/prospero/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/caliban-ai/prospero/compare/v0.2.0...v0.3.0
