@@ -28,9 +28,9 @@ use crate::bus::EventBus;
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::NormalizeOptions;
 use crate::caliband::transport::TlsClient;
-use crate::caliband::wire::Endpoint;
+use crate::caliband::wire::{Endpoint, SpawnSpec};
 use crate::error::{CoreError, Result};
-use crate::fleet::{AttachBackoff, Emitter, attach_loop};
+use crate::fleet::{AttachBackoff, AttachTarget, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
 use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, TaskSpec as CrdTaskSpec, WorkspaceRef};
 use crate::k8s::workspace_api::WorkspaceApi;
@@ -142,6 +142,67 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
         workspace: repo,
         endpoint: Some(ep),
     }))
+}
+
+/// Build the caliband [`SpawnSpec`] that starts `task`'s agent (#159).
+///
+/// caliband is a passive supervisor: it runs an agent only on `Spawn`, and
+/// assigns the agent id itself (the CR name is prospero's identity, not
+/// caliband's). This projects the CalibanTask onto the spec prospero sends to
+/// the pod's caliband.
+///
+/// Deliberate omissions (the operator owns these in the k8s topology):
+/// - `provider` is `None`: the operator resolves the workspace provider
+///   (`provider_ref` → kind + credentials) and injects `CALIBAN_PROVIDER` /
+///   base-url / API key into the pod's caliband env. `provider_ref` is a
+///   *reference name*, not the provider *kind* the worker expects, so passing
+///   it here would be wrong; leaving it unset lets the pod env drive selection.
+/// - `model` is `None`: the frozen CRD carries no per-task model.
+/// - `isolation_worktree` is `false` and `interactive` is `false`: isolation
+///   defaults live on the `Workspace` (operator-resolved), and the CRD carries
+///   no interactive bit (same MVP simplification `agent_from_task` documents).
+///
+/// `label` is the CR name, purely for observability in the pod's `List`.
+fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
+    SpawnSpec {
+        label: task.metadata.name.clone(),
+        frontmatter_path: None,
+        initial_prompt: task.spec.task.prompt.clone(),
+        model: None,
+        provider: None,
+        tool_allowlist: task.spec.tools.clone(),
+        isolation_worktree: false,
+        inherit_hooks: true,
+        interactive: false,
+    }
+}
+
+/// Resolve the pod caliband's (single) agent id, spawning it from `spec` if the
+/// pod has none registered yet (#159). Returns caliband's own id — the one the
+/// `Attach` request must name.
+///
+/// One CalibanTask ⇒ one pod ⇒ one caliband ⇒ at most one agent, so a
+/// non-empty `List` means the agent already exists (a prior poll spawned it, a
+/// peer replica spawned it, or this replica restarted onto a still-running
+/// pod) and we attach to it **without re-spawning** — the idempotency the
+/// acceptance criteria require. Only an empty pod triggers a `Spawn`.
+///
+/// `spec` is `None` for a pure re-attach (`start_agent_stream`): then an empty
+/// pod is an error (nothing to attach and no spec to create one), surfaced to
+/// the caller so the attach task exits and the poll loop retries.
+async fn ensure_pod_agent(client: &CalibandClient, spec: Option<&SpawnSpec>) -> Result<String> {
+    if let Some(rec) = client.list().await?.into_iter().next() {
+        return Ok(rec.id);
+    }
+    match spec {
+        Some(spec) => {
+            let (id, _endpoint) = client.spawn(spec.clone()).await?;
+            Ok(id)
+        }
+        None => Err(CoreError::Fleet(
+            "pod caliband has no registered agent and no spawn spec to create one".to_string(),
+        )),
+    }
 }
 
 /// Map a `CalibanTask`'s `status.phase` string onto Prospero's `AgentStatus`.
@@ -481,6 +542,21 @@ struct AttachTask {
     generation: u64,
 }
 
+/// Evict `agent_id`'s attach reservation, but only if it's still ours: a
+/// restart may have replaced us with a newer `generation`, whose entry we must
+/// not remove (#112). Shared by the attach task's error path (#159 resolve
+/// failure) and its normal exit.
+fn cleanup_attach(
+    attached: &Arc<Mutex<HashMap<String, AttachTask>>>,
+    agent_id: &str,
+    generation: u64,
+) {
+    let mut attached = attached.lock().unwrap_or_else(|e| e.into_inner());
+    if attached.get(agent_id).map(|t| t.generation) == Some(generation) {
+        attached.remove(agent_id);
+    }
+}
+
 /// The k8s session plane: the shared bus/store [`Emitter`], the dial materials
 /// for each agent's caliband control endpoint, the live per-agent attach tasks,
 /// and the [`Ownership`] lease that elects the single replica that attaches a
@@ -514,12 +590,21 @@ struct SessionPlane {
 }
 
 impl SessionPlane {
-    /// Dial `endpoint` (the agent's pod-caliband **control** endpoint) and feed
-    /// its normalized frames into the shared bus/store — but only if THIS
-    /// replica wins the agent's ownership lease (#108). Idempotent: a no-op if a
-    /// stream for `agent_id` is already running here, a logged no-op for a
-    /// non-`Tcp` endpoint, and a silent no-op when a peer owns the lease.
-    async fn attach(&self, repo: &str, agent_id: &str, endpoint: &Endpoint) {
+    /// Dial `endpoint` (the agent's pod-caliband **control** endpoint), ensure
+    /// the pod's agent is running (spawning it from `spec` if none exists yet,
+    /// #159), and feed its normalized frames into the shared bus/store — but
+    /// only if THIS replica wins the agent's ownership lease (#108). Idempotent:
+    /// a no-op if a stream for `agent_id` is already running here, a logged
+    /// no-op for a non-`Tcp` endpoint, and a silent no-op when a peer owns the
+    /// lease. `spec` is `Some` for a CR the poll loop can spawn from, `None` for
+    /// a pure re-attach (then the pod must already have its agent).
+    async fn attach(
+        &self,
+        repo: &str,
+        agent_id: &str,
+        endpoint: &Endpoint,
+        spec: Option<SpawnSpec>,
+    ) {
         let addr = match endpoint {
             Endpoint::Tcp { addr } => addr.clone(),
             Endpoint::Unix { .. } => {
@@ -584,10 +669,33 @@ impl SessionPlane {
         let ownership = Arc::clone(&self.ownership);
 
         let handle = tokio::spawn(async move {
+            // #159: resolve caliband's own agent id for this pod, spawning the
+            // agent from `spec` if the pod has none yet. caliband assigns the id
+            // (the CR name is prospero's identity, not caliband's), so we attach
+            // to *that* id while emitting under `task_agent_id` (the CR name /
+            // stream key). A resolution failure (unreachable pod, or an empty
+            // pod with no spec) ends this task; the poll loop re-attaches next
+            // cycle once the pod is reachable.
+            let attach_id = match ensure_pod_agent(&client, spec.as_ref()).await {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "prospero_k8s_fleet", %repo, agent_id = %task_agent_id, error = %e,
+                        "k8s session-plane: could not resolve/spawn the pod agent; \
+                         will retry on a later poll"
+                    );
+                    cleanup_attach(&attached, &task_agent_id, generation);
+                    ownership.release(&task_agent_id).await;
+                    return;
+                }
+            };
             let result = attach_loop(
                 &client,
-                &repo,
-                &task_agent_id,
+                AttachTarget {
+                    repo: &repo,
+                    agent_id: &task_agent_id,
+                    attach_id: &attach_id,
+                },
                 &emitter,
                 NormalizeOptions::default(),
                 AttachBackoff::default(),
@@ -603,12 +711,7 @@ impl SessionPlane {
             // Self-cleanup, but only if we're still the current task for this id:
             // a restart may have replaced us with a newer generation, whose entry
             // we must not evict. (#112)
-            {
-                let mut attached = attached.lock().unwrap_or_else(|e| e.into_inner());
-                if attached.get(&task_agent_id).map(|t| t.generation) == Some(generation) {
-                    attached.remove(&task_agent_id);
-                }
-            }
+            cleanup_attach(&attached, &task_agent_id, generation);
             // Release for prompt failover hand-off (clustered); no-op standalone.
             ownership.release(&task_agent_id).await;
         });
@@ -698,7 +801,7 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
             // the diff lock, `handle_from` is pure), then attach after releasing
             // the lock. `session.attach` itself is gated by the #108 ownership
             // lease, so exactly one replica actually attaches each.
-            let mut to_attach: Vec<(String, String, Endpoint)> = Vec::new();
+            let mut to_attach: Vec<(String, String, Endpoint, SpawnSpec)> = Vec::new();
             // Diff under the lock so a concurrent `watch_fleet` seed sees a
             // consistent snapshot, then broadcast after releasing it.
             let mut changes: Vec<FleetChange> = Vec::new();
@@ -725,6 +828,10 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                                     agent.workspace.clone(),
                                     handle.id.as_str().to_string(),
                                     endpoint,
+                                    // #159: the spec prospero sends to spawn the
+                                    // agent in the pod's caliband, built from
+                                    // this CR (prompt/tools/label).
+                                    spawn_spec_from_task(task),
                                 ));
                             }
                         }
@@ -774,8 +881,8 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
             // call is deduped + ownership-gated inside `attach`, so a foreign or
             // already-attached agent is cheap (a no-op after a lease miss / a
             // map hit) and only the elected replica actually streams.
-            for (repo, id, endpoint) in to_attach {
-                session.attach(&repo, &id, &endpoint).await;
+            for (repo, id, endpoint, spec) in to_attach {
+                session.attach(&repo, &id, &endpoint, Some(spec)).await;
             }
             tokio::time::sleep(interval).await;
         }
@@ -942,37 +1049,33 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     }
 
     /// Dial `endpoint` (the agent's pod-caliband **control** endpoint) over
-    /// #75's transport, attach to `agent_id`'s per-agent stream, and feed
-    /// normalized frames into the same bus + `Store` `FleetManager`'s own
-    /// attach loop feeds (ADR 0008 §3) — reusing `crate::fleet::attach_loop`
-    /// verbatim rather than a k8s-local duplicate.
+    /// #75's transport, resolve/attach the pod's agent, and feed normalized
+    /// frames into the same bus + `Store` `FleetManager`'s own attach loop feeds
+    /// (ADR 0008 §3) — reusing `crate::fleet::attach_loop` verbatim rather than
+    /// a k8s-local duplicate.
     ///
     /// A no-op (idempotent) if a stream for `agent_id` is already running,
     /// and a logged no-op if `endpoint` isn't `Endpoint::Tcp` (a k8s-backed
     /// agent is always network-attached; a Unix endpoint here would mean a
     /// misconfigured `CalibanTaskApi` implementation).
     ///
-    /// ## Agent-id simplification (documented, MVP)
-    /// `agent_id` is used both as the bus/store stream key — so it must
-    /// match the `AgentId` `ensure_agent` returned, for `/stream` to find
-    /// these events — **and** as the id sent in the pod caliband's `Attach`
-    /// request (`attach_loop` calls `client.attach(agent_id)` internally,
-    /// mirroring the Unix path's single-id design). Those only coincide if
-    /// the pod caliband registers its (single) agent under this same name;
-    /// plausible in production since the operator, having created the
-    /// `CalibanTask`, can tell the pod's caliband to use the CR's name as
-    /// the agent id. The plan's alternative — discover the real id via
-    /// `client.list()`'s first entry when a direct `attach` 404s — is a
-    /// documented follow-up, not implemented here (kept to the narrowest
-    /// version that proves network streaming into a `Store`).
+    /// ## Agent-id resolution (#159)
+    /// `agent_id` is the prospero **stream key** — the CR name `/stream`
+    /// subscribes to. caliband assigns its *own* id on `Spawn`, so this path
+    /// does **not** attach by `agent_id`; it resolves the pod's caliband id via
+    /// [`ensure_pod_agent`] (`list()`, one agent per pod) and attaches to that,
+    /// while emitting under `agent_id`. This convenience entry point passes no
+    /// spawn spec, so it only *re-attaches* an agent the pod already has; the
+    /// poll loop's own `attach` carries the CR's spec and will spawn an empty
+    /// pod (the #159 fix proper).
     ///
     /// ## Where this is called from
-    /// Called from the shared poll loop (#113) for any agent observed `Running`
-    /// (including operator/peer-created ones this replica never spawned, and a
-    /// restarted CR once it comes back up). The #108 ownership lease inside
-    /// [`SessionPlane::attach`] ensures exactly one replica attaches.
+    /// The shared poll loop (#113) calls [`SessionPlane::attach`] directly (with
+    /// a spec) for any agent observed `Running`; the #108 ownership lease inside
+    /// it ensures exactly one replica attaches. This method remains for callers
+    /// that only need to re-attach an already-spawned agent.
     pub async fn start_agent_stream(&self, repo: &str, agent_id: &str, endpoint: &Endpoint) {
-        self.session.attach(repo, agent_id, endpoint).await;
+        self.session.attach(repo, agent_id, endpoint, None).await;
     }
 
     /// Stop the live session-plane attach for `agent_id`, if any (#112). Public
@@ -2238,8 +2341,8 @@ mod tests {
             addr: "127.0.0.1:1".into(),
         };
 
-        a.attach("repo-a", "agent-1", &ep).await;
-        b.attach("repo-a", "agent-1", &ep).await;
+        a.attach("repo-a", "agent-1", &ep, None).await;
+        b.attach("repo-a", "agent-1", &ep, None).await;
 
         assert_eq!(
             a.active_count() + b.active_count(),
@@ -2256,10 +2359,10 @@ mod tests {
         let ep = Endpoint::Tcp {
             addr: "127.0.0.1:1".into(),
         };
-        plane.attach("repo-a", "agent-1", &ep).await;
+        plane.attach("repo-a", "agent-1", &ep, None).await;
         assert_eq!(plane.active_count(), 1);
         // Idempotent: a second attach for the same id is a no-op, not a dupe.
-        plane.attach("repo-a", "agent-1", &ep).await;
+        plane.attach("repo-a", "agent-1", &ep, None).await;
         assert_eq!(plane.active_count(), 1);
     }
 
@@ -2276,7 +2379,7 @@ mod tests {
         let ep = Endpoint::Tcp {
             addr: "127.0.0.1:1".into(),
         };
-        plane.attach("repo-a", "agent-1", &ep).await;
+        plane.attach("repo-a", "agent-1", &ep, None).await;
         assert_eq!(plane.active_count(), 1);
 
         plane.stop("agent-1").await;
@@ -2287,7 +2390,7 @@ mod tests {
         );
 
         // After a stop the id can be re-attached (bookkeeping was cleared).
-        plane.attach("repo-a", "agent-1", &ep).await;
+        plane.attach("repo-a", "agent-1", &ep, None).await;
         assert_eq!(
             plane.active_count(),
             1,
@@ -2319,25 +2422,35 @@ mod tests {
         );
     }
 
-    /// #113: an agent this replica never spawned (operator/peer-created), once
-    /// observed `Running` by the shared poll loop, gets attached by the lease
-    /// owner — so its `/stream` isn't permanently empty. Uses `SelfOwnsAll` (the
-    /// owner) + a short watch cadence and waits for the attach to land.
+    /// #113 + #159: a Running agent this replica never spawned — but that a peer
+    /// replica already spawned in the pod — gets attached by the lease owner
+    /// **without a re-spawn** (its caliband id is discovered via the pod's
+    /// `list()`, one agent per pod). Proves the idempotent "already registered ⇒
+    /// attach only" branch of `ensure_pod_agent`.
     #[tokio::test]
     async fn poll_loop_attaches_observed_running_agent_not_spawned_here() {
+        let token = "poll-attach-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+        // A peer already spawned the agent in this pod. Empty script: the attach
+        // connects, EOFs, and reconnects with backoff — enough to keep the
+        // reservation live across the assertion window.
+        let id = "peer-agent";
+        fake.add_agent_tcp(id, Vec::new()).await;
+
         let api = MemTaskApi::new();
-        // Operator-created: applied + marked Running WITHOUT ensure_agent.
-        api.apply(&build_calibantask(
-            &spec("repo-a", "p", None),
-            "operator-agent",
-        ))
-        .await
-        .unwrap();
-        api.set_running("operator-agent", "127.0.0.1:1");
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
 
         let (bus, store) = test_seams();
-        let fleet =
-            K8sFleet::new(api, bus, store).with_watch_poll_interval(Duration::from_millis(20));
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
 
         // The poll loop should observe it Running and attach it.
         let attached = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2354,6 +2467,84 @@ mod tests {
             attached,
             "the lease owner attaches an observed-Running agent it never spawned (#113)"
         );
+        // It was already registered by the peer, so the poll loop must NOT
+        // re-spawn — only attach (#159 idempotency).
+        assert!(
+            fake.received_specs().is_empty(),
+            "an already-registered pod agent must be attached, not re-spawned (#159); \
+             got specs {:?}",
+            fake.received_specs()
+        );
+    }
+
+    /// #159 CORE: a Running CR whose pod caliband has **no agent yet** must be
+    /// SPAWNED by prospero — caliband is a passive supervisor that starts an
+    /// agent only on `Spawn`. The poll loop dials the pod, spawns from the CR's
+    /// prompt, then streams the run into the store under the **CR-name** stream
+    /// key — even though caliband assigned the agent its own (different) id. The
+    /// prior behavior only `attach`ed → `agent not found`, and nothing ran.
+    #[tokio::test]
+    async fn poll_loop_spawns_the_agent_when_the_pod_is_empty() {
+        use crate::event::{EventKind, stream_key_for};
+
+        let token = "spawn-token";
+        // No `add_agent_*`: the pod starts EMPTY, so prospero must spawn.
+        let (fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let repo = "repo-a";
+        let s = spec(repo, "run the k8s prompt", None);
+        let cr_name = task_name(&s);
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&s, &cr_name)).await.unwrap();
+        api.set_running(&cr_name, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let store_probe = Arc::clone(&store);
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        // Held to keep the poll loop alive (its `Drop` aborts it); the assertions
+        // read the store directly via `store_probe`.
+        let _fleet = K8sFleet::new(api, bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        // The default fake spawn script (TurnStart + RunEnd) lands as events
+        // under the CR-name key; wait for the terminal AgentFinished.
+        let key = stream_key_for(repo, &cr_name);
+        let history = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let h = store_probe.replay(&key, 0).await.unwrap();
+                if h.iter()
+                    .any(|e| matches!(&e.kind, EventKind::AgentFinished { .. }))
+                {
+                    break h;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the spawned agent's stream to land under the CR key");
+
+        assert!(
+            history
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::AgentFinished { .. })),
+            "the spawned agent's run must stream under the CR-name key; got {history:?}"
+        );
+        // prospero actually issued a Spawn carrying the CR's prompt + label, and
+        // exactly once despite many poll cycles (idempotent — `attached` dedups).
+        let specs = fake.received_specs();
+        assert_eq!(
+            specs.len(),
+            1,
+            "exactly one spawn across poll cycles; got {specs:?}"
+        );
+        assert_eq!(specs[0].initial_prompt, "run the k8s prompt");
+        assert_eq!(specs[0].label.as_deref(), Some(cr_name.as_str()));
+        // No per-run provider override — the operator injects the provider env.
+        assert!(specs[0].provider.is_none());
     }
 
     /// #108 + #113 compose: with a peer already holding the agent's lease, this

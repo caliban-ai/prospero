@@ -1301,8 +1301,13 @@ impl FleetManager {
         tokio::spawn(async move {
             let result = attach_loop(
                 &client,
-                &repo,
-                &agent_id,
+                // Local backend: caliband assigned the id prospero uses, so the
+                // stream key and the caliband attach-id are one and the same.
+                AttachTarget {
+                    repo: &repo,
+                    agent_id: &agent_id,
+                    attach_id: &agent_id,
+                },
                 &emitter,
                 normalize,
                 backoff,
@@ -1482,6 +1487,27 @@ async fn event_to_change(mgr: &FleetManager, ev: FleetEvent) -> Option<FleetChan
     }
 }
 
+/// The identity of one attach stream: which caliband agent to `Attach` to, and
+/// the prospero stream key its events are emitted under.
+///
+/// `agent_id` is the **prospero stream key** — events are stored/streamed under
+/// `stream_key_for(repo, agent_id)`, i.e. what the dashboard's `/stream`
+/// subscribes to. `attach_id` is the **caliband-side id** named in the
+/// `Attach { id }` control request. They coincide for the local backend
+/// (caliband assigned the id prospero also uses). They differ for the k8s
+/// backend (#159): caliband assigns the id on `Spawn`, but prospero's identity
+/// is the CR name — so the k8s path attaches to caliband's id while emitting
+/// under the CR name.
+#[derive(Clone, Copy)]
+pub(crate) struct AttachTarget<'a> {
+    /// Workspace/repo the events belong to.
+    pub repo: &'a str,
+    /// Prospero stream key (the CR name in k8s; the caliband id locally).
+    pub agent_id: &'a str,
+    /// caliband-assigned id named in the `Attach { id }` request.
+    pub attach_id: &'a str,
+}
+
 /// How a single attach connection ended.
 enum StreamOutcome {
     /// The agent's terminal `result` frame was seen — the run is done; exit.
@@ -1507,23 +1533,27 @@ enum StreamOutcome {
 /// agent's session plane lands in the identical bus/store path this module's
 /// own `start_attach` (Unix-attached, `FleetManager`) uses. `FleetManager`'s
 /// own call site and behavior are unchanged.
+///
+/// The stream key + attach id are carried in [`AttachTarget`]: events are
+/// emitted under the prospero stream key while the `Attach` request names
+/// caliband's own id (they coincide locally, differ under k8s — see the type's
+/// doc).
 pub(crate) async fn attach_loop(
     client: &CalibandClient,
-    repo: &str,
-    agent_id: &str,
+    target: AttachTarget<'_>,
     emitter: &Emitter,
     normalize: NormalizeOptions,
     backoff: AttachBackoff,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
+    let AttachTarget { repo, agent_id, .. } = target;
     let mut frames_seen: u64 = 0;
     let mut attempt: u32 = 0;
     loop {
         let before = frames_seen;
         let err = match attach_once(
             client,
-            repo,
-            agent_id,
+            target,
             emitter,
             normalize,
             &mut frames_seen,
@@ -1576,14 +1606,20 @@ pub(crate) async fn attach_loop(
 /// event is left half-persisted.
 async fn attach_once(
     client: &CalibandClient,
-    repo: &str,
-    agent_id: &str,
+    target: AttachTarget<'_>,
     emitter: &Emitter,
     normalize: NormalizeOptions,
     frames_seen: &mut u64,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<StreamOutcome> {
-    let endpoint = client.attach(agent_id).await?;
+    let AttachTarget {
+        repo,
+        agent_id,
+        attach_id,
+    } = target;
+    // Resolve the per-agent endpoint from caliband's own id (`attach_id`); emit
+    // under the prospero stream key (`agent_id`). See `AttachTarget`.
+    let endpoint = client.attach(attach_id).await?;
     let mut reader = client.open_stream(&endpoint).await?;
     let mut line = String::new();
     let mut idx: u64 = 0;
