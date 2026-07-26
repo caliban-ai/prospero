@@ -9,6 +9,31 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **Interactive agents under `PROSPERO_FLEET=k8s`.** The dashboard's
+  `interactive: true` now survives the CR round-trip: `build_calibantask`
+  writes `spec.task.interactive` (the field caliban-operator#28 added to the
+  authoritative CRD) and `spawn_spec_from_task` reads it back into the
+  `SpawnSpec` sent to the pod's caliband. Previously the flag was silently
+  dropped at the CR boundary and the spawn spec hardcoded `interactive: false`,
+  so a k8s agent could never await input and the dashboard reply box
+  (`interactive && idle`) could never appear. Requires the `caliban-crds` chart
+  at >= 0.2.1, or the API server prunes the field at admission
+  ([#163](https://github.com/caliban-ai/prospero/issues/163)).
+
+### Fixed
+
+- **Operator replies and the interactive/idle overlay now target caliband's own
+  agent id.** #159 decoupled the agent id caliband assigns from prospero's CR
+  name, but `send_input` still attached by CR name (404, reply lost) and
+  `overlay_pod_status` still looked records up by id (silent miss, regressing
+  #130's reply box). `send_input` now resolves the pod's agent via
+  `ensure_pod_agent`, and the overlay matches each pod's record by **endpoint**
+  rather than by id. The pre-existing tests used one string for both ids, so
+  they passed while the real path was broken; the new tests use distinct ids
+  ([#163](https://github.com/caliban-ai/prospero/issues/163)).
+
 ## [0.3.3] - 2026-07-19
 
 Completes the `PROSPERO_FLEET=k8s` control plane so a spawned agent actually

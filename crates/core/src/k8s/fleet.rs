@@ -82,6 +82,9 @@ pub fn build_calibantask(spec: &TaskSpec, name: &str) -> CalibanTask {
         task: CrdTaskSpec {
             prompt: spec.request.prompt.clone(),
             agent_type: None,
+            // Only set when requested, so a non-interactive task's CR stays
+            // byte-identical to what pre-#163 prospero wrote.
+            interactive: spec.request.interactive.then_some(true),
         },
         isolation: None,
         tools: spec.request.tool_allowlist.clone(),
@@ -158,9 +161,12 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
 ///   *reference name*, not the provider *kind* the worker expects, so passing
 ///   it here would be wrong; leaving it unset lets the pod env drive selection.
 /// - `model` is `None`: the frozen CRD carries no per-task model.
-/// - `isolation_worktree` is `false` and `interactive` is `false`: isolation
-///   defaults live on the `Workspace` (operator-resolved), and the CRD carries
-///   no interactive bit (same MVP simplification `agent_from_task` documents).
+/// - `isolation_worktree` is `false`: isolation defaults live on the
+///   `Workspace` (operator-resolved).
+///
+/// `interactive` comes from the CR (`spec.task.interactive`, added in
+/// caliban-operator#28). An absent field means non-interactive, so CRs written
+/// before #163 keep their old behavior.
 ///
 /// `label` is the CR name, purely for observability in the pod's `List`.
 fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
@@ -173,7 +179,7 @@ fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
         tool_allowlist: task.spec.tools.clone(),
         isolation_worktree: false,
         inherit_hooks: true,
-        interactive: false,
+        interactive: task.spec.task.interactive.unwrap_or(false),
     }
 }
 
@@ -998,28 +1004,37 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     ///
     /// Only `Running`, attachable CRs are consulted (via [`handle_from`], which
     /// yields `Some` exactly for those). One `List` is issued per distinct pod
-    /// endpoint — a pod caliband may host more than one agent — and each returned
-    /// record overlays the agent sharing its id (the pod registers its agent under
-    /// the CR name; see [`Self::start_agent_stream`]'s agent-id note). A pod that
+    /// endpoint, and each pod's record overlays the agent whose CR named that
+    /// endpoint — matched by **endpoint**, not by agent id, because caliband
+    /// assigns the agent its own id (#159) and it is not the CR name. A pod that
     /// fails to answer is logged and skipped: that agent keeps its CR-phase
     /// status rather than dropping out or failing the whole snapshot (#148).
     async fn overlay_pod_status(&self, tasks: &[CalibanTask], agents: &mut [Agent]) {
-        // Distinct Running pod endpoints to query (dedup: one List per pod).
+        // CR name -> its pod endpoint, plus the distinct endpoints to query
+        // (dedup: one List per pod).
+        let mut agent_endpoint: HashMap<String, String> = HashMap::new();
         let mut endpoints: Vec<String> = Vec::new();
         for task in tasks {
             let repo = task.spec.workspace_ref.name.clone();
             if let Ok(Some(handle)) = handle_from(task, repo)
                 && let Some(Endpoint::Tcp { addr }) = &handle.endpoint
-                && !endpoints.contains(addr)
             {
-                endpoints.push(addr.clone());
+                agent_endpoint.insert(task.metadata.name.clone().unwrap_or_default(), addr.clone());
+                if !endpoints.contains(addr) {
+                    endpoints.push(addr.clone());
+                }
             }
         }
         if endpoints.is_empty() {
             return;
         }
 
-        // id -> live record, merged across every reachable pod.
+        // endpoint -> that pod's live record. Keyed by *endpoint*, not agent id:
+        // caliband names the agent itself (#159), so `rec.id` is not the CR name
+        // and an id-keyed lookup silently misses — which is how #130's overlay
+        // regressed. One CalibanTask ⇒ one pod ⇒ one caliband ⇒ at most one
+        // agent (see `ensure_pod_agent`), so the pod's sole record is
+        // unambiguously the one belonging to the CR that named this endpoint.
         let mut records: HashMap<String, crate::caliband::wire::AgentRecord> = HashMap::new();
         for addr in endpoints {
             let client = CalibandClient::connect_tcp(
@@ -1029,8 +1044,8 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
             );
             match client.list().await {
                 Ok(recs) => {
-                    for rec in recs {
-                        records.insert(rec.id.clone(), rec);
+                    if let Some(rec) = recs.into_iter().next() {
+                        records.insert(addr.clone(), rec);
                     }
                 }
                 Err(e) => tracing::debug!(
@@ -1041,7 +1056,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
         }
 
         for agent in agents.iter_mut() {
-            if let Some(rec) = records.get(&agent.id) {
+            if let Some(rec) = agent_endpoint.get(&agent.id).and_then(|a| records.get(a)) {
                 agent.interactive = rec.spec.interactive;
                 agent.status = rec.status;
             }
@@ -1369,7 +1384,14 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // inbox endpoint `attach` returns, NOT the pod's control endpoint. This
         // mirrors `LocalFleet::send_agent_input` and the streaming path
         // (`attach_once`), both of which `attach` first (#130).
-        let per_agent = client.attach(id.as_str()).await?;
+        //
+        // The attach id is caliband's own, NOT `id` (the CR name): caliband
+        // assigns the agent its id on spawn (#159), so attaching by CR name
+        // 404s and the reply is silently lost. `ensure_pod_agent(_, None)`
+        // resolves it from the pod's `List` (one agent per pod) and errors if
+        // the pod has none — the same resolution `start_agent_stream` uses.
+        let agent_id = ensure_pod_agent(&client, None).await?;
+        let per_agent = client.attach(&agent_id).await?;
         client.send_inbound(&per_agent, &input).await
     }
 }
@@ -2094,6 +2116,90 @@ mod tests {
             .find(|a| a.id == id)
     }
 
+    /// #163: an interactive spawn request must survive the CR round-trip.
+    /// `build_calibantask` is where the dashboard's `interactive: true` was
+    /// dropped, so a k8s agent could never await input.
+    #[test]
+    fn build_calibantask_propagates_interactive_to_the_cr() {
+        let mut s = spec("repo-a", "p", None);
+        s.request.interactive = true;
+        let ct = build_calibantask(&s, "ct-1");
+        assert_eq!(
+            ct.spec.task.interactive,
+            Some(true),
+            "SpawnRequest.interactive must reach the CR"
+        );
+    }
+
+    /// #163: a non-interactive request must not set the field, so CRs stay
+    /// byte-identical to what pre-#163 prospero wrote.
+    #[test]
+    fn build_calibantask_omits_interactive_when_not_requested() {
+        let ct = build_calibantask(&spec("repo-a", "p", None), "ct-1");
+        assert_eq!(ct.spec.task.interactive, None);
+    }
+
+    /// #163: the CR's interactive bit must drive the `SpawnSpec` prospero sends
+    /// to the pod caliband — otherwise caliband runs a non-interactive worker
+    /// that terminates at end-of-run instead of awaiting input.
+    #[test]
+    fn spawn_spec_from_task_reads_interactive_from_the_cr() {
+        let mut s = spec("repo-a", "p", None);
+        s.request.interactive = true;
+        let ct = build_calibantask(&s, "ct-1");
+        assert!(
+            spawn_spec_from_task(&ct).interactive,
+            "spawn_spec_from_task must honor the CR's interactive bit"
+        );
+
+        let plain = build_calibantask(&spec("repo-a", "p", None), "ct-2");
+        assert!(!spawn_spec_from_task(&plain).interactive);
+    }
+
+    /// #163: caliband assigns its own agent id (#159), so it is **not** the CR
+    /// name. The overlay must key off the pod it queried, not off a matching id
+    /// — otherwise `records.get(&agent.id)` misses and `interactive`/`idle`
+    /// never surface, which is #130 silently regressing.
+    #[tokio::test]
+    async fn k8s_overlay_matches_pod_agent_whose_id_differs_from_the_cr_name() {
+        let token = "overlay-id-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        // caliband's own id — deliberately NOT the CR name.
+        let caliband_id = "cb-9f3a21";
+        let cr_name = "ct-interactive";
+        fake.add_agent_tcp(caliband_id, Vec::new()).await;
+        fake.set_status(caliband_id, AgentStatus::Idle);
+        fake.set_interactive(caliband_id, true);
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), cr_name))
+            .await
+            .unwrap();
+        api.set_running(cr_name, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_ownership(Arc::new(OwnsNothing));
+
+        let snap = fleet.snapshot().await;
+        let agent = find_agent(&snap, cr_name).expect("agent projected under the CR name");
+        assert!(
+            agent.interactive,
+            "interactive must overlay from the pod's agent even when its id != the CR name, got {agent:?}"
+        );
+        assert_eq!(
+            agent.status,
+            AgentStatus::Idle,
+            "awaiting-input status must overlay from the pod's agent, got {agent:?}"
+        );
+    }
+
     /// #130: a `Running` k8s agent that the pod caliband reports as `Idle` +
     /// `interactive` must surface those from the pod's control `List` — not the
     /// coarse CR phase — so the dashboard reply box (`interactive && idle`) can
@@ -2212,6 +2318,56 @@ mod tests {
             "send_input must issue an Attach round-trip to resolve the per-agent \
              endpoint; got attach ids {:?}",
             fake.received_attach_ids()
+        );
+    }
+
+    /// #163: caliband names the agent itself (#159), so the `Attach` that
+    /// `send_input` issues must carry **caliband's** id, not the CR name.
+    /// Keying it by the CR name 404s, and the operator's reply never lands.
+    /// The pre-#163 test used one string for both ids, so it passed while the
+    /// real path was broken.
+    #[tokio::test]
+    async fn k8s_send_input_attaches_by_caliband_id_not_cr_name() {
+        let token = "send-input-id-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let caliband_id = "cb-7c1e04";
+        let cr_name = "ct-reply";
+        fake.add_agent_tcp(caliband_id, Vec::new()).await;
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), cr_name))
+            .await
+            .unwrap();
+        api.set_running(cr_name, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_ownership(Arc::new(OwnsNothing));
+
+        fleet
+            .send_input(
+                &AgentId::from(cr_name),
+                crate::caliband::wire::AttachInbound::UserMessage {
+                    text: "resume please".into(),
+                },
+            )
+            .await
+            .expect("send_input succeeds when caliband's id differs from the CR name");
+
+        let attached = fake.received_attach_ids();
+        assert!(
+            attached.iter().any(|a| a == caliband_id),
+            "send_input must Attach by caliband's own id; got {attached:?}"
+        );
+        assert!(
+            !attached.iter().any(|a| a == cr_name),
+            "send_input must not Attach by the CR name; got {attached:?}"
         );
     }
 
