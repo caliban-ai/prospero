@@ -290,8 +290,23 @@ mod tests {
         // only assert on which root caliband was spawned with.
         let _ = ensure_caliband(&link, &env, &cfg).await;
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let got = std::fs::read_to_string(&recorded).expect("fake caliband recorded its root");
+        // The stand-in caliband is a separate process racing this test, so poll
+        // for its recorded output up to a deadline instead of guessing a fixed
+        // sleep. A fixed wait passes locally and flakes on loaded CI runners,
+        // where fork+exec can lose the race. (#103)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let got = loop {
+            match std::fs::read_to_string(&recorded) {
+                // The script writes the root in a single `printf`, so any
+                // non-empty content is the complete value.
+                Ok(contents) if !contents.is_empty() => break contents,
+                _ if tokio::time::Instant::now() >= deadline => panic!(
+                    "fake caliband never recorded its root at {}",
+                    recorded.display()
+                ),
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
         assert_eq!(
             got,
             real_canon.to_string_lossy(),

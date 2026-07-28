@@ -96,6 +96,44 @@ async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// Poll `/api/agents/<id>/events` until some persisted event satisfies `pred`,
+/// returning the full events array.
+///
+/// `poll_repo_once` only kicks off the attach task; that task streams and
+/// persists the agent's frames in the background. Waiting a fixed number of
+/// milliseconds for it guesses at how long that takes and flakes on loaded CI
+/// runners, so tests wait on the condition itself. (#103)
+async fn wait_for_event(
+    router: &Router,
+    agent_id: &str,
+    what: &str,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/agents/{agent_id}/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        if v.as_array().is_some_and(|arr| arr.iter().any(&pred)) {
+            return v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what} on {agent_id}: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn healthz_ok() {
     let h = setup().await;
@@ -511,27 +549,11 @@ async fn events_endpoint_returns_history_after_poll() {
         )
         .await;
     h.manager.poll_repo_once("repo").await;
-    // Give the attach task a moment to stream + persist.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let resp = h
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/agents/agent001/events")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    let arr = v.as_array().unwrap();
-    assert!(
-        arr.iter()
-            .any(|e| e["kind"]["kind"] == "output" && e["kind"]["chunk"] == "hi from api")
-    );
+    wait_for_event(&h.router, "agent001", "the streamed output chunk", |e| {
+        e["kind"]["kind"] == "output" && e["kind"]["chunk"] == "hi from api"
+    })
+    .await;
 }
 
 /// Locks the exact `EventKind` JSON shapes the dashboard timeline
@@ -632,7 +654,13 @@ async fn sse_stream_closes_after_agent_finished() {
         )
         .await;
     h.manager.poll_repo_once("repo").await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Wait for the terminal event to be persisted before opening the stream, so
+    // the close-on-`AgentFinished` assertion isn't racing the attach task.
+    wait_for_event(&h.router, "agent001", "agent_finished", |e| {
+        e["kind"]["kind"] == "agent_finished"
+    })
+    .await;
 
     // Collecting the whole body must terminate (stream closes on AgentFinished).
     let resp = h
