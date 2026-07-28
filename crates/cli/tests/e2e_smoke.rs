@@ -97,14 +97,22 @@ async fn cli_drives_the_full_stack() {
         .expect("agent id in spawn output")
         .to_string();
 
-    // Give the poll loop a moment to surface the agent, then list the fleet.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let (ok, out) = run_cli(&base, &["ls"]);
-    assert!(ok, "second ls failed: {out}");
-    assert!(
-        out.contains(&agent_id),
-        "fleet should list the agent: {out}"
-    );
+    // The background poll loop surfaces the agent asynchronously, so poll `ls`
+    // to a deadline instead of guessing how long a cycle takes — a fixed sleep
+    // passes locally and flakes on loaded CI runners. (#103)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (ok, out) = run_cli(&base, &["ls"]);
+        assert!(ok, "second ls failed: {out}");
+        if out.contains(&agent_id) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fleet should list the agent {agent_id}: {out}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Follow streams replayed history then closes when the agent's stream ends.
     let (ok, out) = run_cli(&base, &["follow", &agent_id, "--from", "0"]);
