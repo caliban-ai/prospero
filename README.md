@@ -1,5 +1,9 @@
 # Prospero
 
+[![release](https://img.shields.io/github/v/release/caliban-ai/prospero?logo=github&logoColor=white&label=release&color=blue)](https://github.com/caliban-ai/prospero/releases/latest)
+[![license](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
+[![ci](https://img.shields.io/github/actions/workflow/status/caliban-ai/prospero/ci.yml?branch=main&logo=githubactions&logoColor=white&label=ci)](https://github.com/caliban-ai/prospero/actions/workflows/ci.yml?query=branch%3Amain)
+
 Prospero is the **agent orchestration layer** for the [Caliban](https://github.com/caliban-ai/caliban)
 agent harness. It is a control plane for launching, managing, and observing
 **multiple Caliban agents** across repositories — including several parallel
