@@ -9,6 +9,20 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-27
+
+Makes the `PROSPERO_FLEET=k8s` fleet **interactive**. Since 0.3.0 a k8s agent
+could be launched from the dashboard but never talked to: the reply box renders
+only for an agent that is both `interactive` and `idle`, and under the k8s
+backend neither could ever be true. Closing that took a field on the
+authoritative CRD (caliban-operator#28) plus both halves of the round-trip here,
+and turned up a second defect — 0.3.3's agent-id decoupling had quietly broken
+reply delivery and the 0.3.2 status overlay. Local behavior is unchanged.
+
+**Deploy note:** requires the `caliban-crds` chart at **>= 0.2.1**. Older CRDs
+have no `spec.task.interactive`, so the API server prunes the field at admission
+and the flag never reaches the pod.
+
 ### Added
 
 - **Interactive agents under `PROSPERO_FLEET=k8s`.** The dashboard's
@@ -287,7 +301,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/caliban-ai/prospero/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/caliban-ai/prospero/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/caliban-ai/prospero/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/caliban-ai/prospero/compare/v0.3.0...v0.3.1
