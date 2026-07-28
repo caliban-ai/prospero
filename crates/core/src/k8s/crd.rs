@@ -94,6 +94,12 @@ pub struct TaskSpec {
     /// Agent type (e.g. `general-purpose`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Run the agent in interactive mode: it awaits operator input at each
+    /// end-of-run instead of finishing. Mirrors caliban-operator's authoritative
+    /// CRD field (caliban-operator#28); prospero both writes it
+    /// (`build_calibantask`) and reads it back (`spawn_spec_from_task`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<bool>,
 }
 
 /// Sandbox isolation configuration.
