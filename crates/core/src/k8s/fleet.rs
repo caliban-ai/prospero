@@ -154,15 +154,24 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
 /// caliband's). This projects the CalibanTask onto the spec prospero sends to
 /// the pod's caliband.
 ///
-/// Deliberate omissions (the operator owns these in the k8s topology):
-/// - `provider` is `None`: the operator resolves the workspace provider
-///   (`provider_ref` → kind + credentials) and injects `CALIBAN_PROVIDER` /
-///   base-url / API key into the pod's caliband env. `provider_ref` is a
-///   *reference name*, not the provider *kind* the worker expects, so passing
-///   it here would be wrong; leaving it unset lets the pod env drive selection.
-/// - `model` is `None`: the frozen CRD carries no per-task model.
-/// - `isolation_worktree` is `false`: isolation defaults live on the
-///   `Workspace` (operator-resolved).
+/// `provider`/`model` come from the operator-pinned `status.resolvedWorkspace`
+/// (#168). The spawn contract must carry them explicitly: the caliban worker
+/// selects its provider from `SpawnSpec.provider` and nothing else — it does
+/// **not** read `CALIBAN_PROVIDER` from its environment, which caliban#93
+/// verified directly ("setting `CALIBAN_PROVIDER=ollama` in the worker's
+/// environment does not change the selection"). That gap is why #93 added
+/// `SpawnSpec.provider` in the first place. Leaving these `None` made every
+/// k8s-spawned worker fall back to caliban's default (anthropic) and die at
+/// preflight with `ANTHROPIC_API_KEY is not set`.
+///
+/// Note the distinction the old comment got right: `spec.provider_ref` is a
+/// *reference name* and would indeed be wrong to pass. The value the worker
+/// wants is the **resolved kind** (`ollama`, `anthropic`, …), which the
+/// operator pins into `status.resolvedWorkspace.provider.kind`. Before that
+/// status exists both fields stay `None`, so caliban applies its own defaults.
+///
+/// Still deliberately omitted: `isolation_worktree` is `false` — isolation
+/// defaults live on the `Workspace` (operator-resolved).
 ///
 /// `interactive` comes from the CR (`spec.task.interactive`, added in
 /// caliban-operator#28). An absent field means non-interactive, so CRs written
@@ -170,12 +179,19 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
 ///
 /// `label` is the CR name, purely for observability in the pod's `List`.
 fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
+    // The operator pins exactly one provider per task at admission; absent
+    // until it reconciles, in which case both fields stay unset (#168).
+    let provider = task
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved_workspace.as_ref())
+        .map(|rw| &rw.provider);
     SpawnSpec {
         label: task.metadata.name.clone(),
         frontmatter_path: None,
         initial_prompt: task.spec.task.prompt.clone(),
-        model: None,
-        provider: None,
+        model: provider.and_then(|p| p.model.clone()),
+        provider: provider.map(|p| p.kind.clone()),
         tool_allowlist: task.spec.tools.clone(),
         isolation_worktree: false,
         inherit_hooks: true,
@@ -188,17 +204,39 @@ fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
 /// `Attach` request must name.
 ///
 /// One CalibanTask ⇒ one pod ⇒ one caliband ⇒ at most one agent, so a
-/// non-empty `List` means the agent already exists (a prior poll spawned it, a
-/// peer replica spawned it, or this replica restarted onto a still-running
-/// pod) and we attach to it **without re-spawning** — the idempotency the
-/// acceptance criteria require. Only an empty pod triggers a `Spawn`.
+/// **live** `List` entry means the agent already exists (a prior poll spawned
+/// it, a peer replica spawned it, or this replica restarted onto a
+/// still-running pod) and we attach to it **without re-spawning** — the
+/// idempotency the acceptance criteria require. Only an empty pod triggers a
+/// `Spawn`.
+///
+/// A *terminal* record is not attachable (#168). caliband keeps a `failed`
+/// agent in its registry along with the per-agent endpoint it advertised, but
+/// the worker died before binding that port — so attaching yields `Connection
+/// refused` forever. Accepting any non-empty `List` made a spawn failure
+/// present as an unbounded attach/reconnect loop with no surfaced cause: no
+/// interactive area, no stream, no error. Report it instead.
+///
+/// Deliberately *not* a respawn: re-spawning on every poll would turn a broken
+/// provider config into an unbounded pile of failed agents in the pod's
+/// registry — trading a visible loop for a silent leak. Recovery stays an
+/// explicit `respawn`.
 ///
 /// `spec` is `None` for a pure re-attach (`start_agent_stream`): then an empty
 /// pod is an error (nothing to attach and no spec to create one), surfaced to
 /// the caller so the attach task exits and the poll loop retries.
 async fn ensure_pod_agent(client: &CalibandClient, spec: Option<&SpawnSpec>) -> Result<String> {
-    if let Some(rec) = client.list().await?.into_iter().next() {
-        return Ok(rec.id);
+    let agents = client.list().await?;
+    if let Some(rec) = agents.iter().find(|rec| !rec.status.is_terminal()) {
+        return Ok(rec.id.clone());
+    }
+    if let Some(rec) = agents.first() {
+        return Err(CoreError::Fleet(format!(
+            "pod caliband's agent {} is in terminal state {:?}; not attaching \
+             (its per-agent endpoint will never bind). The worker died at or \
+             after spawn — check the pod's caliband for the cause.",
+            rec.id, rec.status,
+        )));
     }
     match spec {
         Some(spec) => {
@@ -2154,6 +2192,147 @@ mod tests {
 
         let plain = build_calibantask(&spec("repo-a", "p", None), "ct-2");
         assert!(!spawn_spec_from_task(&plain).interactive);
+    }
+
+    /// Build a CR whose status carries an operator-pinned resolved provider.
+    fn task_with_resolved_provider(
+        name: &str,
+        kind: &str,
+        model: Option<&str>,
+    ) -> crate::k8s::crd::CalibanTask {
+        let mut ct = build_calibantask(&spec("repo-a", "p", None), name);
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            phase: "Running".to_string(),
+            caliband_endpoint: None,
+            sandbox_ref: None,
+            resolved_workspace: Some(crate::k8s::crd::ResolvedWorkspace {
+                sources: Vec::new(),
+                provider: crate::k8s::crd::ResolvedProvider {
+                    name: "workers".to_string(),
+                    kind: kind.to_string(),
+                    base_url: Some("http://ollama.example:11434".to_string()),
+                    model: model.map(str::to_string),
+                    credentials_ref: None,
+                },
+                env: Vec::new(),
+                isolation: None,
+            }),
+        });
+        ct
+    }
+
+    /// #168: the caliban worker selects its provider from `SpawnSpec.provider`
+    /// and nothing else — caliban never reads `CALIBAN_PROVIDER` from the pod
+    /// env (verified in caliban#93 *before* this code was written). Leaving it
+    /// `None` therefore makes every k8s-spawned agent fall back to caliban's
+    /// default (anthropic) and die at preflight with `ANTHROPIC_API_KEY is not
+    /// set`. The operator already pins the resolved provider into
+    /// `status.resolvedWorkspace`; project it onto the spawn.
+    #[test]
+    fn spawn_spec_from_task_fills_provider_and_model_from_resolved_workspace() {
+        let ct = task_with_resolved_provider("ct-prov", "ollama", Some("qwen3.6:27b-mlx"));
+        let s = spawn_spec_from_task(&ct);
+        assert_eq!(
+            s.provider.as_deref(),
+            Some("ollama"),
+            "the resolved provider *kind* must reach caliband's SpawnSpec"
+        );
+        assert_eq!(
+            s.model.as_deref(),
+            Some("qwen3.6:27b-mlx"),
+            "the resolved provider's model must reach caliband's SpawnSpec"
+        );
+    }
+
+    /// #168: `resolvedWorkspace` is absent until the operator reconciles, and a
+    /// provider may pin no model. Neither case may invent a value — an unset
+    /// field must stay unset so caliban applies its own default.
+    #[test]
+    fn spawn_spec_from_task_leaves_provider_unset_without_a_resolved_workspace() {
+        let unreconciled = build_calibantask(&spec("repo-a", "p", None), "ct-none");
+        let s = spawn_spec_from_task(&unreconciled);
+        assert_eq!(s.provider, None, "no resolved workspace ⇒ no provider");
+        assert_eq!(s.model, None, "no resolved workspace ⇒ no model");
+
+        let modelless = task_with_resolved_provider("ct-modelless", "anthropic", None);
+        let s = spawn_spec_from_task(&modelless);
+        assert_eq!(s.provider.as_deref(), Some("anthropic"));
+        assert_eq!(s.model, None, "a provider with no pinned model stays unset");
+    }
+
+    /// #168: a worker that dies at spawn leaves a `failed` record in caliband's
+    /// registry whose advertised per-agent endpoint will never bind. Treating
+    /// any non-empty `list()` as "attachable" made prospero reconnect to that
+    /// dead port forever — no interactive area, no stream, and no surfaced
+    /// error. A terminal record must be reported, not attached.
+    #[tokio::test]
+    async fn ensure_pod_agent_rejects_a_terminal_agent_instead_of_attaching_forever() {
+        let token = "terminal-agent-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+        let id = "dead-agent";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, crate::model::AgentStatus::Failed);
+
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let client = CalibandClient::connect_tcp(
+            tls.addr.clone(),
+            Some(client_tls),
+            Some(token.to_string()),
+        );
+
+        let err = ensure_pod_agent(&client, None)
+            .await
+            .expect_err("a terminal agent must not be reported as attachable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(id) && msg.to_lowercase().contains("failed"),
+            "the error must name the agent and its terminal state, got: {msg}"
+        );
+
+        // And it must not be papered over by spawning a replacement every poll:
+        // that turns a broken config into an unbounded pile of failed agents.
+        let spec_for_respawn = spawn_spec_from_task(&build_calibantask(
+            &spec("repo-a", "p", None),
+            "ct-terminal",
+        ));
+        ensure_pod_agent(&client, Some(&spec_for_respawn))
+            .await
+            .expect_err("a terminal agent must not trigger a respawn storm");
+        assert!(
+            fake.received_specs().is_empty(),
+            "no Spawn may be issued while a terminal record occupies the pod"
+        );
+    }
+
+    /// #168 guard: the terminal check must not regress the healthy path — a
+    /// live agent is still discovered and attached without a re-spawn (#159).
+    #[tokio::test]
+    async fn ensure_pod_agent_still_attaches_a_live_agent_without_respawning() {
+        let token = "live-agent-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+        let id = "live-agent";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, crate::model::AgentStatus::Running);
+
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let client = CalibandClient::connect_tcp(
+            tls.addr.clone(),
+            Some(client_tls),
+            Some(token.to_string()),
+        );
+
+        assert_eq!(
+            ensure_pod_agent(&client, None).await.unwrap(),
+            id,
+            "a live agent is discovered via list() and attached as-is"
+        );
+        assert!(fake.received_specs().is_empty(), "no re-spawn (#159)");
     }
 
     /// #163: caliband assigns its own agent id (#159), so it is **not** the CR
