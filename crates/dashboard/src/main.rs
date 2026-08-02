@@ -6,6 +6,8 @@
 
 use dioxus::prelude::*;
 
+mod view_model;
+
 fn main() {
     // Turn wasm panics into a readable console trace instead of bare
     // `unreachable executed`.
