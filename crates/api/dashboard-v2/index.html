@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prospero — Fleet</title>
+    <!-- Inline favicon so the browser never requests (and 404s on) /favicon.ico. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23c792ea'/%3E%3C/svg%3E"
+    />
+    <!-- Absolute URLs: the page is served at /v2 with no trailing slash, so
+         relative asset paths would resolve against / and 404. -->
+    <link rel="stylesheet" href="/v2/app.css" />
+  </head>
+  <body>
+    <div id="main"></div>
+    <script type="module">
+      import init from "/v2/prospero-dashboard.js";
+      init();
+    </script>
+  </body>
+</html>
