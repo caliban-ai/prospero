@@ -172,7 +172,7 @@ pub async fn spawn_agent(
     Path(workspace): Path<String>,
     Json(body): Json<SpawnBody>,
 ) -> Result<(StatusCode, Json<SpawnedResponse>), ApiError> {
-    let req = body.into_request();
+    let req = crate::dto::spawn_request(body);
     let isolated = req.isolation_worktree;
     let handle = st
         .fleet

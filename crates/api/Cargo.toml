@@ -12,6 +12,7 @@ k8s = ["prospero-core/k8s"]
 
 [dependencies]
 prospero-core.workspace = true
+prospero-types.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

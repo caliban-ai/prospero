@@ -6,9 +6,14 @@
 //! (the fleet manager, stores, k8s backend, …) stay in `prospero-core`, which
 //! re-exports each type here from its original path for source compatibility.
 
+mod api;
 mod event;
 mod model;
 
+pub use api::{
+    AddWorkspaceBody, AgentInputBody, Capabilities, RespawnedResponse, SetConfigBody, SpawnBody,
+    SpawnedResponse, WorkspaceSummary,
+};
 pub use event::{EventKind, FleetEvent, OutputStream, stream_key_for};
 pub use model::{
     Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, ProviderInfo,

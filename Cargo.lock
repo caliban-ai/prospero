@@ -1838,6 +1838,7 @@ dependencies = [
  "axum",
  "http-body-util",
  "prospero-core",
+ "prospero-types",
  "serde",
  "serde_json",
  "tempfile",
