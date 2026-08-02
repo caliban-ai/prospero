@@ -1132,3 +1132,126 @@ async fn dashboard_app_js_has_javascript_content_type() {
         .unwrap();
     assert!(ct.contains("javascript"));
 }
+
+// --- Dashboard v2 (Dioxus/WASM bundle, #97) ---------------------------------
+
+/// Fetch `uri` through the real router and return (status, content-type, csp).
+async fn head_of(h: &Harness, uri: &str) -> (StatusCode, String, String) {
+    let resp = h
+        .router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let get = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (
+        resp.status(),
+        get("content-type"),
+        get("content-security-policy"),
+    )
+}
+
+#[tokio::test]
+async fn v2_index_serves_html_with_locked_down_csp() {
+    let h = setup().await;
+    let (status, ct, csp) = head_of(&h, "/v2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    // The bundle is fully self-contained, so everything is denied by default;
+    // 'wasm-unsafe-eval' is the one grant WebAssembly instantiation requires.
+    assert!(csp.contains("default-src 'none'"), "csp was: {csp}");
+    assert!(csp.contains("'wasm-unsafe-eval'"), "csp was: {csp}");
+    assert!(csp.contains("connect-src 'self'"), "csp was: {csp}");
+}
+
+#[tokio::test]
+async fn v2_serves_wasm_with_the_correct_mime() {
+    let h = setup().await;
+    // WebAssembly.instantiateStreaming rejects anything but application/wasm.
+    let (status, ct, _) = head_of(&h, "/v2/prospero-dashboard_bg.wasm").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct, "application/wasm");
+}
+
+#[tokio::test]
+async fn v2_serves_js_glue_and_stylesheet() {
+    let h = setup().await;
+    let (status, ct, _) = head_of(&h, "/v2/prospero-dashboard.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.contains("javascript"), "content-type was {ct}");
+
+    let (status, ct, _) = head_of(&h, "/v2/app.css").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/css"), "content-type was {ct}");
+}
+
+/// wasm-bindgen emits per-dependency JS snippets under `snippets/`, imported
+/// relatively by the glue. Their directory names carry content hashes that
+/// change whenever a dependency does, so the bundle is served from a generated
+/// asset table rather than a hardcoded file list — if these 404 the app never
+/// boots.
+#[tokio::test]
+async fn v2_serves_the_wasm_bindgen_snippets() {
+    let h = setup().await;
+    let glue = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/prospero-dashboard.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = glue.into_body().collect().await.unwrap().to_bytes();
+    let js = String::from_utf8(body.to_vec()).unwrap();
+
+    // Pull every `./snippets/...` import out of the glue and demand each one.
+    let mut checked = 0;
+    for line in js.lines().filter(|l| l.contains("./snippets/")) {
+        let Some(start) = line.find("./snippets/") else {
+            continue;
+        };
+        let rest = &line[start + 2..];
+        let Some(end) = rest.find(['\'', '"']) else {
+            continue;
+        };
+        let (status, ct, _) = head_of(&h, &format!("/v2/{}", &rest[..end])).await;
+        assert_eq!(status, StatusCode::OK, "missing snippet {}", &rest[..end]);
+        assert!(ct.contains("javascript"), "snippet content-type was {ct}");
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "expected the glue to import at least one snippet"
+    );
+}
+
+#[tokio::test]
+async fn v2_unknown_asset_is_404_not_a_panic() {
+    let h = setup().await;
+    let (status, _, _) = head_of(&h, "/v2/does-not-exist.js").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Path traversal cannot escape a static table, but prove it 404s.
+    let (status, _, _) = head_of(&h, "/v2/../Cargo.toml").await;
+    assert_ne!(status, StatusCode::OK);
+}
+
+/// v2 is served alongside v1 during the transition; `/` must be untouched.
+#[tokio::test]
+async fn v1_dashboard_is_unaffected_by_v2() {
+    let h = setup().await;
+    let (status, ct, _) = head_of(&h, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    let (status, ct, _) = head_of(&h, "/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.contains("javascript"), "content-type was {ct}");
+}

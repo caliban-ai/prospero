@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The Dioxus dashboard (#97) targets wasm32 only and is deliberately NOT a
+# workspace member: `cargo {build,clippy,test} --workspace` and the 85% coverage
+# gate (scripts/coverage.sh) all run over members, so a wasm-only UI crate would
+# either fail the host-target build or sink measured coverage below the floor.
+# It builds via scripts/build-dashboard.sh and has its own CI job (ci.yml).
+exclude = ["crates/dashboard"]
 
 [workspace.package]
 version = "0.4.0"

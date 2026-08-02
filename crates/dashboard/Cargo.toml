@@ -1,0 +1,27 @@
+[package]
+name = "prospero-dashboard"
+version = "0.4.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+description = "Prospero Dashboard v2 — Dioxus/WASM fleet-management UI"
+
+# Standalone workspace root. This crate is excluded from the repo workspace (see
+# the root Cargo.toml) so the workspace-wide gates and the coverage floor stay
+# untouched by wasm-only UI code; it therefore resolves its own Cargo.lock.
+[workspace]
+
+[dependencies]
+prospero-types = { path = "../types" }
+dioxus = { version = "0.7", features = ["web"] }
+gloo-net = { version = "0.7", features = ["json"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+serde_json = "1"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+# The .wasm is a committed artifact served to browsers: optimise for size.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

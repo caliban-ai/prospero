@@ -6,6 +6,7 @@
 //! talk to this one surface.
 
 pub mod dashboard;
+pub mod dashboard_v2;
 pub mod dto;
 pub mod error;
 pub mod handlers;
@@ -54,6 +55,11 @@ pub fn router(
         // Dashboard.
         .route("/", get(dashboard::index))
         .route("/app.js", get(dashboard::app_js))
+        // Dashboard v2 (Dioxus/WASM, #97) — served alongside v1 during the
+        // transition, so `/` is unaffected. The catch-all covers the JS glue,
+        // the .wasm, the stylesheet, and wasm-bindgen's hashed `snippets/` tree.
+        .route("/v2", get(dashboard_v2::index))
+        .route("/v2/{*path}", get(dashboard_v2::asset))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/api/metrics", get(handlers::get_metrics))
