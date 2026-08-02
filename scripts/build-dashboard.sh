@@ -155,7 +155,7 @@ else
 fi
 
 # --- 5. Static assets --------------------------------------------------------
-cp "$CRATE_DIR/index.html" "$CRATE_DIR/app.css" "$OUT_DIR/"
+cp "$CRATE_DIR/index.html" "$CRATE_DIR/app.css" "$CRATE_DIR/boot.js" "$OUT_DIR/"
 
 echo "==> bundle written to $OUT_DIR"
 ls -la "$OUT_DIR"

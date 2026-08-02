@@ -10,6 +10,11 @@
 use prospero_types::{Agent, AgentStatus, FleetSnapshot, WorkspaceHealth};
 
 /// How a set of agents is distributed across lifecycle states.
+///
+/// Finished agents are split into `done` and `bad` rather than one `terminal`
+/// bucket: an operator scanning a fleet needs "three finished" and "three
+/// crashed" to look different, and collapsing them would throw away the only
+/// distinction that prompts action.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StatusCounts {
     /// Actively executing.
@@ -18,14 +23,16 @@ pub struct StatusCounts {
     pub idle: usize,
     /// Registered but not yet executing.
     pub spawning: usize,
-    /// Finished, one way or another (done / killed / failed / crashed).
-    pub terminal: usize,
+    /// Finished successfully.
+    pub done: usize,
+    /// Finished badly — killed, failed, or crashed.
+    pub bad: usize,
 }
 
 impl StatusCounts {
     /// Total agents counted.
     pub fn total(&self) -> usize {
-        self.running + self.idle + self.spawning + self.terminal
+        self.running + self.idle + self.spawning + self.done + self.bad
     }
 }
 
@@ -33,17 +40,12 @@ impl StatusCounts {
 pub fn count_statuses(agents: &[Agent]) -> StatusCounts {
     let mut c = StatusCounts::default();
     for a in agents {
-        // Defer to prospero-types for what "terminal" means rather than
-        // restating the match — one definition, shared with the server.
-        if a.status.is_terminal() {
-            c.terminal += 1;
-        } else {
-            match a.status {
-                AgentStatus::Running => c.running += 1,
-                AgentStatus::Idle => c.idle += 1,
-                AgentStatus::Spawning => c.spawning += 1,
-                _ => {}
-            }
+        match a.status {
+            AgentStatus::Running => c.running += 1,
+            AgentStatus::Idle => c.idle += 1,
+            AgentStatus::Spawning => c.spawning += 1,
+            AgentStatus::Done => c.done += 1,
+            AgentStatus::Killed | AgentStatus::Failed | AgentStatus::Crashed => c.bad += 1,
         }
     }
     c
@@ -81,7 +83,8 @@ pub fn totals(snap: &FleetSnapshot) -> FleetTotals {
         t.statuses.running += c.running;
         t.statuses.idle += c.idle;
         t.statuses.spawning += c.spawning;
-        t.statuses.terminal += c.terminal;
+        t.statuses.done += c.done;
+        t.statuses.bad += c.bad;
     }
     t
 }
@@ -188,21 +191,40 @@ mod tests {
         assert_eq!(c.running, 2);
         assert_eq!(c.idle, 1);
         assert_eq!(c.spawning, 1);
-        assert_eq!(c.terminal, 2);
+        assert_eq!(c.done, 1);
+        assert_eq!(c.bad, 1);
         assert_eq!(c.total(), 6);
     }
 
     #[test]
-    fn every_terminal_state_lands_in_the_terminal_bucket() {
+    fn a_clean_finish_and_a_bad_one_are_counted_separately() {
+        let done = count_statuses(&[agent("x", AgentStatus::Done)]);
+        assert_eq!((done.done, done.bad), (1, 0));
+
         for s in [
-            AgentStatus::Done,
             AgentStatus::Killed,
             AgentStatus::Failed,
             AgentStatus::Crashed,
         ] {
             let c = count_statuses(&[agent("x", s)]);
-            assert_eq!(c.terminal, 1, "{s:?} should count as terminal");
-            assert_eq!(c.total(), 1);
+            assert_eq!((c.done, c.bad), (0, 1), "{s:?} should count as bad");
+        }
+    }
+
+    /// Guards against a new `AgentStatus` variant being silently dropped from
+    /// every bucket: whatever the state, an agent must be counted exactly once.
+    #[test]
+    fn every_status_lands_in_exactly_one_bucket() {
+        for s in [
+            AgentStatus::Spawning,
+            AgentStatus::Running,
+            AgentStatus::Idle,
+            AgentStatus::Killed,
+            AgentStatus::Done,
+            AgentStatus::Failed,
+            AgentStatus::Crashed,
+        ] {
+            assert_eq!(count_statuses(&[agent("x", s)]).total(), 1, "{s:?} lost");
         }
     }
 
@@ -232,7 +254,8 @@ mod tests {
         assert_eq!(t.unreachable, 1);
         assert_eq!(t.statuses.running, 1);
         assert_eq!(t.statuses.idle, 1);
-        assert_eq!(t.statuses.terminal, 1);
+        assert_eq!(t.statuses.done, 1);
+        assert_eq!(t.statuses.bad, 0);
     }
 
     #[test]

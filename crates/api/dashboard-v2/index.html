@@ -15,9 +15,8 @@
   </head>
   <body>
     <div id="main"></div>
-    <script type="module">
-      import init from "/v2/prospero-dashboard.js";
-      init();
-    </script>
+    <!-- External, not inline: the page is served under `script-src 'self'`
+         with no 'unsafe-inline', so an inline bootstrap would be blocked. -->
+    <script type="module" src="/v2/boot.js"></script>
   </body>
 </html>

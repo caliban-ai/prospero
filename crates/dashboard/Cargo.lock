@@ -2067,6 +2067,7 @@ dependencies = [
  "console_error_panic_hook",
  "dioxus",
  "gloo-net 0.7.0",
+ "gloo-timers",
  "prospero-types",
  "serde_json",
 ]
