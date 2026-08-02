@@ -627,10 +627,11 @@ body {
   padding-top: var(--sp-2);
 }
 
+/* A column, because an interactive agent stacks its input row beneath the
+   identity line. `.agent-line` is the row. */
 .agent {
   display: flex;
-  align-items: center;
-  gap: var(--sp-2);
+  flex-direction: column;
   padding: 5px 6px;
   border-radius: var(--radius-sm);
   transition: background 0.12s ease;
@@ -865,6 +866,10 @@ body {
 @media (max-width: 880px) {
   .shell {
     grid-template-columns: 1fr;
+    /* Three rows now, not two. Without restating this the `1fr` from the wide
+       layout lands on the header, which then swallows all the slack whenever
+       the page is shorter than the viewport. */
+    grid-template-rows: var(--header-h) var(--header-h) 1fr;
     grid-template-areas:
       "brand"
       "header"
@@ -903,4 +908,283 @@ body {
   .card:hover {
     transform: none;
   }
+}
+
+/* --- Controls -------------------------------------------------------------- */
+.card-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-4) var(--sp-3) calc(var(--sp-4) + 2px);
+}
+
+.btn-sm {
+  font-size: 11.5px;
+  padding: 4px 10px;
+}
+
+.btn-primary {
+  background: var(--accent-wash);
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.btn-primary:hover {
+  border-color: var(--accent);
+}
+
+.btn-danger {
+  background: var(--tone-bad-wash);
+  border-color: var(--tone-bad);
+  color: var(--tone-bad);
+}
+
+.btn:disabled,
+.act-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.act-btn {
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--ink-dim);
+  background: none;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  padding: 1px 7px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.act-btn:hover {
+  color: var(--ink);
+  border-color: var(--ink-muted);
+}
+
+.act-btn.danger:hover {
+  color: var(--tone-bad);
+  border-color: var(--tone-bad);
+  background: var(--tone-bad-wash);
+}
+
+/* Row actions stay dim until the row is hovered or focused, so a wall of cards
+   reads as data rather than as a grid of buttons — but they must never be
+   hidden outright, or keyboard users could not reach them. */
+.acts {
+  display: flex;
+  gap: var(--sp-1);
+  margin-left: var(--sp-2);
+  opacity: 0.35;
+  transition: opacity 0.12s ease;
+}
+
+.agent:hover .acts,
+.agent:focus-within .acts {
+  opacity: 1;
+}
+
+.agent-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.agent-age {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Agent input ----------------------------------------------------------- */
+.agent-input {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0 var(--sp-1) 22px;
+}
+
+.agent-input .input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* --- Banner / note --------------------------------------------------------- */
+.banner,
+.note {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  margin-bottom: var(--sp-4);
+  cursor: pointer;
+  border: 1px solid;
+  animation: rise 0.2s ease backwards;
+}
+
+.banner {
+  background: var(--tone-bad-wash);
+  border-color: var(--tone-bad);
+  color: var(--tone-bad);
+}
+
+.note {
+  background: var(--tone-live-wash);
+  border-color: var(--tone-live);
+  color: var(--tone-live);
+}
+
+.banner-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.banner-dismiss {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+/* --- Modal ----------------------------------------------------------------- */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(5, 7, 11, 0.62);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: var(--sp-6) var(--sp-4);
+  overflow-y: auto;
+  animation: fade 0.14s ease;
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+
+.modal {
+  width: min(420px, 100%);
+  margin-top: 6vh;
+  background: var(--surface);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lift);
+  padding: var(--sp-5);
+  animation: rise 0.2s cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+/* The launch form carries more fields than a confirmation. */
+.modal-wide {
+  width: min(560px, 100%);
+}
+
+.modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin: 0 0 var(--sp-2);
+}
+
+.modal-detail {
+  font-size: 13px;
+  color: var(--ink-dim);
+  margin: 0 0 var(--sp-5);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-5);
+}
+
+/* --- Form ------------------------------------------------------------------ */
+.field {
+  display: block;
+  margin-bottom: var(--sp-4);
+}
+
+.field-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  margin-bottom: var(--sp-1);
+}
+
+.input {
+  display: block;
+  width: 100%;
+  background: var(--ground);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  padding: 7px 9px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  transition: border-color 0.12s ease;
+}
+
+textarea.input {
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.input:focus {
+  border-color: var(--accent-dim);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 13px;
+  color: var(--ink-dim);
+  margin-bottom: var(--sp-3);
+  cursor: pointer;
+}
+
+.check input {
+  accent-color: var(--accent);
+}
+
+.disclosure {
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+  margin-bottom: var(--sp-2);
+}
+
+.disclosure:hover {
+  color: var(--ink-dim);
+}
+
+.advanced {
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--hairline);
+}
+
+.form-error {
+  font-size: 12.5px;
+  color: var(--tone-bad);
+  margin: var(--sp-2) 0 0;
 }

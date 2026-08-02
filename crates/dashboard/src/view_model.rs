@@ -7,7 +7,7 @@
 //! what keeps the parts where bugs actually hide under test without a headless
 //! browser.
 
-use prospero_types::{Agent, AgentStatus, FleetSnapshot, WorkspaceHealth};
+use prospero_types::{Agent, AgentStatus, FleetSnapshot, Workspace, WorkspaceHealth};
 
 /// How a set of agents is distributed across lifecycle states.
 ///
@@ -138,6 +138,97 @@ pub fn short_id(id: &str) -> &str {
         Some((byte_idx, _)) => &id[..byte_idx],
         None => id,
     }
+}
+
+/// Which control an agent's row should offer.
+///
+/// This partition is **deliberately not** `AgentStatus::is_active()`. That one
+/// is stream-oriented (`Spawning | Running`) and answers "might this still emit
+/// output?". The operator question is different: an `Idle` agent is awaiting
+/// input and is very much still killable, so it belongs with the live ones. The
+/// remove path is kill → terminal → remove, which is why removing is only
+/// offered once an agent has actually finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentControls {
+    /// Still going: offer kill.
+    Killable,
+    /// Finished: offer respawn and remove.
+    Finished,
+}
+
+/// Choose the control set for an agent's lifecycle state.
+pub fn controls_for(status: AgentStatus) -> AgentControls {
+    match status {
+        AgentStatus::Spawning | AgentStatus::Running | AgentStatus::Idle => AgentControls::Killable,
+        AgentStatus::Killed | AgentStatus::Done | AgentStatus::Failed | AgentStatus::Crashed => {
+            AgentControls::Finished
+        }
+    }
+}
+
+/// Whether an interactive agent is currently waiting for operator input.
+pub fn awaits_input(agent: &Agent) -> bool {
+    agent.interactive && agent.status == AgentStatus::Idle
+}
+
+/// Whether a workspace can accept new agents.
+///
+/// Backend-dependent: a k8s workspace must have reconciled to `Ready`, while a
+/// local one just needs its caliband reachable. Asking the wrong question would
+/// either offer a launch that is certain to fail or hide one that would work.
+pub fn is_launchable(workspace: &Workspace) -> bool {
+    is_healthy(&workspace.health)
+}
+
+/// Compact elapsed string ("45s", "12m", "3h") from an RFC-3339 timestamp and
+/// the current time in milliseconds since the epoch.
+///
+/// Takes `now_ms` rather than reading the clock so it stays pure and testable —
+/// the caller supplies the browser's clock.
+pub fn elapsed(started_at: &str, now_ms: f64) -> Option<String> {
+    let started_ms = rfc3339_to_millis(started_at)?;
+    let secs = ((now_ms - started_ms) / 1000.0).floor();
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    let secs = secs as u64;
+    Some(if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    })
+}
+
+/// Parse the RFC-3339 timestamps caliband emits into epoch milliseconds.
+///
+/// Hand-rolled rather than pulling `chrono`: this crate is compiled to wasm and
+/// ships to a browser, and one timestamp format does not justify the bytes.
+/// Only the shape prospero actually emits is accepted — `YYYY-MM-DDTHH:MM:SS`
+/// with an optional fractional part and an optional `Z`/offset.
+fn rfc3339_to_millis(ts: &str) -> Option<f64> {
+    let bytes = ts.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num = |a: usize, b: usize| ts.get(a..b)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, s) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+
+    // Days from the civil epoch (Howard Hinnant's days_from_civil).
+    let y_adj = if mo <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    Some(((days * 86_400 + h * 3600 + mi * 60 + s) * 1000) as f64)
 }
 
 /// Trailing path component, for showing a source or session directory compactly.
@@ -306,6 +397,113 @@ mod tests {
         let s = "ααααααααα";
         assert!(s.starts_with(short_id(s)));
         assert_eq!(short_id(s).chars().count(), 8);
+    }
+
+    #[test]
+    fn idle_agents_are_killable_not_removable() {
+        // The operator partition is broader than AgentStatus::is_active():
+        // an idle agent is awaiting input but still very much killable.
+        for s in [
+            AgentStatus::Spawning,
+            AgentStatus::Running,
+            AgentStatus::Idle,
+        ] {
+            assert_eq!(controls_for(s), AgentControls::Killable, "{s:?}");
+        }
+        for s in [
+            AgentStatus::Killed,
+            AgentStatus::Done,
+            AgentStatus::Failed,
+            AgentStatus::Crashed,
+        ] {
+            assert_eq!(controls_for(s), AgentControls::Finished, "{s:?}");
+        }
+        // Guard the divergence explicitly: Idle is NOT active by the stream
+        // definition, but IS killable by the operator one.
+        assert!(!AgentStatus::Idle.is_active());
+        assert_eq!(controls_for(AgentStatus::Idle), AgentControls::Killable);
+    }
+
+    #[test]
+    fn only_an_interactive_idle_agent_awaits_input() {
+        let mut a = agent("x", AgentStatus::Idle);
+        a.interactive = true;
+        assert!(awaits_input(&a));
+
+        a.interactive = false;
+        assert!(
+            !awaits_input(&a),
+            "non-interactive idle must not offer input"
+        );
+
+        let mut running = agent("y", AgentStatus::Running);
+        running.interactive = true;
+        assert!(
+            !awaits_input(&running),
+            "a busy agent is not awaiting input"
+        );
+    }
+
+    #[test]
+    fn elapsed_renders_seconds_minutes_and_hours() {
+        let t0 = rfc3339_to_millis("2026-08-02T12:00:00Z").unwrap();
+        assert_eq!(
+            elapsed("2026-08-02T12:00:00Z", t0 + 45_000.0).as_deref(),
+            Some("45s")
+        );
+        assert_eq!(
+            elapsed("2026-08-02T12:00:00Z", t0 + 12.0 * 60_000.0).as_deref(),
+            Some("12m")
+        );
+        assert_eq!(
+            elapsed("2026-08-02T12:00:00Z", t0 + 3.0 * 3_600_000.0).as_deref(),
+            Some("3h")
+        );
+        // Boundaries.
+        assert_eq!(
+            elapsed("2026-08-02T12:00:00Z", t0 + 59_999.0).as_deref(),
+            Some("59s")
+        );
+        assert_eq!(
+            elapsed("2026-08-02T12:00:00Z", t0 + 60_000.0).as_deref(),
+            Some("1m")
+        );
+    }
+
+    #[test]
+    fn elapsed_rejects_clock_skew_and_garbage_instead_of_rendering_nonsense() {
+        let t0 = rfc3339_to_millis("2026-08-02T12:00:00Z").unwrap();
+        // A timestamp in the future (client clock behind the server) must not
+        // render a huge or negative duration.
+        assert_eq!(elapsed("2026-08-02T12:00:00Z", t0 - 5_000.0), None);
+        assert_eq!(elapsed("not-a-timestamp", t0), None);
+        assert_eq!(elapsed("", t0), None);
+        assert_eq!(elapsed("2026-13-45T99:99:99Z", t0), None);
+    }
+
+    /// The parser is hand-rolled to keep chrono out of a wasm bundle, so pin it
+    /// against known epoch values.
+    #[test]
+    fn rfc3339_parses_against_known_epoch_values() {
+        assert_eq!(rfc3339_to_millis("1970-01-01T00:00:00Z"), Some(0.0));
+        assert_eq!(
+            rfc3339_to_millis("2000-01-01T00:00:00Z"),
+            Some(946_684_800_000.0)
+        );
+        assert_eq!(
+            rfc3339_to_millis("2026-08-02T12:00:00Z"),
+            Some(1_785_672_000_000.0)
+        );
+        // A leap day must not shift the date.
+        assert_eq!(
+            rfc3339_to_millis("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800_000.0)
+        );
+        // Fractional seconds and offsets are tolerated (the tail is ignored).
+        assert_eq!(
+            rfc3339_to_millis("2026-08-02T12:00:00.123456Z"),
+            Some(1_785_672_000_000.0)
+        );
     }
 
     #[test]

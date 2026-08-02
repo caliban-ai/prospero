@@ -3,12 +3,56 @@
 //! and the logic stays testable on the host target.
 
 use dioxus::prelude::*;
-use prospero_types::{Agent, FleetSnapshot, Workspace};
+use prospero_types::{Agent, Capabilities, FleetSnapshot, SpawnBody, Workspace};
 
+use crate::actions::Action;
 use crate::view_model::{
-    FleetTotals, StatusCounts, basename, count_statuses, health_reason, is_healthy, short_id,
-    status_label, status_tone, totals,
+    AgentControls, FleetTotals, StatusCounts, awaits_input, basename, controls_for, count_statuses,
+    elapsed, health_reason, is_healthy, is_launchable, short_id, status_label, status_tone, totals,
 };
+
+/// Shared UI state, provided once by `App` and read by any component that needs
+/// to raise a dialog, report a failure, or ask for a refresh.
+///
+/// Dioxus signals are `Copy`, so this whole struct is `Copy` and can be pulled
+/// out of context by value wherever it is needed — no cloning, no prop drilling
+/// through every intermediate component.
+#[derive(Clone, Copy)]
+pub struct Ui {
+    /// The dialog currently open, if any.
+    pub modal: Signal<Modal>,
+    /// A failure to surface to the operator.
+    pub banner: Signal<Option<String>>,
+    /// A transient success note.
+    pub note: Signal<Option<String>>,
+    /// What the active backend supports; gates the admin controls.
+    pub caps: Signal<Capabilities>,
+    /// Bumped after a successful mutation to force an immediate refetch.
+    pub refresh: Signal<u32>,
+    /// Browser clock, in epoch milliseconds, sampled once per render pass.
+    pub now_ms: Signal<f64>,
+}
+
+impl Ui {
+    /// Request a fleet refetch on the next tick.
+    pub fn request_refresh(&mut self) {
+        self.refresh += 1;
+    }
+}
+
+/// Which dialog is open.
+#[derive(Clone, PartialEq)]
+pub enum Modal {
+    /// None.
+    Closed,
+    /// Confirm a destructive or irreversible [`Action`].
+    Confirm(Action),
+    /// The launch-an-agent form, pre-targeted at a workspace.
+    Launch {
+        /// Workspace the launch button belonged to.
+        workspace: String,
+    },
+}
 
 /// How many segments the status meter draws.
 const METER_SEGMENTS: usize = 10;
@@ -134,7 +178,12 @@ fn Stat(label: String, value: usize, note: Option<String>) -> Element {
 /// One workspace: identity, health, its agents' status distribution.
 #[component]
 fn WorkspaceCard(workspace: Workspace) -> Element {
+    let mut ui = use_context::<Ui>();
     let healthy = is_healthy(&workspace.health);
+    let launchable = is_launchable(&workspace);
+    let admin = ui.caps.read().admin;
+    let name = workspace.name.clone();
+    let remove_name = workspace.name.clone();
     let counts = count_statuses(&workspace.agents);
     let card_class = if healthy {
         "card reveal is-healthy"
@@ -160,6 +209,24 @@ fn WorkspaceCard(workspace: Workspace) -> Element {
                     div { class: "card-sub", "{sources}" }
                 }
                 HealthPill { workspace: workspace.clone() }
+            }
+            div { class: "card-controls",
+                if launchable {
+                    button {
+                        class: "btn btn-sm btn-primary",
+                        onclick: move |_| ui.modal.set(Modal::Launch { workspace: name.clone() }),
+                        "Launch agent"
+                    }
+                }
+                // Registry controls only exist when the backend wired an admin
+                // plane; under a backend without one they would 405.
+                if admin {
+                    ControlButton {
+                        action: Action::RemoveWorkspace { name: remove_name.clone() },
+                        label: "Remove".to_string(),
+                        danger: true,
+                    }
+                }
             }
             div { class: "card-body",
                 if workspace.agents.is_empty() {
@@ -235,22 +302,67 @@ fn LegendItem(tone: String, label: String, count: usize) -> Element {
 
 #[component]
 fn AgentRow(agent: Agent) -> Element {
+    let ui = use_context::<Ui>();
     let tone = status_tone(agent.status);
+    let age = elapsed(&agent.started_at, *ui.now_ms.read());
+    let controls = controls_for(agent.status);
+    let wants_input = awaits_input(&agent);
+
     rsx! {
         div { class: "agent",
-            span { class: "agent-id", "{short_id(&agent.id)}" }
-            span { class: "agent-name", "{agent.name}" }
-            span { class: "agent-tags",
-                if agent.interactive {
-                    span { class: "tag", title: "Accepts operator input", "int" }
+            div { class: "agent-line",
+                span { class: "agent-id", "{short_id(&agent.id)}" }
+                span { class: "agent-name", "{agent.name}" }
+                span { class: "agent-tags",
+                    if let Some(age) = age {
+                        span { class: "agent-age", title: "Started {agent.started_at}", "{age}" }
+                    }
+                    if agent.interactive {
+                        span { class: "tag", title: "Accepts operator input", "int" }
+                    }
+                    if agent.isolated {
+                        span { class: "tag", title: "Runs in an isolated git worktree", "wt" }
+                    }
+                    span { class: "pill tone-{tone}",
+                        span { class: "glyph tone-{tone}" }
+                        "{status_label(agent.status)}"
+                    }
                 }
-                if agent.isolated {
-                    span { class: "tag", title: "Runs in an isolated git worktree", "wt" }
+                div { class: "acts",
+                    match controls {
+                        AgentControls::Killable => rsx! {
+                            ControlButton {
+                                action: Action::KillAgent {
+                                    id: agent.id.clone(),
+                                    name: agent.name.clone(),
+                                },
+                                label: "Kill".to_string(),
+                                danger: true,
+                            }
+                        },
+                        AgentControls::Finished => rsx! {
+                            ControlButton {
+                                action: Action::RespawnAgent {
+                                    id: agent.id.clone(),
+                                    name: agent.name.clone(),
+                                },
+                                label: "Respawn".to_string(),
+                                danger: false,
+                            }
+                            ControlButton {
+                                action: Action::RemoveAgent {
+                                    id: agent.id.clone(),
+                                    name: agent.name.clone(),
+                                },
+                                label: "Remove".to_string(),
+                                danger: true,
+                            }
+                        },
+                    }
                 }
-                span { class: "pill tone-{tone}",
-                    span { class: "glyph tone-{tone}" }
-                    "{status_label(agent.status)}"
-                }
+            }
+            if wants_input {
+                AgentInput { agent: agent.clone() }
             }
         }
     }
@@ -437,5 +549,421 @@ mod tests {
         for word in ["running", "spawning", "idle", "finished", "failed"] {
             assert!(s.contains(word), "summary missing {word}: {s}");
         }
+    }
+}
+
+// --- Controls ---------------------------------------------------------------
+
+/// A small inline control on an agent or workspace row.
+///
+/// Raises the confirmation dialog for anything irreversible; fires immediately
+/// otherwise. Disables itself while a request is in flight so a double-click
+/// can't issue the operation twice.
+#[component]
+fn ControlButton(action: Action, label: String, danger: bool) -> Element {
+    let mut ui = use_context::<Ui>();
+    let mut busy = use_signal(|| false);
+    let class = if danger { "act-btn danger" } else { "act-btn" };
+
+    rsx! {
+        button {
+            class: "{class}",
+            disabled: busy(),
+            onclick: move |evt| {
+                evt.stop_propagation();
+                let action = action.clone();
+                if action.needs_confirmation() {
+                    ui.modal.set(Modal::Confirm(action));
+                } else {
+                    busy.set(true);
+                    spawn(async move {
+                        run_action(ui, action).await;
+                        busy.set(false);
+                    });
+                }
+            },
+            "{label}"
+        }
+    }
+}
+
+/// Execute an action, then route the outcome: refresh on success, banner on
+/// failure. Central so every control reports consistently.
+async fn run_action(mut ui: Ui, action: Action) {
+    match action.run().await {
+        Ok(()) => {
+            ui.note.set(action.success_note());
+            ui.banner.set(None);
+            ui.request_refresh();
+        }
+        Err(e) => ui.banner.set(Some(e)),
+    }
+}
+
+/// Confirmation dialog for an irreversible action.
+#[component]
+fn ConfirmDialog(action: Action) -> Element {
+    let mut ui = use_context::<Ui>();
+    let mut busy = use_signal(|| false);
+    let confirm_class = if action.is_destructive() {
+        "btn btn-danger"
+    } else {
+        "btn btn-primary"
+    };
+
+    let run = {
+        let action = action.clone();
+        move |_| {
+            let action = action.clone();
+            busy.set(true);
+            spawn(async move {
+                run_action(ui, action).await;
+                busy.set(false);
+                ui.modal.set(Modal::Closed);
+            });
+        }
+    };
+
+    rsx! {
+        Scrim {
+            div { class: "modal", role: "dialog", aria_modal: "true",
+                h2 { class: "modal-title", "{action.title()}" }
+                p { class: "modal-detail", "{action.detail()}" }
+                div { class: "modal-actions",
+                    button {
+                        class: "btn",
+                        disabled: busy(),
+                        onclick: move |_| ui.modal.set(Modal::Closed),
+                        "Cancel"
+                    }
+                    button {
+                        class: "{confirm_class}",
+                        disabled: busy(),
+                        autofocus: true,
+                        onclick: run,
+                        if busy() { "Working…" } else { "{action.confirm_label()}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Modal backdrop. Clicking it or pressing Escape closes the dialog — an
+/// operator who opened the wrong one should not have to hunt for Cancel.
+#[component]
+fn Scrim(children: Element) -> Element {
+    let mut ui = use_context::<Ui>();
+    rsx! {
+        div {
+            class: "scrim",
+            tabindex: "-1",
+            onclick: move |_| ui.modal.set(Modal::Closed),
+            onkeydown: move |evt| {
+                if evt.key() == Key::Escape {
+                    ui.modal.set(Modal::Closed);
+                }
+            },
+            div {
+                // Swallow clicks inside the panel so they don't reach the
+                // backdrop's close handler.
+                onclick: move |evt| evt.stop_propagation(),
+                {children}
+            }
+        }
+    }
+}
+
+/// The launch-an-agent form.
+#[component]
+fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
+    let mut ui = use_context::<Ui>();
+
+    let launchable: Vec<String> = snapshot
+        .workspaces
+        .iter()
+        .filter(|w| is_launchable(w))
+        .map(|w| w.name.clone())
+        .collect();
+
+    let mut target = use_signal(|| workspace.clone());
+    let mut prompt = use_signal(String::new);
+    let mut label = use_signal(String::new);
+    let mut model = use_signal(String::new);
+    let mut tools = use_signal(String::new);
+    let mut worktree = use_signal(|| true);
+    let mut interactive = use_signal(|| false);
+    let mut advanced = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+
+    let submit = move |_| {
+        let ws = target().trim().to_string();
+        let task = prompt().trim().to_string();
+        if ws.is_empty() || task.is_empty() {
+            error.set(Some("A workspace and a task are both required.".into()));
+            return;
+        }
+        let allowlist: Vec<String> = tools()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let body = SpawnBody {
+            prompt: task,
+            label: non_empty(label()),
+            model: non_empty(model()),
+            // Only the literal "shared" opts out of worktree isolation, so send
+            // that exact token rather than a bool the server would misread.
+            isolation: if worktree() {
+                None
+            } else {
+                Some("shared".into())
+            },
+            tool_allowlist: if allowlist.is_empty() {
+                None
+            } else {
+                Some(allowlist)
+            },
+            interactive: interactive(),
+            frontmatter_path: None,
+            provider_ref: None,
+        };
+        busy.set(true);
+        error.set(None);
+        spawn(async move {
+            match crate::api::spawn_agent(&ws, &body).await {
+                Ok(spawned) => {
+                    ui.note.set(Some(format!(
+                        "Launched {} in {}.",
+                        short_id(&spawned.agent_id),
+                        spawned.workspace
+                    )));
+                    ui.banner.set(None);
+                    ui.request_refresh();
+                    ui.modal.set(Modal::Closed);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    rsx! {
+        Scrim {
+            div { class: "modal modal-wide", role: "dialog", aria_modal: "true",
+                h2 { class: "modal-title", "Launch an agent" }
+
+                label { class: "field",
+                    span { class: "field-label", "Workspace" }
+                    select {
+                        class: "input",
+                        value: "{target}",
+                        onchange: move |e| target.set(e.value()),
+                        for name in launchable.iter() {
+                            option { key: "{name}", value: "{name}", "{name}" }
+                        }
+                    }
+                }
+
+                label { class: "field",
+                    span { class: "field-label", "Task" }
+                    textarea {
+                        class: "input",
+                        rows: "4",
+                        placeholder: "Describe what the agent should do",
+                        value: "{prompt}",
+                        oninput: move |e| prompt.set(e.value()),
+                    }
+                }
+
+                label { class: "check",
+                    input {
+                        r#type: "checkbox",
+                        checked: worktree(),
+                        onchange: move |e| worktree.set(e.checked()),
+                    }
+                    span { "Worktree isolation" }
+                }
+                label { class: "check",
+                    input {
+                        r#type: "checkbox",
+                        checked: interactive(),
+                        onchange: move |e| interactive.set(e.checked()),
+                    }
+                    span { "Interactive — the agent will wait for your input" }
+                }
+
+                button {
+                    class: "disclosure",
+                    onclick: move |_| advanced.toggle(),
+                    if advanced() { "▾ Advanced" } else { "▸ Advanced" }
+                }
+                if advanced() {
+                    div { class: "advanced",
+                        label { class: "field",
+                            span { class: "field-label", "Label" }
+                            input {
+                                class: "input",
+                                value: "{label}",
+                                oninput: move |e| label.set(e.value()),
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Model" }
+                            input {
+                                class: "input",
+                                placeholder: "workspace default",
+                                value: "{model}",
+                                oninput: move |e| model.set(e.value()),
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Tool allowlist" }
+                            input {
+                                class: "input",
+                                placeholder: "comma, separated",
+                                value: "{tools}",
+                                oninput: move |e| tools.set(e.value()),
+                            }
+                        }
+                    }
+                }
+
+                if let Some(e) = error() {
+                    p { class: "form-error", "{e}" }
+                }
+
+                div { class: "modal-actions",
+                    button {
+                        class: "btn",
+                        disabled: busy(),
+                        onclick: move |_| ui.modal.set(Modal::Closed),
+                        "Cancel"
+                    }
+                    button {
+                        class: "btn btn-primary",
+                        disabled: busy(),
+                        onclick: submit,
+                        if busy() { "Launching…" } else { "Launch" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Trim a form field, treating blank as absent.
+fn non_empty(s: String) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Send-a-message row for an interactive agent that is awaiting input.
+#[component]
+fn AgentInput(agent: Agent) -> Element {
+    let mut ui = use_context::<Ui>();
+    let mut text = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+    let id = agent.id.clone();
+
+    // `use_callback` so the same handler can be shared by the button and the
+    // Enter key without being moved into the first closure that uses it.
+    let send = use_callback(move |_: ()| {
+        let body = text().trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let id = id.clone();
+        busy.set(true);
+        spawn(async move {
+            match crate::api::send_input(&id, &body).await {
+                Ok(()) => {
+                    text.set(String::new());
+                    ui.banner.set(None);
+                    ui.request_refresh();
+                }
+                Err(e) => ui.banner.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    });
+
+    rsx! {
+        div { class: "agent-input", onclick: move |e| e.stop_propagation(),
+            input {
+                class: "input",
+                placeholder: "Send a message…",
+                value: "{text}",
+                disabled: busy(),
+                oninput: move |e| text.set(e.value()),
+                onkeydown: move |e| {
+                    if e.key() == Key::Enter {
+                        e.stop_propagation();
+                        send.call(());
+                    }
+                },
+            }
+            button {
+                class: "btn btn-primary btn-sm",
+                disabled: busy(),
+                onclick: move |e| {
+                    e.stop_propagation();
+                    send.call(());
+                },
+                "Send"
+            }
+            ControlButton {
+                action: Action::EndInput {
+                    id: agent.id.clone(),
+                    name: agent.name.clone(),
+                },
+                label: "End".to_string(),
+                danger: false,
+            }
+        }
+    }
+}
+
+/// Transient failure banner. Click to dismiss.
+#[component]
+pub fn Banner() -> Element {
+    let mut ui = use_context::<Ui>();
+    rsx! {
+        if let Some(msg) = ui.banner.read().clone() {
+            div {
+                class: "banner",
+                role: "alert",
+                onclick: move |_| ui.banner.set(None),
+                span { class: "glyph tone-bad" }
+                span { class: "banner-text", "{msg}" }
+                span { class: "banner-dismiss", "dismiss" }
+            }
+        }
+        if let Some(msg) = ui.note.read().clone() {
+            div {
+                class: "note",
+                role: "status",
+                onclick: move |_| ui.note.set(None),
+                span { class: "glyph tone-live" }
+                span { class: "banner-text", "{msg}" }
+            }
+        }
+    }
+}
+
+/// Render whichever dialog is currently open.
+#[component]
+pub fn ModalHost(snapshot: FleetSnapshot) -> Element {
+    let ui = use_context::<Ui>();
+    let current = ui.modal.read().clone();
+    match current {
+        Modal::Closed => rsx! {},
+        Modal::Confirm(action) => rsx! { ConfirmDialog { action } },
+        Modal::Launch { workspace } => rsx! { LaunchModal { workspace, snapshot } },
     }
 }
