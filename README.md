@@ -46,6 +46,7 @@ NDJSON client and does not depend on the caliban crates.
 | `prospero-api` | — | axum REST + SSE + embedded dashboard over `FleetManager` |
 | `prospero-daemon` | `prosperod` | Long-running control-plane daemon |
 | `prospero-cli` | `prospero` | Operator CLI (thin HTTP client over `prosperod`) |
+| `prospero-dashboard` | — | Dashboard v2: Dioxus → WASM SPA (outside the workspace — see below) |
 
 ## Usage
 
@@ -53,7 +54,8 @@ Start the daemon (serves the API + dashboard on `127.0.0.1:7878` by default):
 
 ```bash
 cargo run --bin prosperod
-# dashboard: http://127.0.0.1:7878
+# dashboard:    http://127.0.0.1:7878
+# dashboard v2: http://127.0.0.1:7878/v2   (Dioxus/WASM — in development, #95)
 ```
 
 Drive it with the CLI:
@@ -88,6 +90,38 @@ The test suite runs entirely against an in-process `FakeCaliband` harness (in
 `prospero-core`'s `testkit` feature) that speaks the real wire protocol over Unix
 sockets — so the whole control plane, including the end-to-end CLI path, is
 tested with no real caliban and no LLM calls.
+
+### Dashboard v2 (Dioxus/WASM)
+
+`crates/dashboard` is a Rust → WASM SPA served at `/v2`. It is **excluded from
+the cargo workspace** on purpose: the workspace gates and the 85% coverage floor
+run over members, and a wasm-only UI crate would either fail the host-target
+build or sink measured coverage. It has its own `Cargo.lock` and its own CI job.
+
+Its built bundle is **committed** to `crates/api/dashboard-v2/` and
+`include_bytes!`'d into prosperod, so an ordinary `cargo build` needs no wasm
+toolchain and one binary still ships the UI. Rebuild it after changing anything
+under `crates/dashboard/`:
+
+```bash
+scripts/build-dashboard.sh          # rebuild the bundle (then commit it)
+scripts/build-dashboard.sh --check  # is the committed bundle current?
+```
+
+Requirements: the `wasm32-unknown-unknown` target, a `wasm-bindgen` CLI **at the
+same version as the `wasm-bindgen` crate** (the script checks and tells you if
+they differ), and optionally `binaryen` for the `wasm-opt` size pass. Where the
+default toolchain has no wasm32 std — a Homebrew Rust, say — the script finds a
+rustup toolchain automatically, or set `CARGO_WASM` to one.
+
+CI enforces freshness with `--check`, which compares a recorded hash of the
+build *inputs* rather than diffing rebuilt bytes: wasm output is not
+reproducible across toolchains, so a byte diff would fail whenever CI's
+`rustc`/`wasm-opt` differed from yours.
+
+```bash
+cd crates/dashboard && cargo test    # view-model + meter logic, host target
+```
 
 ## Design docs
 

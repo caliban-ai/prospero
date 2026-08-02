@@ -95,9 +95,20 @@ same pattern as the existing `dashboard.rs`, adding no dependency.
 | Route | Content-Type |
 |---|---|
 | `GET /v2` | `text/html; charset=utf-8` |
-| `GET /v2/app.css` | `text/css; charset=utf-8` |
-| `GET /v2/prospero-dashboard.js` | `application/javascript; charset=utf-8` |
-| `GET /v2/prospero-dashboard_bg.wasm` | `application/wasm` |
+| `GET /v2/{*path}` | by extension (`application/wasm`, `text/css`, …) |
+
+**Correction (during implementation): the asset list is generated, not
+hardcoded.** wasm-bindgen emits per-dependency JS under
+`snippets/<crate>-<hash>/`, and those directory names carry content hashes that
+change whenever a dependency does. A fixed list of `include_bytes!` calls would
+rot silently — the glue would import a snippet the server no longer routes and
+the app would never boot. So `crates/api/build.rs` walks the bundle directory
+and generates the `(url_path, content_type, bytes)` table. Each entry is still
+an `include_bytes!`, so the bytes are embedded exactly as planned and no
+`rust-embed`/`mime_guess` dependency enters prosperod.
+
+Lookup is an exact match against that static table, so path traversal has
+nothing to traverse — `/v2/../Cargo.toml` simply misses and 404s.
 
 Asset URLs inside the HTML are **absolute** (`/v2/app.css`), so serving at `/v2`
 without a trailing slash cannot mis-resolve them.
@@ -114,6 +125,20 @@ connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'
 `'wasm-unsafe-eval'` is required for the module to instantiate. Everything else
 stays denied because the bundle is fully self-contained — no CDN, no external
 font, no remote image.
+
+**Two findings from running it, both fixed in the app rather than by loosening
+the policy:**
+
+1. An inline `<script type="module">` bootstrap is blocked by `script-src
+   'self'` (no `'unsafe-inline'`, no nonce). It moved to `boot.js`.
+2. Dioxus applies **inline `style` attributes**, which `style-src 'self'`
+   blocks. Every component was changed to set no `style` attribute at all; the
+   entrance stagger is expressed with `:nth-child` rules in the stylesheet.
+
+The page therefore runs under `default-src 'none'` with no `'unsafe-inline'`
+anywhere. A consequence worth stating: with no `font-src` grant, **no webfont
+can load — not even a self-hosted one.** Typography is a system-font stack by
+design, which also means the bundle renders correctly offline.
 
 ### Data flow
 
@@ -167,17 +192,29 @@ parts where bugs actually hide under test without a headless browser.
 with the expected content type and CSP header, that the wasm route serves
 `application/wasm`, and that `/` still serves the v1 dashboard unchanged.
 
-**CI — new `dashboard-wasm` job.** Installs the `wasm32-unknown-unknown` target
-and a pinned `wasm-bindgen-cli`, then:
+**CI — new `dashboard-wasm` job.** The crate is outside the workspace, so the
+`check` job never sees it; this is its gate. Installs the
+`wasm32-unknown-unknown` target, `wasm-bindgen-cli`, and binaryen, then runs
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, the freshness
+check, and the wasm build.
 
-1. runs `scripts/build-dashboard.sh`
-2. `git diff --exit-code crates/api/dashboard-v2/` — **proves the committed
-   bundle matches its sources**
-3. `cargo test -p prospero-dashboard`
-4. `cargo clippy -p prospero-dashboard --all-targets -- -D warnings`
+The freshness check is what makes committing a build artifact safe rather than a
+rot vector.
 
-Step 2 is what makes committing a build artifact safe instead of a rot vector: a
-stale bundle fails the build.
+**Correction (during implementation): freshness is checked by source hash, not
+by diffing rebuilt bytes.** The original plan was `git diff --exit-code` after a
+rebuild. That cannot work: wasm output is **not reproducible across toolchains**
+— a different `rustc` or `wasm-opt` version produces different bytes from
+identical sources — so CI would fail on every run whenever its toolchain
+differed from the committer's, which is most of the time.
+
+Instead `scripts/build-dashboard.sh` records a SHA-256 over its *inputs*
+(`src/**.rs`, `Cargo.toml`, `Cargo.lock`, `index.html`, `app.css`, `boot.js`)
+into `crates/api/dashboard-v2/SOURCE_HASH`, and `--check` recomputes and
+compares it. This enforces the property actually worth enforcing — *the bundle
+was regenerated after its sources last changed* — and is stable across
+toolchains. CI runs `--check` **before** the build, since the build overwrites
+the bundle in the working tree.
 
 ## Out of scope
 

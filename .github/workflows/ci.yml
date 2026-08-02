@@ -136,6 +136,56 @@ jobs:
       - name: cargo build -p prospero-types --target wasm32-unknown-unknown
         run: cargo build -p prospero-types --target wasm32-unknown-unknown
 
+  # Dashboard v2 (#97). The crate is excluded from the cargo workspace, so the
+  # `check` job above never sees it — this is its gate.
+  dashboard-wasm:
+    name: dashboard v2 wasm build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust toolchain (+ wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates/dashboard"
+      # Must match the wasm-bindgen crate version in crates/dashboard/Cargo.lock.
+      # scripts/build-dashboard.sh compares the two and fails loudly on skew,
+      # which is the failure this pin exists to prevent.
+      - name: Install wasm-bindgen-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: cargo fmt --check
+        run: cd crates/dashboard && cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cd crates/dashboard && cargo clippy --all-targets -- -D warnings
+      # The view-model and meter-allocation logic compiles for the host target,
+      # so it is testable without a headless browser.
+      - name: cargo test
+        run: cd crates/dashboard && cargo test
+      # crates/api/dashboard-v2/ is a COMMITTED build artifact — it is
+      # include_bytes!'d into prosperod so an ordinary `cargo build` needs no
+      # wasm toolchain. This proves it was regenerated after its sources last
+      # changed, so a stale bundle fails the build instead of shipping.
+      #
+      # It compares a recorded hash of the build INPUTS rather than diffing
+      # rebuilt bytes: wasm output is not reproducible across toolchains, so a
+      # byte diff would fail on every run whenever CI's rustc or wasm-opt
+      # differed from the committer's. Run before the build, which overwrites
+      # the bundle in the working tree.
+      - name: Committed bundle is fresh
+        run: scripts/build-dashboard.sh --check
+      - name: Build the wasm bundle
+        run: scripts/build-dashboard.sh
+
   coverage:
     name: line-coverage gate
     needs: check

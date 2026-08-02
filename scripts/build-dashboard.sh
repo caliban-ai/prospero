@@ -35,6 +35,58 @@ CRATE_DIR="crates/dashboard"
 OUT_DIR="crates/api/dashboard-v2"
 TARGET="wasm32-unknown-unknown"
 OUT_NAME="prospero-dashboard"
+STAMP="$OUT_DIR/SOURCE_HASH"
+
+# --- Staleness stamp ---------------------------------------------------------
+# The committed bundle must not drift from the sources it was built from, but a
+# byte-for-byte diff of a rebuilt .wasm CANNOT express that: wasm output is not
+# reproducible across machines — a different rustc or wasm-opt version yields
+# different bytes from identical sources, so CI would fail on every run for no
+# real reason.
+#
+# Instead the build records a hash of its INPUTS. Checking that hash proves the
+# bundle was regenerated after the last source change, which is the property
+# actually worth enforcing, and it is stable across toolchains.
+source_hash() {
+  local sha
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha=sha256sum
+  else
+    sha="shasum -a 256"
+  fi
+  {
+    find "$CRATE_DIR/src" -type f -name '*.rs' | LC_ALL=C sort
+    printf '%s\n' \
+      "$CRATE_DIR/Cargo.toml" "$CRATE_DIR/Cargo.lock" \
+      "$CRATE_DIR/index.html" "$CRATE_DIR/app.css" "$CRATE_DIR/boot.js"
+  } | xargs $sha | $sha | cut -d' ' -f1
+}
+
+# `--check` verifies the stamp without building — cheap enough to run first in
+# CI, before the (slow) wasm build.
+if [ "${1:-}" = "--check" ]; then
+  if [ ! -f "$STAMP" ]; then
+    echo "error: $STAMP is missing — run scripts/build-dashboard.sh and commit the bundle." >&2
+    exit 1
+  fi
+  want="$(cat "$STAMP")"
+  got="$(source_hash)"
+  if [ "$want" != "$got" ]; then
+    cat >&2 <<EOF
+error: the committed dashboard bundle is STALE.
+       $CRATE_DIR has changed since $OUT_DIR was last built.
+         recorded: $want
+         current:  $got
+
+  Rebuild and commit:
+    scripts/build-dashboard.sh
+    git add $OUT_DIR && git commit
+EOF
+    exit 1
+  fi
+  echo "committed dashboard bundle is fresh ✓ ($got)"
+  exit 0
+fi
 
 # --- 1. Resolve a cargo that can target wasm32 -------------------------------
 # The repo's default toolchain is not guaranteed to have the wasm32 std (a
@@ -157,5 +209,8 @@ fi
 # --- 5. Static assets --------------------------------------------------------
 cp "$CRATE_DIR/index.html" "$CRATE_DIR/app.css" "$CRATE_DIR/boot.js" "$OUT_DIR/"
 
-echo "==> bundle written to $OUT_DIR"
+# Record what this bundle was built from, so `--check` can prove it is current.
+source_hash > "$STAMP"
+
+echo "==> bundle written to $OUT_DIR (sources $(cat "$STAMP"))"
 ls -la "$OUT_DIR"
