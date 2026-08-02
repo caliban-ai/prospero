@@ -199,9 +199,19 @@ wasm-bindgen --target web --no-typescript \
 
 # --- 4. Shrink when binaryen is available (never required) -------------------
 if command -v wasm-opt >/dev/null 2>&1; then
-  echo "==> wasm-opt -Oz"
-  wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
-    "$OUT_DIR/${OUT_NAME}_bg.wasm" -o "$OUT_DIR/${OUT_NAME}_bg.wasm"
+  echo "==> wasm-opt -Oz ($(wasm-opt --version))"
+  # rustc emits post-MVP opcodes that older binaryen releases reject outright
+  # ("invalid code after misc prefix"). Enable them explicitly rather than
+  # relying on whatever the local binaryen defaults to — reference-types in
+  # particular (0xFC 17 = table.fill) is what a modern rustc emits.
+  wasm-opt -Oz \
+    --enable-bulk-memory \
+    --enable-nontrapping-float-to-int \
+    --enable-reference-types \
+    --enable-sign-ext \
+    --enable-multivalue \
+    "$OUT_DIR/${OUT_NAME}_bg.wasm" -o "$OUT_DIR/${OUT_NAME}_bg.wasm.opt"
+  mv "$OUT_DIR/${OUT_NAME}_bg.wasm.opt" "$OUT_DIR/${OUT_NAME}_bg.wasm"
 else
   echo "note: wasm-opt not found (brew install binaryen) — skipping the size pass."
 fi

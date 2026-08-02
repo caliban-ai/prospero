@@ -161,8 +161,12 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli
-      - name: Install binaryen (wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+      # Deliberately NO binaryen here. wasm-opt is an optional size pass, and
+      # apt's binaryen lags far enough behind rustc to reject its output
+      # outright ("invalid code after misc prefix" on a reference-types opcode).
+      # CI's job for this crate is to prove it compiles; the bytes that actually
+      # ship come from the committed bundle, which is optimised on the machine
+      # that builds it. The build script skips the pass when wasm-opt is absent.
       - name: cargo fmt --check
         run: cd crates/dashboard && cargo fmt --all -- --check
       - name: cargo clippy
