@@ -95,6 +95,7 @@ mod tests {
             health: prospero_core::WorkspaceHealth::Healthy,
             agent_count: 0,
             config: prospero_core::registry::RepoProviderConfig::default(),
+            source_specs: Vec::new(),
             display_name: None,
             providers: Vec::new(),
             default_provider: None,
@@ -102,5 +103,52 @@ mod tests {
         };
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["sources"][0]["name"], "a");
+        // A local workspace has no CR specs, so the key must not appear at all.
+        assert!(
+            j.get("source_specs").is_none(),
+            "local payload gained a k8s key: {j}"
+        );
+    }
+
+    /// `sources` is the *discovered* view (name + path) — all a local checkout
+    /// has. A k8s workspace additionally carries the git remote and ref, and
+    /// the v2 config editor needs those to round-trip an edit: without them an
+    /// operator would face blank remote fields and have to retype every one
+    /// from memory. (#175)
+    #[test]
+    fn source_specs_carry_the_remote_and_ref_that_sources_loses() {
+        let s = WorkspaceSummary {
+            name: "ws".into(),
+            root: String::new(),
+            sources: vec![prospero_core::Source {
+                name: "caliban".into(),
+                path: "/work/caliban".into(),
+            }],
+            health: prospero_core::WorkspaceHealth::Healthy,
+            agent_count: 0,
+            config: prospero_core::registry::RepoProviderConfig::default(),
+            source_specs: vec![prospero_types::WorkspaceSourceSpec {
+                name: "caliban".into(),
+                repo: "git@github.com:caliban-ai/caliban.git".into(),
+                r#ref: Some("main".into()),
+                path: "/work/caliban".into(),
+            }],
+            display_name: None,
+            providers: Vec::new(),
+            default_provider: None,
+            status: None,
+        };
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            j["source_specs"][0]["repo"],
+            "git@github.com:caliban-ai/caliban.git"
+        );
+        assert_eq!(j["source_specs"][0]["ref"], "main");
+        // And it round-trips back, which is what the dashboard depends on.
+        let back: WorkspaceSummary = serde_json::from_value(j).unwrap();
+        assert_eq!(
+            back.source_specs[0].repo,
+            "git@github.com:caliban-ai/caliban.git"
+        );
     }
 }

@@ -1188,3 +1188,109 @@ textarea.input {
   color: var(--tone-bad);
   margin: var(--sp-2) 0 0;
 }
+
+/* --- Config editor rows ----------------------------------------------------- */
+.section-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  margin: var(--sp-4) 0 var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--hairline);
+}
+
+.cfg-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* Repeatable rows wrap rather than overflow: a provider row carries six fields
+   and must stay usable in a modal, not scroll sideways. */
+.cfg-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.cfg-row .input {
+  flex: 1 1 96px;
+  min-width: 80px;
+  width: auto;
+  font-size: 12.5px;
+  padding: 5px 8px;
+}
+
+.cfg-row .input.cfg-grow {
+  flex: 2 1 160px;
+}
+
+.cfg-row .input.cfg-narrow {
+  flex: 0 1 92px;
+}
+
+.cfg-default {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.cfg-default input {
+  accent-color: var(--accent);
+}
+
+.row-add {
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--accent);
+  cursor: pointer;
+  padding: var(--sp-2) 0 0;
+}
+
+.row-add:hover {
+  text-decoration: underline;
+}
+
+.field-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--ink-muted);
+  margin-top: var(--sp-1);
+  line-height: 1.4;
+}
+
+/* Distinct from .form-error: this is "you are about to lose something",
+   not "this was rejected". */
+.form-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  font-size: 12.5px;
+  color: var(--tone-wait);
+  background: var(--tone-wait-wash);
+  border: 1px solid var(--tone-wait);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+  margin: var(--sp-3) 0 0;
+  line-height: 1.45;
+}
+
+.form-warning .glyph {
+  margin-top: 4px;
+}
+
+/* The config modal is the tallest thing here; let it scroll inside the scrim
+   rather than pushing the page. */
+.modal-wide {
+  max-height: 84vh;
+  overflow-y: auto;
+}

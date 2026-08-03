@@ -3,9 +3,12 @@
 //! and the logic stays testable on the host target.
 
 use dioxus::prelude::*;
-use prospero_types::{Agent, Capabilities, FleetSnapshot, SpawnBody, Workspace};
+use prospero_types::{
+    AddWorkspaceBody, Agent, Capabilities, FleetSnapshot, SpawnBody, Workspace, WorkspaceSummary,
+};
 
 use crate::actions::Action;
+use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
 use crate::view_model::{
     AgentControls, FleetTotals, StatusCounts, awaits_input, basename, controls_for, count_statuses,
     elapsed, health_reason, is_healthy, is_launchable, short_id, status_label, status_tone, totals,
@@ -29,6 +32,10 @@ pub struct Ui {
     pub caps: Signal<Capabilities>,
     /// Bumped after a successful mutation to force an immediate refetch.
     pub refresh: Signal<u32>,
+    /// `GET /api/workspaces` summaries, keyed by name. `FleetSnapshot` carries
+    /// neither the named providers nor the k8s reconciliation status, so the
+    /// config editor and the provider picker need this second read.
+    pub workspaces: Signal<Vec<WorkspaceSummary>>,
     /// Browser clock, in epoch milliseconds, sampled once per render pass.
     pub now_ms: Signal<f64>,
 }
@@ -51,6 +58,13 @@ pub enum Modal {
     Launch {
         /// Workspace the launch button belonged to.
         workspace: String,
+    },
+    /// Register a new workspace.
+    AddWorkspace,
+    /// Edit an existing workspace's configuration.
+    EditWorkspace {
+        /// Which workspace to edit.
+        name: String,
     },
 }
 
@@ -114,12 +128,21 @@ fn ConnectionState(freshness: Freshness) -> Element {
 /// The whole overview: stat row plus a card per workspace.
 #[component]
 pub fn Overview(snapshot: FleetSnapshot) -> Element {
+    let mut ui = use_context::<Ui>();
+    let admin = ui.caps.read().admin;
     let t = totals(&snapshot);
     rsx! {
         StatRow { totals: t }
         div { class: "section-head",
             h2 { class: "section-title", "Workspaces" }
             span { class: "section-rule" }
+            if admin {
+                button {
+                    class: "btn btn-sm",
+                    onclick: move |_| ui.modal.set(Modal::AddWorkspace),
+                    "+ Add workspace"
+                }
+            }
         }
         if snapshot.workspaces.is_empty() {
             EmptyState {}
@@ -185,6 +208,30 @@ fn WorkspaceCard(workspace: Workspace) -> Element {
     let name = workspace.name.clone();
     let remove_name = workspace.name.clone();
     let counts = count_statuses(&workspace.agents);
+    // Reconciliation status and named providers live only on /api/workspaces —
+    // FleetSnapshot carries neither.
+    let summary = ui
+        .workspaces
+        .read()
+        .iter()
+        .find(|w| w.name == workspace.name)
+        .cloned();
+    let status = summary.as_ref().and_then(|s| s.status.clone());
+    let providers: Vec<String> = summary
+        .as_ref()
+        .map(|s| {
+            s.providers
+                .iter()
+                .map(|p| {
+                    if Some(p.name.as_str()) == s.default_provider.as_deref() {
+                        format!("{}*", p.name)
+                    } else {
+                        p.name.clone()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let card_class = if healthy {
         "card reveal is-healthy"
     } else {
@@ -207,8 +254,16 @@ fn WorkspaceCard(workspace: Workspace) -> Element {
                 div { class: "card-ident",
                     h3 { class: "card-title", "{workspace.name}" }
                     div { class: "card-sub", "{sources}" }
+                    if !providers.is_empty() {
+                        div { class: "card-sub", title: "* is the default provider",
+                            "providers: {providers.join(\" · \")}"
+                        }
+                    }
                 }
-                HealthPill { workspace: workspace.clone() }
+                match status {
+                    Some(s) => rsx! { StatusPill { status: s } },
+                    None => rsx! { HealthPill { workspace: workspace.clone() } },
+                }
             }
             div { class: "card-controls",
                 if launchable {
@@ -221,11 +276,7 @@ fn WorkspaceCard(workspace: Workspace) -> Element {
                 // Registry controls only exist when the backend wired an admin
                 // plane; under a backend without one they would 405.
                 if admin {
-                    ControlButton {
-                        action: Action::RemoveWorkspace { name: remove_name.clone() },
-                        label: "Remove".to_string(),
-                        danger: true,
-                    }
+                    WorkspaceAdminControls { name: remove_name.clone() }
                 }
             }
             div { class: "card-body",
@@ -687,6 +738,7 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
         .collect();
 
     let mut target = use_signal(|| workspace.clone());
+    let mut provider_ref = use_signal(String::new);
     let mut prompt = use_signal(String::new);
     let mut label = use_signal(String::new);
     let mut model = use_signal(String::new);
@@ -696,6 +748,26 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
     let mut advanced = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
+
+    // (value, display) for the currently selected workspace's providers.
+    let providers_for_target: Vec<(String, String)> = ui
+        .workspaces
+        .read()
+        .iter()
+        .find(|w| w.name == target())
+        .map(|w| {
+            w.providers
+                .iter()
+                .map(|p| {
+                    let display = match &p.model {
+                        Some(m) => format!("{} · {} · {m}", p.name, p.kind),
+                        None => format!("{} · {}", p.name, p.kind),
+                    };
+                    (p.name.clone(), display)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let submit = move |_| {
         let ws = target().trim().to_string();
@@ -727,7 +799,7 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
             },
             interactive: interactive(),
             frontmatter_path: None,
-            provider_ref: None,
+            provider_ref: non_empty(provider_ref()),
         };
         busy.set(true);
         error.set(None);
@@ -758,10 +830,40 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
                     span { class: "field-label", "Workspace" }
                     select {
                         class: "input",
-                        value: "{target}",
                         onchange: move |e| target.set(e.value()),
                         for name in launchable.iter() {
-                            option { key: "{name}", value: "{name}", "{name}" }
+                            option {
+                                key: "{name}",
+                                value: "{name}",
+                                selected: target() == *name,
+                                "{name}"
+                            }
+                        }
+                    }
+                }
+
+                // k8s only: an agent binds one of the workspace's named
+                // providers. Repopulates when the workspace changes, since the
+                // provider list belongs to the workspace.
+                if !providers_for_target.is_empty() {
+                    label { class: "field",
+                        span { class: "field-label", "Provider" }
+                        select {
+                            class: "input",
+                            onchange: move |e| provider_ref.set(e.value()),
+                            option {
+                                value: "",
+                                selected: provider_ref().is_empty(),
+                                "(workspace default)"
+                            }
+                            for p in providers_for_target.iter() {
+                                option {
+                                    key: "{p.0}",
+                                    value: "{p.0}",
+                                    selected: provider_ref() == p.0,
+                                    "{p.1}"
+                                }
+                            }
                         }
                     }
                 }
@@ -965,5 +1067,493 @@ pub fn ModalHost(snapshot: FleetSnapshot) -> Element {
         Modal::Closed => rsx! {},
         Modal::Confirm(action) => rsx! { ConfirmDialog { action } },
         Modal::Launch { workspace } => rsx! { LaunchModal { workspace, snapshot } },
+        Modal::AddWorkspace => rsx! { WorkspaceModal { existing: None } },
+        Modal::EditWorkspace { name } => rsx! { WorkspaceModal { existing: Some(name) } },
+    }
+}
+
+// --- Workspace configuration ------------------------------------------------
+
+/// Reconciliation status of a k8s workspace. Local workspaces report none and
+/// show caliband reachability instead.
+#[component]
+fn StatusPill(status: prospero_types::WorkspaceStatusInfo) -> Element {
+    let phase = status.phase.to_lowercase();
+    let tone = match phase.as_str() {
+        "ready" => "live",
+        "failed" => "bad",
+        _ => "wait",
+    };
+    let title = status.message.clone().unwrap_or_else(|| phase.clone());
+    rsx! {
+        span { class: "pill tone-{tone}", title: "{title}",
+            span { class: "glyph tone-{tone}" }
+            "{phase}"
+        }
+    }
+}
+
+/// The registry controls on a workspace card: configure and remove.
+#[component]
+fn WorkspaceAdminControls(name: String) -> Element {
+    let mut ui = use_context::<Ui>();
+    let edit_name = name.clone();
+    rsx! {
+        button {
+            class: "act-btn",
+            title: "Configure this workspace",
+            onclick: move |evt| {
+                evt.stop_propagation();
+                ui.modal.set(Modal::EditWorkspace { name: edit_name.clone() });
+            },
+            "Configure"
+        }
+        ControlButton {
+            action: Action::RemoveWorkspace { name: name.clone() },
+            label: "Remove".to_string(),
+            danger: true,
+        }
+    }
+}
+
+/// Add-a-workspace and edit-configuration share one form; only the identity
+/// fields and the submit call differ.
+#[component]
+fn WorkspaceModal(existing: Option<String>) -> Element {
+    let mut ui = use_context::<Ui>();
+    let is_k8s = ui.caps.read().async_workspace_ops;
+    let editing = existing.clone();
+
+    // Prefill from the read side when editing.
+    let summary = existing
+        .as_ref()
+        .and_then(|n| ui.workspaces.read().iter().find(|w| &w.name == n).cloned());
+
+    let mut name = use_signal(|| existing.clone().unwrap_or_default());
+    let mut root = use_signal(|| summary.as_ref().map(|s| s.root.clone()).unwrap_or_default());
+
+    let local = use_signal(|| match &summary {
+        Some(s) => LocalForm::from_config(&s.config),
+        None => LocalForm::default(),
+    });
+    let k8s = use_signal(|| match &summary {
+        Some(s) => K8sForm::from_summary(
+            s.display_name.as_deref(),
+            &s.source_specs,
+            &s.providers,
+            s.default_provider.as_deref(),
+        ),
+        None => K8sForm::blank(),
+    });
+
+    // Which providers the server says already hold credentials. The API never
+    // returns the Secret reference itself, so this is the only way to warn that
+    // saving without re-entering it would strip the credential.
+    let had_credentials: Vec<String> = summary
+        .as_ref()
+        .map(|s| {
+            s.providers
+                .iter()
+                .filter(|p| p.has_credentials)
+                .map(|p| p.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Env rows live outside the two form structs so one component can edit
+    // them for either shape; they are folded back in at submit.
+    let env = use_signal(|| match &summary {
+        Some(s) => s
+            .config
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    });
+
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+
+    let title = if editing.is_some() {
+        "Configure workspace"
+    } else {
+        "Add workspace"
+    };
+
+    let warning = if is_k8s {
+        let refs: Vec<&str> = had_credentials.iter().map(String::as_str).collect();
+        k8s.read().credentials_warning(&refs)
+    } else {
+        None
+    };
+
+    let submit = move |_| {
+        let ws_name = name().trim().to_string();
+        if ws_name.is_empty() {
+            error.set(Some("A name is required.".into()));
+            return;
+        }
+        let checkout = root().trim().to_string();
+        if editing.is_none() && !is_k8s && checkout.is_empty() {
+            error.set(Some("A checkout path is required.".into()));
+            return;
+        }
+
+        let validated = if is_k8s {
+            let mut f = k8s.read().clone();
+            f.env = env();
+            f.validate().map(|()| f.to_config())
+        } else {
+            let mut f = local.read().clone();
+            f.env = env();
+            f.validate().map(|()| f.to_config())
+        };
+        let config = match validated {
+            Ok(c) => c,
+            Err(e) => {
+                error.set(Some(e));
+                return;
+            }
+        };
+
+        let editing = editing.clone();
+        busy.set(true);
+        error.set(None);
+        spawn(async move {
+            let result = match &editing {
+                Some(existing) => crate::api::set_workspace_config(existing, &config).await,
+                None => {
+                    let body = AddWorkspaceBody {
+                        name: ws_name.clone(),
+                        root: checkout,
+                        config,
+                    };
+                    crate::api::add_workspace(&body).await
+                }
+            };
+            match result {
+                Ok(()) => {
+                    // Under k8s the write is accepted, not applied — the
+                    // operator should expect a reconcile, not a finished change.
+                    ui.note.set(Some(if is_k8s {
+                        format!("{ws_name} accepted — reconciling.")
+                    } else if editing.is_some() {
+                        format!("{ws_name} updated.")
+                    } else {
+                        format!("{ws_name} registered.")
+                    }));
+                    ui.banner.set(None);
+                    ui.request_refresh();
+                    ui.modal.set(Modal::Closed);
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    rsx! {
+        Scrim {
+            div { class: "modal modal-wide", role: "dialog", aria_modal: "true",
+                h2 { class: "modal-title", "{title}" }
+
+                label { class: "field",
+                    span { class: "field-label", "Name" }
+                    input {
+                        class: "input",
+                        value: "{name}",
+                        disabled: existing.is_some(),
+                        placeholder: "my-workspace",
+                        oninput: move |e| name.set(e.value()),
+                    }
+                }
+
+                // The local backend needs a checkout path; k8s derives its
+                // sources from the config below instead.
+                if existing.is_none() && !is_k8s {
+                    label { class: "field",
+                        span { class: "field-label", "Checkout path" }
+                        input {
+                            class: "input",
+                            placeholder: "/path/to/workspace",
+                            value: "{root}",
+                            oninput: move |e| root.set(e.value()),
+                        }
+                    }
+                }
+
+                if is_k8s {
+                    K8sFields { form: k8s, env }
+                } else {
+                    LocalFields { form: local, env }
+                }
+
+                if let Some(w) = warning {
+                    p { class: "form-warning",
+                        span { class: "glyph tone-wait" }
+                        "{w}"
+                    }
+                }
+                if let Some(e) = error() {
+                    p { class: "form-error", "{e}" }
+                }
+
+                div { class: "modal-actions",
+                    button {
+                        class: "btn",
+                        disabled: busy(),
+                        onclick: move |_| ui.modal.set(Modal::Closed),
+                        "Cancel"
+                    }
+                    button {
+                        class: "btn btn-primary",
+                        disabled: busy(),
+                        onclick: submit,
+                        if busy() { "Saving…" } else { "Save" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The local backend's single-provider fields.
+#[component]
+fn LocalFields(form: Signal<LocalForm>, env: Signal<Vec<(String, String)>>) -> Element {
+    let mut form = form;
+    let mut show_env = use_signal(|| !env.read().is_empty());
+
+    rsx! {
+        label { class: "field",
+            span { class: "field-label", "Provider" }
+            select {
+                class: "input",
+                onchange: move |e| form.write().provider = e.value(),
+                // `selected` on the option, not `value` on the select: a
+                // select's value is a DOM property, and the attribute does not
+                // pre-select anything — the prefill silently did nothing.
+                option {
+                    value: "",
+                    selected: form.read().provider.is_empty(),
+                    "(backend default)"
+                }
+                for kind in PROVIDER_KINDS.iter() {
+                    option {
+                        key: "{kind}",
+                        value: "{kind}",
+                        selected: form.read().provider == *kind,
+                        "{kind}"
+                    }
+                }
+            }
+        }
+        label { class: "field",
+            span { class: "field-label", "Base URL" }
+            input {
+                class: "input",
+                placeholder: "http://host:11434",
+                value: "{form.read().base_url}",
+                oninput: move |e| form.write().base_url = e.value(),
+            }
+        }
+        label { class: "field",
+            span { class: "field-label", "API key from env var" }
+            input {
+                class: "input",
+                placeholder: "e.g. ANTHROPIC_API_KEY",
+                value: "{form.read().api_key_from_env}",
+                oninput: move |e| form.write().api_key_from_env = e.value(),
+            }
+            // The distinction that keeps secrets out of the config store.
+            span { class: "field-hint",
+                "The NAME of a variable in prosperod's environment — never the key itself."
+            }
+        }
+
+        button { class: "disclosure", onclick: move |_| show_env.toggle(),
+            if show_env() { "▾ Environment overrides" } else { "▸ Environment overrides" }
+        }
+        if show_env() {
+            EnvRows { rows: env }
+        }
+    }
+}
+
+/// The k8s `Workspace`-CR fields: sources, named providers, env.
+#[component]
+fn K8sFields(form: Signal<K8sForm>, env: Signal<Vec<(String, String)>>) -> Element {
+    let mut form = form;
+    let mut show_env = use_signal(|| !env.read().is_empty());
+
+    rsx! {
+        label { class: "field",
+            span { class: "field-label", "Display name" }
+            input {
+                class: "input",
+                placeholder: "Team A",
+                value: "{form.read().display_name}",
+                oninput: move |e| form.write().display_name = e.value(),
+            }
+        }
+
+        div { class: "section-label", "Sources" }
+        div { class: "cfg-rows",
+            for i in 0..form.read().sources.len() {
+                div { key: "src-{i}", class: "cfg-row",
+                    input {
+                        class: "input",
+                        placeholder: "name",
+                        value: "{form.read().sources[i].name}",
+                        oninput: move |e| form.write().sources[i].name = e.value(),
+                    }
+                    input {
+                        class: "input cfg-grow",
+                        placeholder: "git remote",
+                        value: "{form.read().sources[i].repo}",
+                        oninput: move |e| form.write().sources[i].repo = e.value(),
+                    }
+                    input {
+                        class: "input cfg-narrow",
+                        placeholder: "ref (main)",
+                        value: "{form.read().sources[i].r#ref}",
+                        oninput: move |e| form.write().sources[i].r#ref = e.value(),
+                    }
+                    input {
+                        class: "input",
+                        placeholder: "/work/name",
+                        value: "{form.read().sources[i].path}",
+                        oninput: move |e| form.write().sources[i].path = e.value(),
+                    }
+                    button {
+                        class: "act-btn danger",
+                        onclick: move |_| { form.write().sources.remove(i); },
+                        "×"
+                    }
+                }
+            }
+        }
+        button {
+            class: "row-add",
+            onclick: move |_| form.write().sources.push(SourceRow::default()),
+            "+ add source"
+        }
+
+        div { class: "section-label", "Providers" }
+        div { class: "cfg-rows",
+            for i in 0..form.read().providers.len() {
+                div { key: "prov-{i}", class: "cfg-row",
+                    input {
+                        class: "input",
+                        placeholder: "name",
+                        value: "{form.read().providers[i].name}",
+                        oninput: move |e| form.write().providers[i].name = e.value(),
+                    }
+                    select {
+                        class: "input cfg-narrow",
+                        onchange: move |e| form.write().providers[i].kind = e.value(),
+                        for kind in PROVIDER_KINDS.iter() {
+                            option {
+                                key: "{kind}",
+                                value: "{kind}",
+                                selected: form.read().providers[i].kind == *kind,
+                                "{kind}"
+                            }
+                        }
+                    }
+                    input {
+                        class: "input",
+                        placeholder: "model",
+                        value: "{form.read().providers[i].model}",
+                        oninput: move |e| form.write().providers[i].model = e.value(),
+                    }
+                    input {
+                        class: "input",
+                        placeholder: "secret name",
+                        value: "{form.read().providers[i].secret_name}",
+                        oninput: move |e| form.write().providers[i].secret_name = e.value(),
+                    }
+                    input {
+                        class: "input cfg-narrow",
+                        placeholder: "key",
+                        value: "{form.read().providers[i].secret_key}",
+                        oninput: move |e| form.write().providers[i].secret_key = e.value(),
+                    }
+                    label { class: "cfg-default", title: "Bound when an agent requests no provider",
+                        input {
+                            r#type: "radio",
+                            checked: form.read().default_provider.as_deref()
+                                == Some(form.read().providers[i].name.as_str()),
+                            onchange: move |_| {
+                                let n = form.read().providers[i].name.clone();
+                                form.write().default_provider = Some(n);
+                            },
+                        }
+                        span { "default" }
+                    }
+                    button {
+                        class: "act-btn danger",
+                        onclick: move |_| { form.write().providers.remove(i); },
+                        "×"
+                    }
+                }
+            }
+        }
+        button {
+            class: "row-add",
+            onclick: move |_| {
+                form.write().providers.push(ProviderRow {
+                    kind: PROVIDER_KINDS[0].to_string(),
+                    ..Default::default()
+                });
+            },
+            "+ add provider"
+        }
+        span { class: "field-hint",
+            "Credentials are referenced by Secret name and key — the value is never sent or shown."
+        }
+
+        button { class: "disclosure", onclick: move |_| show_env.toggle(),
+            if show_env() { "▾ Environment overrides" } else { "▸ Environment overrides" }
+        }
+        if show_env() {
+            EnvRows { rows: env }
+        }
+    }
+}
+
+/// Repeatable KEY/VALUE rows, shared by both form shapes.
+#[component]
+fn EnvRows(rows: Signal<Vec<(String, String)>>) -> Element {
+    let mut rows = rows;
+    rsx! {
+        div { class: "cfg-rows",
+            for i in 0..rows.read().len() {
+                div { key: "env-{i}", class: "cfg-row",
+                    input {
+                        class: "input",
+                        placeholder: "KEY",
+                        value: "{rows.read()[i].0}",
+                        oninput: move |e| rows.write()[i].0 = e.value(),
+                    }
+                    input {
+                        class: "input cfg-grow",
+                        placeholder: "VALUE",
+                        value: "{rows.read()[i].1}",
+                        oninput: move |e| rows.write()[i].1 = e.value(),
+                    }
+                    button {
+                        class: "act-btn danger",
+                        onclick: move |_| { rows.write().remove(i); },
+                        "×"
+                    }
+                }
+            }
+        }
+        button {
+            class: "row-add",
+            onclick: move |_| rows.write().push((String::new(), String::new())),
+            "+ add variable"
+        }
     }
 }
