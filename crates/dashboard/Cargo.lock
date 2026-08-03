@@ -2068,7 +2068,9 @@ dependencies = [
  "dioxus",
  "gloo-net 0.7.0",
  "gloo-timers",
+ "js-sys",
  "prospero-types",
+ "serde",
  "serde_json",
 ]
 
