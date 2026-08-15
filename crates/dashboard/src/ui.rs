@@ -4,11 +4,13 @@
 
 use dioxus::prelude::*;
 use prospero_types::{
-    AddWorkspaceBody, Agent, Capabilities, FleetSnapshot, SpawnBody, Workspace, WorkspaceSummary,
+    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetEvent, FleetSnapshot, SpawnBody,
+    Workspace, WorkspaceSummary,
 };
 
 use crate::actions::Action;
 use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
+use crate::stream::{Entry, StreamSession, StreamState};
 use crate::view_model::{
     AgentControls, FleetTotals, StatusCounts, awaits_input, basename, controls_for, count_statuses,
     elapsed, health_reason, is_healthy, is_launchable, short_id, status_label, status_tone, totals,
@@ -32,6 +34,8 @@ pub struct Ui {
     pub caps: Signal<Capabilities>,
     /// Bumped after a successful mutation to force an immediate refetch.
     pub refresh: Signal<u32>,
+    /// The agent whose stream is open, if any.
+    pub selected: Signal<Option<Agent>>,
     /// `GET /api/workspaces` summaries, keyed by name. `FleetSnapshot` carries
     /// neither the named providers nor the k8s reconciliation status, so the
     /// config editor and the provider picker need this second read.
@@ -143,6 +147,9 @@ pub fn Overview(snapshot: FleetSnapshot) -> Element {
                     "+ Add workspace"
                 }
             }
+        }
+        if let Some(agent) = ui.selected.read().clone() {
+            StreamPane { key: "{agent.id}", agent }
         }
         if snapshot.workspaces.is_empty() {
             EmptyState {}
@@ -353,15 +360,24 @@ fn LegendItem(tone: String, label: String, count: usize) -> Element {
 
 #[component]
 fn AgentRow(agent: Agent) -> Element {
-    let ui = use_context::<Ui>();
+    let mut ui = use_context::<Ui>();
     let tone = status_tone(agent.status);
+    let is_open = ui
+        .selected
+        .read()
+        .as_ref()
+        .is_some_and(|a| a.id == agent.id);
+    let row_class = if is_open { "agent is-open" } else { "agent" };
     let age = elapsed(&agent.started_at, *ui.now_ms.read());
     let controls = controls_for(agent.status);
     let wants_input = awaits_input(&agent);
 
+    let open = agent.clone();
     rsx! {
-        div { class: "agent",
-            div { class: "agent-line",
+        div { class: "{row_class}",
+            div {
+                class: "agent-line",
+                onclick: move |_| ui.selected.set(Some(open.clone())),
                 span { class: "agent-id", "{short_id(&agent.id)}" }
                 span { class: "agent-name", "{agent.name}" }
                 span { class: "agent-tags",
@@ -1555,5 +1571,171 @@ fn EnvRows(rows: Signal<Vec<(String, String)>>) -> Element {
             onclick: move |_| rows.write().push((String::new(), String::new())),
             "+ add variable"
         }
+    }
+}
+
+// --- Agent stream -----------------------------------------------------------
+
+/// The live event stream for one agent: replay history, then tail.
+#[component]
+pub fn StreamPane(agent: Agent) -> Element {
+    let mut ui = use_context::<Ui>();
+    let id = agent.id.clone();
+    let mut session = use_signal(|| StreamSession::new(id.clone()));
+
+    // Re-open whenever the selected agent changes. The loop owns reconnection:
+    // `follow` returns when the connection ends, and the session decides
+    // whether that was a finish or a failure.
+    use_future(move || {
+        let id = id.clone();
+        async move {
+            // A different agent may have been selected while this was starting.
+            if session.peek().agent_id != id {
+                session.set(StreamSession::new(id.clone()));
+            }
+            loop {
+                let from = session.peek().resume_from();
+                crate::sse::follow(&id, from, |incoming| {
+                    let mut s = session.write();
+                    crate::sse::apply(&mut s, incoming);
+                })
+                .await;
+
+                if !session.peek().should_retry() {
+                    break;
+                }
+                let wait = session.peek().backoff();
+                gloo_timers::future::sleep(wait).await;
+            }
+        }
+    });
+
+    let current = session.read().clone();
+    let tone = match &current.state {
+        StreamState::Live | StreamState::Connecting => "live",
+        StreamState::Reconnecting { .. } => "wait",
+        StreamState::Closed => "done",
+    };
+    let label = match &current.state {
+        StreamState::Connecting => "connecting".to_string(),
+        StreamState::Live => "live".to_string(),
+        // Say which attempt, so a slow recovery doesn't look like a hang.
+        StreamState::Reconnecting { attempt } => format!("reconnecting ({attempt})"),
+        StreamState::Closed => "finished".to_string(),
+    };
+
+    rsx! {
+        section { class: "stream",
+            div { class: "stream-head",
+                div { class: "card-ident",
+                    h3 { class: "card-title", "{agent.name}" }
+                    div { class: "card-sub", "{agent.id}" }
+                }
+                span { class: "pill tone-{tone}",
+                    span { class: "glyph tone-{tone}" }
+                    "{label}"
+                }
+                button {
+                    class: "act-btn",
+                    onclick: move |_| ui.selected.set(None),
+                    "Close"
+                }
+            }
+            div { class: "stream-body",
+                if current.entries.is_empty() {
+                    div { class: "stream-empty",
+                        if current.state.is_problem() {
+                            "Waiting to reconnect…"
+                        } else {
+                            "No output yet."
+                        }
+                    }
+                }
+                for (i , entry) in current.entries.iter().enumerate() {
+                    match entry {
+                        Entry::Event(ev) => rsx! {
+                            StreamEvent { key: "e{i}", event: (**ev).clone() }
+                        },
+                        // Rendered inline so the timeline is honest about being
+                        // discontinuous rather than quietly skipping.
+                        Entry::Gap { skipped } => rsx! {
+                            div { key: "g{i}", class: "stream-gap",
+                                span { class: "glyph tone-wait" }
+                                "{skipped} events were dropped and replayed from the store"
+                            }
+                        },
+                        Entry::Undecodable { why } => rsx! {
+                            div { key: "u{i}", class: "stream-gap is-bad",
+                                span { class: "glyph tone-bad" }
+                                "could not decode a frame — {why}"
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One event line.
+#[component]
+fn StreamEvent(event: FleetEvent) -> Element {
+    let seq = event.seq;
+    match &event.kind {
+        EventKind::Output { chunk, .. } => rsx! {
+            pre { class: "ev-out", "{chunk}" }
+        },
+        EventKind::ToolStarted { name, .. } => rsx! {
+            div { class: "ev-line",
+                span { class: "ev-seq", "{seq}" }
+                span { class: "ev-tool", "{name}" }
+                span { class: "ev-kind", "started" }
+            }
+        },
+        EventKind::ToolFinished { id, name, ok } => rsx! {
+            div { class: "ev-line",
+                span { class: "ev-seq", "{seq}" }
+                // Caliban's ToolCallEnd omits the name (#106); fall back to the
+                // correlation id so the row is never blank.
+                span { class: "ev-tool",
+                    if name.is_empty() { "{id}" } else { "{name}" }
+                }
+                span { class: if *ok { "pill tone-done" } else { "pill tone-bad" },
+                    if *ok { "ok" } else { "failed" }
+                }
+            }
+        },
+        EventKind::AgentFinished {
+            outcome,
+            turns,
+            cost_usd,
+        } => rsx! {
+            div { class: "ev-finish",
+                span { class: "glyph tone-done" }
+                "finished · {outcome} · {turns} turns · ${cost_usd:.4}"
+            }
+        },
+        other => rsx! {
+            div { class: "ev-line",
+                span { class: "ev-seq", "{seq}" }
+                span { class: "ev-kind", "{kind_label(other)}" }
+            }
+        },
+    }
+}
+
+/// Short label for the event kinds without a dedicated row.
+fn kind_label(kind: &EventKind) -> String {
+    match kind {
+        EventKind::AgentInit { model, .. } => format!("init · {model}"),
+        EventKind::StatusChanged { from, to } => {
+            format!("{} → {}", status_label(*from), status_label(*to))
+        }
+        EventKind::StorePersistFailed { lost_seq, .. } => {
+            format!("store append failed at seq {lost_seq}")
+        }
+        EventKind::RepoHealth { .. } => "workspace health".into(),
+        // Every other kind has its own row; this is the catch-all.
+        _ => "event".into(),
     }
 }

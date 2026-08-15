@@ -35,11 +35,10 @@ pub(crate) enum Step {
 }
 
 /// Payload of a `gap` SSE event: `skipped` events were dropped after `last_seq`.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct GapSignal {
-    pub skipped: u64,
-    pub last_seq: u64,
-}
+///
+/// Shared with the WASM dashboard via `prospero-types` (#178) so the client
+/// deserialises the exact type the server sends.
+pub(crate) use prospero_types::GapSignal;
 
 /// Source of persisted events for replay-based self-heal.
 #[async_trait]

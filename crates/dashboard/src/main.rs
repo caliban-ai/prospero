@@ -16,6 +16,8 @@ use prospero_types::{Capabilities, FleetSnapshot};
 mod actions;
 mod api;
 mod config_form;
+mod sse;
+mod stream;
 mod ui;
 mod view_model;
 
@@ -67,6 +69,7 @@ fn App() -> Element {
         }),
         refresh: Signal::new(0),
         workspaces: Signal::new(Vec::new()),
+        selected: Signal::new(None),
         now_ms: Signal::new(now_ms()),
     });
 

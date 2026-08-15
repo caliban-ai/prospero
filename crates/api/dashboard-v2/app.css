@@ -1294,3 +1294,110 @@ textarea.input {
   max-height: 84vh;
   overflow-y: auto;
 }
+
+/* --- Agent stream ----------------------------------------------------------- */
+.agent-line {
+  cursor: pointer;
+}
+
+.agent.is-open {
+  background: var(--accent-wash);
+}
+
+.stream {
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  margin-bottom: var(--sp-5);
+  overflow: hidden;
+}
+
+.stream-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--hairline);
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 1;
+}
+
+.stream-body {
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: var(--sp-3) var(--sp-4);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.stream-empty {
+  color: var(--ink-muted);
+  font-style: italic;
+  padding: var(--sp-4) 0;
+  font-family: var(--font-ui);
+}
+
+/* Agent output keeps its own whitespace; everything else is a structured row. */
+.ev-out {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+
+.ev-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 1px 0;
+}
+
+.ev-seq {
+  color: var(--ink-muted);
+  font-size: 10.5px;
+  min-width: 3ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ev-tool {
+  color: var(--accent);
+}
+
+.ev-kind {
+  color: var(--ink-dim);
+}
+
+.ev-finish {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--hairline);
+  color: var(--tone-done);
+}
+
+/* A dropped-events notice reads as a break in the record, not as output. */
+.stream-gap {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+  padding: var(--sp-1) var(--sp-2);
+  border-left: 2px solid var(--tone-wait);
+  background: var(--tone-wait-wash);
+  color: var(--tone-wait);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+}
+
+.stream-gap.is-bad {
+  border-left-color: var(--tone-bad);
+  background: var(--tone-bad-wash);
+  color: var(--tone-bad);
+}

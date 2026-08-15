@@ -14,12 +14,13 @@ description = "Prospero Dashboard v2 — Dioxus/WASM fleet-management UI"
 [dependencies]
 prospero-types = { path = "../types" }
 dioxus = { version = "0.7", features = ["web"] }
-gloo-net = { version = "0.7", features = ["json"] }
+gloo-net = { version = "0.7", features = ["json", "eventsource"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
+futures = "0.3"
 
 [profile.release]
 # The .wasm is a committed artifact served to browsers: optimise for size.
