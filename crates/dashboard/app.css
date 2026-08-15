@@ -77,9 +77,14 @@
 
 /* --- Tokens: light -------------------------------------------------------- */
 /* A deliberate light theme, not an inversion. Warm paper rather than pure
-   white, and a deeper accent so it holds its own against a bright ground. */
+   white, and a deeper accent so it holds its own against a bright ground.
+   
+   Applied when the OS asks for light AND the operator has not pinned a theme
+   (`:not([data-theme])`), or when they explicitly picked light. The
+   `:not()` guard is what lets "force dark on a light OS" work: without it the
+   media query would keep re-applying these tokens over the explicit choice. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme]) {
     --ground: #f6f5f3;
     --surface: #ffffff;
     --raised: #fbfaf9;
@@ -108,6 +113,73 @@
     --shadow-lift: 0 2px 6px rgba(24, 20, 14, 0.08),
       0 18px 32px -18px rgba(24, 20, 14, 0.25);
   }
+}
+
+/* Explicitly chosen light — wins over the OS preference in both directions.
+   Same tokens as above; duplicated rather than shared because a media query
+   and an attribute selector cannot be combined in one rule. */
+:root[data-theme="light"] {
+    --ground: #f6f5f3;
+    --surface: #ffffff;
+    --raised: #fbfaf9;
+    --hairline: #e4e1dc;
+    --hairline-strong: #d2cec7;
+
+    --ink: #1a1d24;
+    --ink-dim: #5b6273;
+    --ink-muted: #868d9c;
+
+    --accent: #7439bd;
+    --accent-dim: #9d6fd6;
+    --accent-wash: rgba(116, 57, 189, 0.08);
+
+    --tone-live: #1c8f5f;
+    --tone-wait: #a9711a;
+    --tone-done: #6b7383;
+    --tone-bad: #c8372c;
+    --tone-live-wash: rgba(28, 143, 95, 0.1);
+    --tone-wait-wash: rgba(169, 113, 26, 0.11);
+    --tone-done-wash: rgba(107, 115, 131, 0.1);
+    --tone-bad-wash: rgba(200, 55, 44, 0.09);
+
+    --shadow-card: 0 1px 2px rgba(24, 20, 14, 0.06),
+      0 8px 20px -14px rgba(24, 20, 14, 0.18);
+    --shadow-lift: 0 2px 6px rgba(24, 20, 14, 0.08),
+      0 18px 32px -18px rgba(24, 20, 14, 0.25);
+  color-scheme: light;
+}
+
+/* Explicitly chosen dark. The :root defaults are already dark, so this only
+   has to restate `color-scheme` — but the tokens are pinned here too so the
+   rule keeps working if the defaults ever change. */
+:root[data-theme="dark"] {
+  --ground: #0b0d12;
+  --surface: #12151c;
+  --raised: #171b24;
+  --hairline: #212734;
+  --hairline-strong: #2c3444;
+
+  --ink: #e7e9ef;
+  --ink-dim: #9aa3b4;
+  --ink-muted: #6b7385;
+
+  --accent: #b98cf0;
+  --accent-dim: #8a5fc4;
+  --accent-wash: rgba(185, 140, 240, 0.11);
+
+  --tone-live: #5ed39a;
+  --tone-wait: #e5b567;
+  --tone-done: #7d8798;
+  --tone-bad: #f0736a;
+  --tone-live-wash: rgba(94, 211, 154, 0.13);
+  --tone-wait-wash: rgba(229, 181, 103, 0.13);
+  --tone-done-wash: rgba(125, 135, 152, 0.13);
+  --tone-bad-wash: rgba(240, 115, 106, 0.13);
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+  --shadow-lift: 0 2px 4px rgba(0, 0, 0, 0.4), 0 16px 32px -16px rgba(0, 0, 0, 0.7);
+
+  color-scheme: dark;
 }
 
 /* --- Reset ---------------------------------------------------------------- */
@@ -1400,4 +1472,50 @@ textarea.input {
   border-left-color: var(--tone-bad);
   background: var(--tone-bad-wash);
   color: var(--tone-bad);
+}
+
+/* --- Theme control ---------------------------------------------------------- */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 550;
+  color: var(--ink-dim);
+  background: none;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.theme-toggle:hover {
+  color: var(--ink);
+  border-color: var(--ink-muted);
+}
+
+.theme-icon {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+}
+
+/* Light: a filled disc. Dark: a crescent, cut with an offset shadow. System: a
+   half-filled disc. Distinguishable by shape, so the control is readable
+   without relying on the label alone. */
+.theme-icon.is-light {
+  background: currentColor;
+}
+
+.theme-icon.is-dark {
+  background: none;
+  box-shadow: inset -3px 0 0 0 currentColor;
+}
+
+.theme-icon.is-system {
+  background: linear-gradient(90deg, currentColor 50%, transparent 50%);
 }

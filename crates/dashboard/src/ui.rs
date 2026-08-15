@@ -11,6 +11,7 @@ use prospero_types::{
 use crate::actions::Action;
 use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
 use crate::stream::{Entry, StreamSession, StreamState};
+use crate::theme::{STORAGE_KEY, Theme};
 use crate::view_model::{
     AgentControls, FleetTotals, StatusCounts, awaits_input, basename, controls_for, count_statuses,
     elapsed, health_reason, is_healthy, is_launchable, short_id, status_label, status_tone, totals,
@@ -98,7 +99,10 @@ pub fn Shell(host: String, freshness: Freshness, children: Element) -> Element {
                     span { class: "topbar-label", "fleet" }
                     span { class: "topbar-host", "{host}" }
                 }
-                div { class: "topbar-right", ConnectionState { freshness } }
+                div { class: "topbar-right",
+                    ConnectionState { freshness }
+                    ThemeToggle {}
+                }
             }
             nav { class: "nav", aria_label: "Sections",
                 span { class: "nav-heading", "Fleet" }
@@ -107,6 +111,79 @@ pub fn Shell(host: String, freshness: Freshness, children: Element) -> Element {
             }
             main { class: "main", {children} }
         }
+    }
+}
+
+/// Theme control: cycles System → Light → Dark.
+///
+/// A cycling button rather than a three-way picker: the header is dense, the
+/// set is tiny, and the current state is always named on the control itself.
+#[component]
+fn ThemeToggle() -> Element {
+    let mut theme = use_signal(|| Theme::parse(stored_theme().as_deref()));
+
+    // Reflect the choice onto the document and persist it.
+    use_effect(move || {
+        apply_theme(theme());
+    });
+
+    let current = theme();
+    let icon = match current {
+        Theme::System => "theme-icon is-system",
+        Theme::Light => "theme-icon is-light",
+        Theme::Dark => "theme-icon is-dark",
+    };
+
+    rsx! {
+        button {
+            class: "theme-toggle",
+            // Named for screen readers, and says what pressing it will do —
+            // a bare icon would leave the state and the action both implicit.
+            aria_label: "Theme: {current.label()}. Switch to {current.next().label()}.",
+            title: "Theme: {current.label()}",
+            onclick: move |_| {
+                let next = theme().next();
+                theme.set(next);
+            },
+            span { class: "{icon}" }
+            "{current.label()}"
+        }
+    }
+}
+
+/// Read the persisted preference. `None` when storage is unavailable.
+fn stored_theme() -> Option<String> {
+    web_sys::window()?
+        .local_storage()
+        .ok()
+        .flatten()?
+        .get_item(STORAGE_KEY)
+        .ok()
+        .flatten()
+}
+
+/// Stamp the theme onto the document root and persist it.
+///
+/// `System` removes the attribute rather than setting a third value, so the
+/// stylesheet's `prefers-color-scheme` query takes over again.
+fn apply_theme(theme: Theme) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    if let Some(root) = window.document().and_then(|d| d.document_element()) {
+        match theme.attribute() {
+            Some(value) => {
+                let _ = root.set_attribute("data-theme", value);
+            }
+            None => {
+                let _ = root.remove_attribute("data-theme");
+            }
+        }
+    }
+    // Storage can be unavailable (private browsing); the choice simply won't
+    // survive a reload, which is better than failing to apply it at all.
+    if let Ok(Some(storage)) = window.local_storage() {
+        let _ = storage.set_item(STORAGE_KEY, theme.as_str());
     }
 }
 
