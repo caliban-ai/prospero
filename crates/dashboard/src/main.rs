@@ -18,6 +18,7 @@ mod api;
 mod config_form;
 mod sse;
 mod stream;
+mod theme;
 mod ui;
 mod view_model;
 
