@@ -42,6 +42,7 @@ pub async fn get_workspaces(State(st): State<AppState>) -> Json<Vec<WorkspaceSum
                 health: r.health,
                 agent_count: r.agents.len(),
                 config: r.config,
+                source_specs: Vec::new(),
                 display_name: None,
                 providers: Vec::new(),
                 default_provider: None,
@@ -82,6 +83,9 @@ pub async fn get_workspaces(State(st): State<AppState>) -> Json<Vec<WorkspaceSum
                 health: prospero_core::WorkspaceHealth::Healthy,
                 agent_count,
                 config: prospero_core::registry::RepoProviderConfig::default(),
+                // The full specs, so the config editor can round-trip an edit.
+                // `sources` above loses the git remote and ref.
+                source_specs: wi.sources,
                 display_name: wi.display_name,
                 providers: wi.providers,
                 default_provider: wi.default_provider,

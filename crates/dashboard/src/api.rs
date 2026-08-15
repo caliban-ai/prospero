@@ -11,7 +11,10 @@
 //! to a bare status code.
 
 use gloo_net::http::{Request, Response};
-use prospero_types::{AgentInputBody, Capabilities, FleetSnapshot, SpawnBody, SpawnedResponse};
+use prospero_types::{
+    AddWorkspaceBody, AgentInputBody, Capabilities, FleetSnapshot, SetConfigBody, SpawnBody,
+    SpawnedResponse, WorkspaceConfig, WorkspaceSummary,
+};
 use serde::Serialize;
 
 /// Turn a non-2xx response into the best message available.
@@ -145,6 +148,12 @@ pub async fn fetch_capabilities() -> Result<Capabilities, String> {
     get_json("/api/capabilities", "capabilities").await
 }
 
+/// `GET /api/workspaces` — summaries carrying the k8s reconciliation status and
+/// the named providers an agent can bind, neither of which `FleetSnapshot` has.
+pub async fn fetch_workspaces() -> Result<Vec<WorkspaceSummary>, String> {
+    get_json("/api/workspaces", "workspaces").await
+}
+
 // --- Agent control ----------------------------------------------------------
 
 /// `POST /api/agents/{id}/kill`.
@@ -198,6 +207,27 @@ pub async fn spawn_agent(workspace: &str, body: &SpawnBody) -> Result<SpawnedRes
 }
 
 // --- Workspace registry -----------------------------------------------------
+
+/// `POST /api/workspaces` — register a workspace.
+pub async fn add_workspace(body: &AddWorkspaceBody) -> Result<(), String> {
+    post_json_no_reply("/api/workspaces", body, "add workspace").await
+}
+
+/// `PUT /api/workspaces/{name}/config` — replace a workspace's configuration.
+pub async fn set_workspace_config(name: &str, config: &WorkspaceConfig) -> Result<(), String> {
+    let path = format!("/api/workspaces/{}/config", encode_segment(name));
+    let body = SetConfigBody(config.clone());
+    let response = Request::put(&path)
+        .json(&body)
+        .map_err(|e| format!("could not encode the save-config request: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("could not reach prosperod: {e}"))?;
+    if !response.ok() {
+        return Err(failure("save config", response).await);
+    }
+    Ok(())
+}
 
 /// `DELETE /api/workspaces/{name}` — deregister a workspace.
 pub async fn remove_workspace(name: &str) -> Result<(), String> {

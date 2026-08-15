@@ -19,7 +19,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    ProviderInfo, RepoProviderConfig, Source, WorkspaceConfig, WorkspaceHealth, WorkspaceStatusInfo,
+    ProviderInfo, RepoProviderConfig, Source, WorkspaceConfig, WorkspaceHealth,
+    WorkspaceSourceSpec, WorkspaceStatusInfo,
 };
 
 /// Backend capability signal for the dashboard (`GET /api/capabilities`).
@@ -150,6 +151,17 @@ pub struct WorkspaceSummary {
     /// Human-friendly label (k8s config plane).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// The workspace's configured source **specs** (k8s config plane).
+    ///
+    /// `sources` above is the *discovered* view — name and path only — because
+    /// that is all a local checkout has. A k8s workspace's sources come from a
+    /// `Workspace` CR and additionally carry the git remote and ref, and the
+    /// config editor needs those to round-trip an edit: without them an
+    /// operator editing a workspace would face blank remote fields and have to
+    /// retype every one from memory. Empty for the local backend, so local
+    /// responses are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_specs: Vec<WorkspaceSourceSpec>,
     /// Named providers agents can bind to (k8s config plane).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderInfo>,
@@ -212,6 +224,7 @@ mod tests {
             health: WorkspaceHealth::Healthy,
             agent_count: 1,
             config: RepoProviderConfig::default(),
+            source_specs: Vec::new(),
             display_name: None,
             providers: Vec::new(),
             default_provider: None,
@@ -254,13 +267,20 @@ mod tests {
             health: WorkspaceHealth::Healthy,
             agent_count: 0,
             config: RepoProviderConfig::default(),
+            source_specs: Vec::new(),
             display_name: None,
             providers: Vec::new(),
             default_provider: None,
             status: None,
         };
         let json = serde_json::to_string(&s).unwrap();
-        for absent in ["display_name", "providers", "default_provider", "status"] {
+        for absent in [
+            "display_name",
+            "providers",
+            "default_provider",
+            "status",
+            "source_specs",
+        ] {
             assert!(!json.contains(absent), "{absent} leaked into {json}");
         }
     }

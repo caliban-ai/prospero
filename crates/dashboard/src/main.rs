@@ -15,6 +15,7 @@ use prospero_types::{Capabilities, FleetSnapshot};
 
 mod actions;
 mod api;
+mod config_form;
 mod ui;
 mod view_model;
 
@@ -65,6 +66,7 @@ fn App() -> Element {
             async_workspace_ops: false,
         }),
         refresh: Signal::new(0),
+        workspaces: Signal::new(Vec::new()),
         now_ms: Signal::new(now_ms()),
     });
 
@@ -104,6 +106,13 @@ fn App() -> Element {
                         };
                         load.set(next);
                     }
+                }
+                // The config editor and the provider picker need what only
+                // /api/workspaces carries (named providers, reconciliation
+                // status, source specs). A failure here is not surfaced: the
+                // fleet view still works without it.
+                if let Ok(ws) = api::fetch_workspaces().await {
+                    ui.workspaces.set(ws);
                 }
                 // Re-sample the clock each pass so agent ages advance.
                 ui.now_ms.set(now_ms());
