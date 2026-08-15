@@ -2075,6 +2075,9 @@ mod tests {
         async fn prune(&self, before_ts: &str) -> Result<u64> {
             self.inner.prune(before_ts).await
         }
+        async fn usage(&self, since: &str, until: &str) -> Result<Vec<crate::store::UsageRow>> {
+            self.inner.usage(since, until).await
+        }
     }
 
     fn emitter_with(store: Arc<dyn Store>) -> Emitter {

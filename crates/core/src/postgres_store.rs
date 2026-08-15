@@ -138,6 +138,57 @@ impl Store for PostgresStore {
             .map_err(|e| CoreError::Store(format!("prune: {e}")))?;
         Ok(res.rows_affected())
     }
+
+    /// The sqlite query's Postgres twin: same grouping, same filter, same shape.
+    /// `kind` is a TEXT column (not `jsonb`), so each read casts before
+    /// extracting. The explicit `::bigint` casts on the counts are load-bearing —
+    /// Postgres widens `SUM` over an integer to `numeric`, which sqlx will not
+    /// decode as `i64`.
+    async fn usage(&self, since: &str, until: &str) -> Result<Vec<crate::store::UsageRow>> {
+        let rows = sqlx::query(
+            "SELECT repo AS workspace, substr(ts, 1, 10) AS day, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'kind' = 'agent_finished' \
+                    THEN (kind::jsonb->>'cost_usd')::double precision END), 0.0)::double precision \
+                    AS cost_usd, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'kind' = 'agent_finished' \
+                    THEN (kind::jsonb->>'turns')::bigint END), 0)::bigint AS turns, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'to' = 'done' THEN 1 END), 0)::bigint AS done, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'to' = 'failed' THEN 1 END), 0)::bigint \
+                    AS failed, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'to' = 'killed' THEN 1 END), 0)::bigint \
+                    AS killed, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'to' = 'crashed' THEN 1 END), 0)::bigint \
+                    AS crashed \
+             FROM events \
+             WHERE ts >= $1 AND ts < $2 AND ( \
+                kind::jsonb->>'kind' = 'agent_finished' OR ( \
+                    kind::jsonb->>'kind' = 'status_changed' \
+                    AND kind::jsonb->>'to' IN ('done', 'failed', 'killed', 'crashed'))) \
+             GROUP BY repo, substr(ts, 1, 10) \
+             ORDER BY repo, day",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("usage: {e}")))?;
+
+        let decode = |e: sqlx::Error| CoreError::Store(format!("usage decode: {e}"));
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::store::UsageRow {
+                workspace: row.try_get("workspace").map_err(decode)?,
+                day: row.try_get("day").map_err(decode)?,
+                cost_usd: row.try_get::<f64, _>("cost_usd").map_err(decode)?,
+                turns: row.try_get::<i64, _>("turns").map_err(decode)? as u64,
+                done: row.try_get::<i64, _>("done").map_err(decode)? as u64,
+                failed: row.try_get::<i64, _>("failed").map_err(decode)? as u64,
+                killed: row.try_get::<i64, _>("killed").map_err(decode)? as u64,
+                crashed: row.try_get::<i64, _>("crashed").map_err(decode)? as u64,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -160,5 +211,7 @@ mod tests {
         crate::testkit::store_conformance(&store).await;
         store.reset_for_tests().await.unwrap();
         crate::testkit::store_prune_conformance(&store).await;
+        store.reset_for_tests().await.unwrap();
+        crate::testkit::store_usage_conformance(&store).await;
     }
 }

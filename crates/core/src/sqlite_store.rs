@@ -150,6 +150,52 @@ impl Store for SqliteStore {
             .map_err(|e| CoreError::Store(format!("prune: {e}")))?;
         Ok(res.rows_affected())
     }
+
+    /// Aggregated in SQL (JSON1 `json_extract` over the `kind` column) so a long
+    /// log is grouped by the database rather than replayed into memory. The
+    /// `WHERE` clause discards every other event kind before grouping, so
+    /// workspaces that only produced output never open a row.
+    async fn usage(&self, since: &str, until: &str) -> Result<Vec<crate::store::UsageRow>> {
+        let rows = sqlx::query(
+            "SELECT repo AS workspace, substr(ts, 1, 10) AS day, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.kind') = 'agent_finished' \
+                    THEN json_extract(kind, '$.cost_usd') END), 0.0) AS cost_usd, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.kind') = 'agent_finished' \
+                    THEN json_extract(kind, '$.turns') END), 0) AS turns, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'done' THEN 1 END), 0) AS done, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'failed' THEN 1 END), 0) AS failed, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'killed' THEN 1 END), 0) AS killed, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'crashed' THEN 1 END), 0) AS crashed \
+             FROM events \
+             WHERE ts >= ? AND ts < ? AND ( \
+                json_extract(kind, '$.kind') = 'agent_finished' OR ( \
+                    json_extract(kind, '$.kind') = 'status_changed' \
+                    AND json_extract(kind, '$.to') IN ('done', 'failed', 'killed', 'crashed'))) \
+             GROUP BY repo, substr(ts, 1, 10) \
+             ORDER BY repo, day",
+        )
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("usage: {e}")))?;
+
+        let decode = |e: sqlx::Error| CoreError::Store(format!("usage decode: {e}"));
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(crate::store::UsageRow {
+                workspace: row.try_get("workspace").map_err(decode)?,
+                day: row.try_get("day").map_err(decode)?,
+                cost_usd: row.try_get::<f64, _>("cost_usd").map_err(decode)?,
+                turns: row.try_get::<i64, _>("turns").map_err(decode)? as u64,
+                done: row.try_get::<i64, _>("done").map_err(decode)? as u64,
+                failed: row.try_get::<i64, _>("failed").map_err(decode)? as u64,
+                killed: row.try_get::<i64, _>("killed").map_err(decode)? as u64,
+                crashed: row.try_get::<i64, _>("crashed").map_err(decode)? as u64,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +243,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(dir.path()).await.unwrap();
         crate::testkit::store_prune_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_aggregates_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path()).await.unwrap();
+        crate::testkit::store_usage_conformance(&store).await;
     }
 }

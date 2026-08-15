@@ -66,6 +66,7 @@ pub fn router(
         .route("/api/capabilities", get(handlers::get_capabilities))
         // Fleet + workspaces.
         .route("/api/fleet", get(handlers::get_fleet))
+        .route("/api/usage", get(handlers::get_usage))
         .route(
             "/api/workspaces",
             get(handlers::get_workspaces).post(handlers::add_workspace),

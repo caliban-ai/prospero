@@ -12,11 +12,13 @@
 //! `prospero-types`) would drag a transport concept downward.
 
 use prospero_core::fleet::SpawnRequest;
+use prospero_core::store::UsageRow;
 use serde::Deserialize;
 
 pub use prospero_types::{
-    AddWorkspaceBody, AgentInputBody, Capabilities, RespawnedResponse, SetConfigBody, SpawnBody,
-    SpawnedResponse, WorkspaceSummary,
+    AddWorkspaceBody, AgentInputBody, Capabilities, OutcomeCounts, RespawnedResponse,
+    SetConfigBody, SpawnBody, SpawnedResponse, UsageBucket, UsageGroup, UsageReport,
+    WorkspaceSummary,
 };
 
 /// Query params for `GET /api/agents/{id}/events` and `/stream`.
@@ -50,9 +52,163 @@ pub fn spawn_request(body: SpawnBody) -> SpawnRequest {
     }
 }
 
+/// Query params for `GET /api/usage`.
+///
+/// Both bounds are optional; the handler fills in a default window and echoes
+/// back what it used. Like [`FromSeq`], this is a URL-query extractor rather
+/// than part of the body contract, so it stays in this crate.
+#[derive(Debug, Default, Deserialize)]
+pub struct UsageQuery {
+    /// Inclusive window start (RFC-3339). Defaults to 7 days before `until`.
+    pub since: Option<String>,
+    /// Exclusive window end (RFC-3339). Defaults to now.
+    pub until: Option<String>,
+}
+
+/// Fold the store's flat (workspace, day) rows into the per-workspace report.
+///
+/// The store already did the aggregation; this only reshapes. Another adapter
+/// mapping in the ADR 0006 sense — [`UsageRow`] is a `prospero-core` type and
+/// [`UsageReport`] a `prospero-types` one, and neither crate should know about
+/// the other.
+///
+/// Rows are expected in (workspace, day) order — both SQL backends `ORDER BY`
+/// that way and the in-memory fold uses a `BTreeMap` — but this does not rely on
+/// it: groups are collected by name and each series sorted before returning, so
+/// a backend that ordered differently still produces the same report.
+pub fn usage_report(rows: Vec<UsageRow>, since: &str, until: &str) -> UsageReport {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<String, UsageGroup> = BTreeMap::new();
+    for r in rows {
+        let g = groups
+            .entry(r.workspace.clone())
+            .or_insert_with(|| UsageGroup {
+                workspace: r.workspace.clone(),
+                ..UsageGroup::default()
+            });
+        g.cost_usd += r.cost_usd;
+        g.turns += r.turns;
+        g.outcomes.done += r.done;
+        g.outcomes.failed += r.failed;
+        g.outcomes.killed += r.killed;
+        g.outcomes.crashed += r.crashed;
+        g.series.push(UsageBucket {
+            day: r.day,
+            cost_usd: r.cost_usd,
+            turns: r.turns,
+            outcomes: OutcomeCounts {
+                done: r.done,
+                failed: r.failed,
+                killed: r.killed,
+                crashed: r.crashed,
+            },
+        });
+    }
+
+    let mut groups: Vec<UsageGroup> = groups.into_values().collect();
+    for g in &mut groups {
+        g.series.sort_by(|a, b| a.day.cmp(&b.day));
+    }
+
+    UsageReport {
+        since: since.to_string(),
+        until: until.to_string(),
+        groups,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(workspace: &str, day: &str, cost: f64, turns: u64) -> UsageRow {
+        UsageRow {
+            workspace: workspace.into(),
+            day: day.into(),
+            cost_usd: cost,
+            turns,
+            done: 0,
+            failed: 0,
+            killed: 0,
+            crashed: 0,
+        }
+    }
+
+    #[test]
+    fn usage_report_folds_days_into_per_workspace_totals() {
+        let rows = vec![
+            row("alpha", "2026-08-01", 0.75, 4),
+            row("alpha", "2026-08-02", 1.00, 2),
+            row("beta", "2026-08-01", 0.10, 1),
+        ];
+
+        let report = usage_report(
+            rows,
+            "2026-08-01T00:00:00+00:00",
+            "2026-08-03T00:00:00+00:00",
+        );
+
+        assert_eq!(report.since, "2026-08-01T00:00:00+00:00");
+        assert_eq!(report.until, "2026-08-03T00:00:00+00:00");
+        assert_eq!(report.groups.len(), 2);
+
+        let alpha = &report.groups[0];
+        assert_eq!(alpha.workspace, "alpha");
+        assert!((alpha.cost_usd - 1.75).abs() < 1e-9);
+        assert_eq!(alpha.turns, 6);
+        assert_eq!(
+            alpha
+                .series
+                .iter()
+                .map(|b| b.day.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-08-01", "2026-08-02"],
+            "the series must stay ascending by day"
+        );
+
+        let beta = &report.groups[1];
+        assert_eq!(beta.workspace, "beta");
+        assert_eq!(beta.series.len(), 1);
+    }
+
+    #[test]
+    fn usage_report_sums_outcomes_across_the_window() {
+        let mut a = row("alpha", "2026-08-01", 0.0, 0);
+        a.done = 2;
+        a.killed = 1;
+        let mut b = row("alpha", "2026-08-02", 0.0, 0);
+        b.failed = 3;
+
+        let report = usage_report(vec![a, b], "s", "u");
+
+        let g = &report.groups[0];
+        assert_eq!(g.outcomes.done, 2);
+        assert_eq!(g.outcomes.killed, 1);
+        assert_eq!(g.outcomes.failed, 3);
+        assert_eq!(g.outcomes.total(), 6);
+    }
+
+    /// A killed agent never reports cost, so a workspace can show outcomes
+    /// against zero spend. The fold must preserve that rather than dropping the
+    /// group as empty.
+    #[test]
+    fn usage_report_keeps_a_workspace_with_outcomes_but_no_cost() {
+        let mut killed = row("beta", "2026-08-01", 0.0, 0);
+        killed.killed = 1;
+
+        let report = usage_report(vec![killed], "s", "u");
+
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].cost_usd, 0.0);
+        assert_eq!(report.groups[0].outcomes.killed, 1);
+    }
+
+    #[test]
+    fn usage_report_over_an_empty_window_has_no_groups() {
+        let report = usage_report(Vec::new(), "s", "u");
+        assert!(report.groups.is_empty());
+    }
 
     #[test]
     fn spawn_body_interactive_round_trips_and_defaults_false() {

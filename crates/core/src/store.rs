@@ -29,6 +29,92 @@ pub(crate) fn map_append_error(e: sqlx::Error) -> CoreError {
     }
 }
 
+/// One aggregate row: everything one workspace did on one UTC day.
+///
+/// The store computes these; nothing replays the log to build them. Cost and
+/// turns come from `agent_finished` events, the outcome counts from terminal
+/// `status_changed` transitions — so a workspace whose agents were all killed
+/// legitimately reports outcomes with zero cost. See [`Store::usage`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRow {
+    /// Workspace name (the event's `repo`).
+    pub workspace: String,
+    /// UTC day, `YYYY-MM-DD`, sliced from the RFC-3339 timestamp.
+    pub day: String,
+    /// Summed run cost in USD.
+    pub cost_usd: f64,
+    /// Summed turns.
+    pub turns: u64,
+    /// Agents that reached `done`.
+    pub done: u64,
+    /// Agents that reached `failed`.
+    pub failed: u64,
+    /// Agents that reached `killed`.
+    pub killed: u64,
+    /// Agents that reached `crashed`.
+    pub crashed: u64,
+}
+
+/// The UTC day (`YYYY-MM-DD`) an RFC-3339 timestamp falls on, or `None` if the
+/// string is too short to carry one. Timestamps are stored as written, so this
+/// slices rather than parses — the same assumption [`Store::prune`] makes.
+pub(crate) fn day_of(ts: &str) -> Option<&str> {
+    ts.get(..10)
+}
+
+/// Fold events into per-(workspace, day) aggregates. Shared by the backends
+/// that cannot push this into SQL; the sqlite and Postgres stores compute the
+/// identical shape in the database instead.
+pub(crate) fn aggregate_usage<'a>(events: impl Iterator<Item = &'a FleetEvent>) -> Vec<UsageRow> {
+    use crate::event::EventKind;
+    use crate::model::AgentStatus;
+    use std::collections::BTreeMap;
+
+    let mut rows: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
+    for e in events {
+        let Some(day) = day_of(&e.ts) else { continue };
+        // Only the two event kinds below open a row. Otherwise a workspace that
+        // merely emitted output would appear as a zero-cost, zero-outcome row.
+        let interesting = match &e.kind {
+            EventKind::AgentFinished { .. } => true,
+            EventKind::StatusChanged { to, .. } => to.is_terminal(),
+            _ => false,
+        };
+        if !interesting {
+            continue;
+        }
+        let row = rows
+            .entry((e.repo.clone(), day.to_string()))
+            .or_insert_with(|| UsageRow {
+                workspace: e.repo.clone(),
+                day: day.to_string(),
+                cost_usd: 0.0,
+                turns: 0,
+                done: 0,
+                failed: 0,
+                killed: 0,
+                crashed: 0,
+            });
+        match &e.kind {
+            EventKind::AgentFinished {
+                cost_usd, turns, ..
+            } => {
+                row.cost_usd += cost_usd;
+                row.turns += u64::from(*turns);
+            }
+            EventKind::StatusChanged { to, .. } => match to {
+                AgentStatus::Done => row.done += 1,
+                AgentStatus::Failed => row.failed += 1,
+                AgentStatus::Killed => row.killed += 1,
+                AgentStatus::Crashed => row.crashed += 1,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    rows.into_values().collect()
+}
+
 /// A durable, append-only event log keyed by stream.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -49,6 +135,15 @@ pub trait Store: Send + Sync {
     /// Delete events with `ts < before_ts` (RFC-3339, lexically ordered).
     /// Returns the number removed. Backs age-based retention (#4).
     async fn prune(&self, before_ts: &str) -> Result<u64>;
+
+    /// Aggregate cost, turns, and terminal outcomes per (workspace, UTC day)
+    /// over `[since, until)` (RFC-3339, lexically ordered like [`Store::prune`]).
+    ///
+    /// Deliberately **not** a default method: a backend that silently returned
+    /// nothing here would make the usage endpoint report zero spend rather than
+    /// fail, which is worse than a compile error. Every backend implements it,
+    /// and `testkit::store_usage_conformance` holds them to identical semantics.
+    async fn usage(&self, since: &str, until: &str) -> Result<Vec<UsageRow>>;
 }
 
 /// Delete events older than `max_age` from `store`, returning the count
@@ -183,6 +278,13 @@ impl Store for JsonlStore {
         }
         std::fs::write(&self.path, body)?;
         Ok(removed)
+    }
+
+    async fn usage(&self, since: &str, until: &str) -> Result<Vec<UsageRow>> {
+        let all = self.read_all()?;
+        Ok(aggregate_usage(all.iter().filter(|e| {
+            e.ts.as_str() >= since && e.ts.as_str() < until
+        })))
     }
 }
 
@@ -324,5 +426,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
         crate::testkit::store_prune_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn jsonl_store_aggregates_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        crate::testkit::store_usage_conformance(&store).await;
     }
 }

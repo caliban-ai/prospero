@@ -677,6 +677,208 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
     assert_eq!(store.prune("2026-03-01T00:00:00+00:00").await.unwrap(), 0);
 }
 
+/// Usage-aggregation contract every [`crate::store::Store`] must satisfy
+/// (prospero #180): `usage(since, until)` returns one row per
+/// (workspace, UTC day) that saw terminal activity, summing cost and turns from
+/// `AgentFinished` and counting outcomes from terminal `StatusChanged`
+/// transitions.
+///
+/// The two come from different events on purpose. `AgentFinished.outcome` is
+/// caliban's raw result subtype ("EndOfTurn", "max_turns"), an open vocabulary;
+/// the done/failed/killed/crashed breakdown the dashboard charts is the
+/// terminal [`crate::model::AgentStatus`] set, which only `StatusChanged`
+/// carries. A killed agent therefore contributes an outcome but no cost — that
+/// divergence is real, and asserted below.
+pub async fn store_usage_conformance(store: &dyn crate::store::Store) {
+    use crate::event::{EventKind, FleetEvent};
+    use crate::model::AgentStatus;
+
+    fn ev(seq: u64, ts: &str, repo: &str, agent: &str, kind: EventKind) -> FleetEvent {
+        FleetEvent {
+            seq,
+            ts: ts.into(),
+            repo: repo.into(),
+            agent_id: agent.into(),
+            kind,
+        }
+    }
+
+    fn finished(cost: f64, turns: u32) -> EventKind {
+        EventKind::AgentFinished {
+            outcome: "EndOfTurn".into(),
+            cost_usd: cost,
+            turns,
+        }
+    }
+
+    fn moved_to(to: AgentStatus) -> EventKind {
+        EventKind::StatusChanged {
+            from: AgentStatus::Running,
+            to,
+        }
+    }
+
+    // Before the window — must be excluded entirely.
+    store
+        .append(&ev(
+            1,
+            "2026-07-31T23:59:59+00:00",
+            "alpha",
+            "old",
+            finished(99.0, 99),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            "2026-07-31T23:59:59+00:00",
+            "alpha",
+            "old",
+            moved_to(AgentStatus::Done),
+        ))
+        .await
+        .unwrap();
+
+    // alpha, day 1: one clean finish and one failure.
+    store
+        .append(&ev(
+            1,
+            "2026-08-01T10:00:00+00:00",
+            "alpha",
+            "a1",
+            finished(0.50, 3),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            "2026-08-01T10:00:01+00:00",
+            "alpha",
+            "a1",
+            moved_to(AgentStatus::Done),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            1,
+            "2026-08-01T11:00:00+00:00",
+            "alpha",
+            "a2",
+            finished(0.25, 1),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            "2026-08-01T11:00:01+00:00",
+            "alpha",
+            "a2",
+            moved_to(AgentStatus::Failed),
+        ))
+        .await
+        .unwrap();
+
+    // alpha, day 2: a separate bucket, so the series is per-day not per-window.
+    store
+        .append(&ev(
+            1,
+            "2026-08-02T09:00:00+00:00",
+            "alpha",
+            "a3",
+            finished(1.00, 2),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            "2026-08-02T09:00:01+00:00",
+            "alpha",
+            "a3",
+            moved_to(AgentStatus::Crashed),
+        ))
+        .await
+        .unwrap();
+
+    // beta: killed before it ever finished — an outcome with no cost at all.
+    store
+        .append(&ev(
+            1,
+            "2026-08-01T12:00:00+00:00",
+            "beta",
+            "b1",
+            moved_to(AgentStatus::Killed),
+        ))
+        .await
+        .unwrap();
+    // A non-terminal transition must not be counted as an outcome.
+    store
+        .append(&ev(
+            2,
+            "2026-08-01T12:00:01+00:00",
+            "beta",
+            "b1",
+            moved_to(AgentStatus::Idle),
+        ))
+        .await
+        .unwrap();
+
+    let rows = store
+        .usage("2026-08-01T00:00:00+00:00", "2026-08-03T00:00:00+00:00")
+        .await
+        .unwrap();
+
+    let find = |workspace: &str, day: &str| {
+        rows.iter()
+            .find(|r| r.workspace == workspace && r.day == day)
+            .unwrap_or_else(|| panic!("no row for {workspace}/{day} in {rows:?}"))
+    };
+
+    let a1 = find("alpha", "2026-08-01");
+    assert!(
+        (a1.cost_usd - 0.75).abs() < 1e-9,
+        "alpha day 1 cost should sum both finishes, got {}",
+        a1.cost_usd
+    );
+    assert_eq!(a1.turns, 4, "alpha day 1 turns should sum both finishes");
+    assert_eq!(a1.done, 1);
+    assert_eq!(a1.failed, 1);
+    assert_eq!(a1.killed, 0);
+    assert_eq!(a1.crashed, 0);
+
+    let a2 = find("alpha", "2026-08-02");
+    assert!((a2.cost_usd - 1.00).abs() < 1e-9);
+    assert_eq!(a2.turns, 2);
+    assert_eq!(a2.crashed, 1);
+    assert_eq!(a2.done, 0);
+
+    // The divergence: an outcome with no matching AgentFinished.
+    let b = find("beta", "2026-08-01");
+    assert_eq!(b.cost_usd, 0.0, "a killed agent never reported cost");
+    assert_eq!(b.turns, 0);
+    assert_eq!(b.killed, 1);
+    assert_eq!(
+        b.done + b.failed + b.crashed,
+        0,
+        "Idle is not terminal and must not be counted"
+    );
+
+    // Exactly the three (workspace, day) pairs above — the pre-window events
+    // must not have created a row.
+    assert_eq!(rows.len(), 3, "unexpected rows: {rows:?}");
+
+    // An empty window aggregates to nothing rather than erroring.
+    let empty = store
+        .usage("2027-01-01T00:00:00+00:00", "2027-02-01T00:00:00+00:00")
+        .await
+        .unwrap();
+    assert!(empty.is_empty(), "empty window should yield no rows");
+}
+
 /// Contract every [`crate::config_store::ConfigStore`] must satisfy: upsert is
 /// insert-or-update by name, list returns all repos (name-ordered), delete is
 /// idempotent. Backends call this to prove identical config semantics.
