@@ -129,6 +129,20 @@ pub struct RespawnedResponse {
     pub agent_id: String,
 }
 
+/// Payload of a `gap` SSE event on `GET /api/agents/{id}/stream`.
+///
+/// The bus dropped `skipped` events after `last_seq` because the subscriber
+/// lagged (#28). The stream self-heals by replaying from the store, but the
+/// signal is still sent so a client can say "some output was missed" rather
+/// than silently rendering a discontinuous timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSignal {
+    /// How many events were dropped.
+    pub skipped: u64,
+    /// The last sequence number delivered before the gap.
+    pub last_seq: u64,
+}
+
 /// A workspace summary (no agents) for `GET /api/workspaces`.
 ///
 /// The tail fields are populated by the k8s config plane (from `Workspace` CRs)

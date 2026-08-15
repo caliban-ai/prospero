@@ -11,8 +11,8 @@ mod event;
 mod model;
 
 pub use api::{
-    AddWorkspaceBody, AgentInputBody, Capabilities, RespawnedResponse, SetConfigBody, SpawnBody,
-    SpawnedResponse, WorkspaceSummary,
+    AddWorkspaceBody, AgentInputBody, Capabilities, GapSignal, RespawnedResponse, SetConfigBody,
+    SpawnBody, SpawnedResponse, WorkspaceSummary,
 };
 pub use event::{EventKind, FleetEvent, OutputStream, stream_key_for};
 pub use model::{
