@@ -154,13 +154,33 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "crates/dashboard"
-      # Must match the wasm-bindgen crate version in crates/dashboard/Cargo.lock.
-      # scripts/build-dashboard.sh compares the two and fails loudly on skew,
-      # which is the failure this pin exists to prevent.
+      # The CLI must match the wasm-bindgen CRATE exactly — a mismatch produces
+      # a bundle that fails at runtime in the browser, so
+      # scripts/build-dashboard.sh refuses to build on skew.
+      #
+      # Resolve the version from the lockfile rather than pinning it here.
+      # install-action installs the LATEST CLI by default, which drifts the
+      # moment a new wasm-bindgen ships (0.2.127 did exactly that, turning this
+      # job red on an unrelated PR), and hardcoding a version would add a second
+      # place to update on every dependency bump. The lockfile is the one
+      # source of truth.
+      - name: Resolve the wasm-bindgen version
+        id: wasm_bindgen
+        run: |
+          V="$(awk '
+            /^name = "wasm-bindgen"$/ { in_wb = 1; next }
+            in_wb && /^version = / { gsub(/[",]/, ""); print $3; exit }
+          ' crates/dashboard/Cargo.lock)"
+          if [ -z "$V" ]; then
+            echo "::error::could not read the wasm-bindgen version from crates/dashboard/Cargo.lock"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "wasm-bindgen crate is $V"
       - name: Install wasm-bindgen-cli
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli
+          tool: wasm-bindgen-cli@${{ steps.wasm_bindgen.outputs.version }}
       # Deliberately NO binaryen here. wasm-opt is an optional size pass, and
       # apt's binaryen lags far enough behind rustc to reject its output
       # outright ("invalid code after misc prefix" on a reference-types opcode).
