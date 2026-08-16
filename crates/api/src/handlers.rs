@@ -34,9 +34,18 @@ pub async fn get_usage(
 ) -> Result<Json<UsageReport>, ApiError> {
     let now = chrono::Utc::now();
     let until = q.until.unwrap_or_else(|| now.to_rfc3339());
-    let since = q
-        .since
-        .unwrap_or_else(|| (now - chrono::Duration::days(DEFAULT_USAGE_WINDOW_DAYS)).to_rfc3339());
+    // An explicit `since` wins; otherwise fall back to `days`, then the default.
+    // `days` is clamped to at least 1 so `?days=0` yields an empty-but-valid
+    // window rather than one that ends before it starts.
+    let since = q.since.unwrap_or_else(|| {
+        let back = q.days.unwrap_or(DEFAULT_USAGE_WINDOW_DAYS).max(1);
+        // Offset from the resolved end, not from `now`, so an explicit `until`
+        // plus `days` spans exactly `days`.
+        let end = chrono::DateTime::parse_from_rfc3339(&until)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+        (end - chrono::Duration::days(back)).to_rfc3339()
+    });
 
     let rows = st.store.usage(&since, &until).await?;
     Ok(Json(crate::dto::usage_report(rows, &since, &until)))

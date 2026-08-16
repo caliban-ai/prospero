@@ -729,6 +729,37 @@ async fn usage_endpoint_aggregates_cost_and_outcomes_by_workspace() {
     assert_eq!(series[1]["outcomes"]["killed"], 1);
 }
 
+/// The overview's window control sends a day count and lets the server resolve
+/// `since` against its own clock — a browser-computed bound would silently clip
+/// or pad the window whenever the client clock drifts (#181).
+#[tokio::test]
+async fn usage_endpoint_accepts_a_day_count_window() {
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/usage?days=30")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+
+    let since = v["since"].as_str().unwrap();
+    let until = v["until"].as_str().unwrap();
+    let since = chrono::DateTime::parse_from_rfc3339(since).unwrap();
+    let until = chrono::DateTime::parse_from_rfc3339(until).unwrap();
+    let span_days = (until - since).num_days();
+    assert_eq!(
+        span_days, 30,
+        "days=30 must widen the window to 30 days, got {span_days} ({since} → {until})"
+    );
+}
+
 /// With no query params the endpoint must still answer, echoing back the window
 /// it chose so a client can label an axis without re-deriving the default.
 #[tokio::test]

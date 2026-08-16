@@ -13,7 +13,7 @@
 use gloo_net::http::{Request, Response};
 use prospero_types::{
     AddWorkspaceBody, AgentInputBody, Capabilities, FleetSnapshot, SetConfigBody, SpawnBody,
-    SpawnedResponse, WorkspaceConfig, WorkspaceSummary,
+    SpawnedResponse, UsageReport, WorkspaceConfig, WorkspaceSummary,
 };
 use serde::Serialize;
 
@@ -152,6 +152,16 @@ pub async fn fetch_capabilities() -> Result<Capabilities, String> {
 /// the named providers an agent can bind, neither of which `FleetSnapshot` has.
 pub async fn fetch_workspaces() -> Result<Vec<WorkspaceSummary>, String> {
     get_json("/api/workspaces", "workspaces").await
+}
+
+/// `GET /api/usage` — aggregated spend, turns, and outcomes per workspace with
+/// a per-day series (#180), for the overview charts.
+///
+/// The window is sent as a day count rather than a timestamp so the server
+/// resolves `since` against its own clock: the browser's clock can be minutes
+/// off, and a client-computed bound would silently clip or pad the window.
+pub async fn fetch_usage(days: i64) -> Result<UsageReport, String> {
+    get_json(&format!("/api/usage?days={days}"), "usage").await
 }
 
 // --- Agent control ----------------------------------------------------------
