@@ -113,6 +113,23 @@ pub struct SpawnedResponse {
     pub workspace: String,
     /// Whether the agent runs in an isolated worktree.
     pub isolated: bool,
+    /// Whether this request actually started a new agent, as opposed to
+    /// resolving to one that was already running (#190).
+    ///
+    /// Spawning is idempotent, and under k8s the `CalibanTask` name is derived
+    /// from the spec — so re-submitting an identical prompt attaches to the
+    /// existing run. Clients must distinguish the two, or they report a launch
+    /// that never happened.
+    ///
+    /// Defaults to `true` so a response from a pre-#190 daemon deserializes to
+    /// the behaviour clients already assumed.
+    #[serde(default = "default_created")]
+    pub created: bool,
+}
+
+/// `SpawnedResponse::created`'s default — see that field.
+fn default_created() -> bool {
+    true
 }
 
 /// Body for `POST /api/agents/{id}/input`.
@@ -295,6 +312,7 @@ mod tests {
             agent_id: "a".into(),
             workspace: "w".into(),
             isolated: true,
+            created: false,
         });
         round_trip!(AgentInputBody { text: "hi".into() });
         round_trip!(RespawnedResponse {
@@ -316,6 +334,21 @@ mod tests {
             default_provider: None,
             status: None,
         });
+    }
+
+    /// #190: `created` was added after the fact, so a body from a pre-#190
+    /// daemon omits it. It must read back as `true` — the launch-happened
+    /// assumption every client already made — rather than failing to parse or
+    /// silently claiming an attach.
+    #[test]
+    fn spawned_response_created_defaults_to_true_when_absent() {
+        let legacy = r#"{"agent_id":"a","workspace":"w","isolated":true}"#;
+        let parsed: SpawnedResponse = serde_json::from_str(legacy).expect("legacy body parses");
+        assert!(parsed.created);
+
+        let explicit = r#"{"agent_id":"a","workspace":"w","isolated":true,"created":false}"#;
+        let parsed: SpawnedResponse = serde_json::from_str(explicit).expect("parses");
+        assert!(!parsed.created, "an explicit false must survive");
     }
 
     #[test]

@@ -224,6 +224,7 @@ pub async fn spawn_agent(
             agent_id: handle.id.to_string(),
             workspace,
             isolated,
+            created: handle.created,
         }),
     ))
 }

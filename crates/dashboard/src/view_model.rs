@@ -89,6 +89,59 @@ pub fn totals(snap: &FleetSnapshot) -> FleetTotals {
     t
 }
 
+/// A digest of everything in the snapshot that could change the usage
+/// aggregate: each agent's identity and lifecycle state (#190).
+///
+/// The usage panel must not ride the 5-second fleet poll — re-running a 30-day
+/// store aggregate that often would be wasteful, which is why #181 fetched only
+/// on a window change. But never refetching left the panel reading `TURNS 0`
+/// while the API already reported `1`. This key is the middle ground: the poll
+/// loop compares it across snapshots and asks for a refetch only when it moves,
+/// so the cost is one aggregate per *change* rather than one per poll.
+///
+/// A spawn, a terminal transition, and a reap all move it; streaming output —
+/// which changes no agent's identity or status — does not.
+///
+/// Order-independent (the snapshot's workspace and agent order is not
+/// guaranteed stable) via a commutative fold, and `DefaultHasher`'s keys are
+/// fixed, so the same fleet always digests to the same value.
+pub fn activity_key(snap: &FleetSnapshot) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut key: u64 = 0;
+    for ws in &snap.workspaces {
+        for agent in &ws.agents {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            agent.id.hash(&mut h);
+            agent.workspace.hash(&mut h);
+            // `AgentStatus` is a wire type and derives no `Hash`; its
+            // discriminant is enough here and keeps the shared DTO untouched.
+            std::mem::discriminant(&agent.status).hash(&mut h);
+            // Commutative, so agent/workspace ordering can't alter the digest.
+            key = key.wrapping_add(h.finish());
+        }
+    }
+    key
+}
+
+/// What to tell the operator after a spawn request succeeds (#190).
+///
+/// Spawning is idempotent, and under k8s the `CalibanTask` name is derived from
+/// the spec — so submitting the same prompt twice resolves to the run already in
+/// flight. The dashboard used to report "Launched …" either way, which claimed
+/// something that had not happened. When the server reports `created: false`,
+/// say what actually occurred instead.
+pub fn launch_note(created: bool, agent_id: &str, workspace: &str) -> String {
+    let id = short_id(agent_id);
+    if created {
+        format!("Launched {id} in {workspace}.")
+    } else {
+        format!(
+            "Attached to the existing run {id} in {workspace} — an identical prompt was already in flight."
+        )
+    }
+}
+
 /// Whether a workspace's caliband answered the last poll.
 pub fn is_healthy(health: &WorkspaceHealth) -> bool {
     matches!(health, WorkspaceHealth::Healthy)
@@ -512,5 +565,127 @@ mod tests {
         assert_eq!(basename("/work/caliban/"), "caliban");
         assert_eq!(basename("caliban"), "caliban");
         assert_eq!(basename("/"), "/");
+    }
+
+    /// #190: the note must not claim a launch that did not happen.
+    #[test]
+    fn launch_note_distinguishes_a_real_launch_from_an_attach() {
+        let launched = launch_note(true, "ct-6e9c59b774f34db2", "v2-eval");
+        assert!(
+            launched.starts_with("Launched "),
+            "a real launch reads as one: {launched}"
+        );
+
+        let attached = launch_note(false, "ct-6e9c59b774f34db2", "v2-eval");
+        assert!(
+            !attached.contains("Launched"),
+            "an attach must never claim a launch: {attached}"
+        );
+        assert!(attached.contains("existing run"), "{attached}");
+        // Both name the same agent and workspace, so the operator can find it.
+        for note in [&launched, &attached] {
+            assert!(note.contains(short_id("ct-6e9c59b774f34db2")), "{note}");
+            assert!(note.contains("v2-eval"), "{note}");
+        }
+    }
+
+    fn snap(workspaces: Vec<Workspace>) -> FleetSnapshot {
+        FleetSnapshot {
+            host: "h".into(),
+            workspaces,
+        }
+    }
+
+    /// #190: the same fleet must digest identically, or the usage panel would
+    /// refetch on every poll — exactly the cost #181 avoided.
+    #[test]
+    fn activity_key_is_stable_for_an_unchanged_fleet() {
+        let build = || {
+            snap(vec![workspace(
+                "ws",
+                WorkspaceHealth::Healthy,
+                vec![
+                    agent("a1", AgentStatus::Running),
+                    agent("a2", AgentStatus::Idle),
+                ],
+            )])
+        };
+        assert_eq!(activity_key(&build()), activity_key(&build()));
+    }
+
+    /// The case the ticket was filed for: an agent reaching a terminal state
+    /// changes the aggregate, so it must move the key.
+    #[test]
+    fn activity_key_moves_when_an_agent_reaches_a_terminal_state() {
+        let before = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![agent("a1", AgentStatus::Running)],
+        )]);
+        let after = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![agent("a1", AgentStatus::Done)],
+        )]);
+        assert_ne!(activity_key(&before), activity_key(&after));
+    }
+
+    #[test]
+    fn activity_key_moves_when_an_agent_is_added_or_removed() {
+        let one = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![agent("a1", AgentStatus::Running)],
+        )]);
+        let two = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![
+                agent("a1", AgentStatus::Running),
+                agent("a2", AgentStatus::Running),
+            ],
+        )]);
+        assert_ne!(activity_key(&one), activity_key(&two), "an added agent");
+
+        let none = snap(vec![workspace("ws", WorkspaceHealth::Healthy, vec![])]);
+        assert_ne!(activity_key(&one), activity_key(&none), "a reaped agent");
+    }
+
+    /// The API does not promise a stable agent or workspace order, so an
+    /// ordering-sensitive digest would refetch on noise.
+    #[test]
+    fn activity_key_ignores_ordering() {
+        let a1 = agent("a1", AgentStatus::Running);
+        let a2 = agent("a2", AgentStatus::Done);
+        let forward = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![a1.clone(), a2.clone()],
+        )]);
+        let reversed = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![a2, a1],
+        )]);
+        assert_eq!(activity_key(&forward), activity_key(&reversed));
+    }
+
+    /// Health is reconciliation noise, not spend: flapping it must not trigger
+    /// a store aggregate.
+    #[test]
+    fn activity_key_ignores_workspace_health() {
+        let healthy = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Healthy,
+            vec![agent("a1", AgentStatus::Running)],
+        )]);
+        let sick = snap(vec![workspace(
+            "ws",
+            WorkspaceHealth::Unreachable {
+                reason: "boom".into(),
+            },
+            vec![agent("a1", AgentStatus::Running)],
+        )]);
+        assert_eq!(activity_key(&healthy), activity_key(&sick));
     }
 }

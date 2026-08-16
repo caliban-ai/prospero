@@ -419,6 +419,10 @@ async fn spawn_defaults_to_worktree_and_returns_isolated_true() {
     let v = json_body(resp).await;
     assert_eq!(v["isolated"], true);
     assert_eq!(v["workspace"], "repo");
+    // #190: the provider reports whether it really started something, and that
+    // must reach the wire — the dashboard picks its message from it. Local
+    // always spawns a fresh agent, so this is a genuine launch.
+    assert_eq!(v["created"], true);
     // And caliban actually received a worktree-isolated spec.
     assert!(h.fake.received_specs()[0].isolation_worktree);
 }

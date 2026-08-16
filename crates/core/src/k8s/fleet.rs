@@ -30,6 +30,7 @@ use crate::caliband::stream::NormalizeOptions;
 use crate::caliband::transport::TlsClient;
 use crate::caliband::wire::{Endpoint, SpawnSpec};
 use crate::error::{CoreError, Result};
+use crate::event::EventKind;
 use crate::fleet::{AttachBackoff, AttachTarget, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
 use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, TaskSpec as CrdTaskSpec, WorkspaceRef};
@@ -144,6 +145,8 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
         id: AgentId::from(name),
         workspace: repo,
         endpoint: Some(ep),
+        // An observation of an existing CR, never a creation (#190).
+        created: false,
     }))
 }
 
@@ -819,6 +822,19 @@ type KnownAgents = Arc<Mutex<HashMap<String, Agent>>>;
 /// the shared `known` state, update it, broadcast each `FleetChange` once, and
 /// (#113) attach every observed-`Running` agent this replica is elected to own.
 /// Runs for the fleet's lifetime (aborted by `K8sFleet::drop`). (#77 M2)
+/// Ownership key electing the single replica that persists the watch loop's
+/// observed transitions (#190).
+///
+/// Every replica polls the same `CalibanTask`s, so an ungated emit would write
+/// one copy of each transition *per replica* and multiply every outcome count in
+/// `Store::usage` by the replica count. This is the k8s counterpart to the local
+/// arm's per-repo `own_lifecycle` lease.
+///
+/// The leading underscores keep it disjoint from the agent-id keyspace the
+/// session plane leases: agent ids are `CalibanTask` names, and DNS-1123 forbids
+/// `_`, so no agent can ever collide with this key.
+pub(crate) const OBSERVER_STREAM_KEY: &str = "__fleet_observer";
+
 fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
     api: Arc<A>,
     known: KnownAgents,
@@ -914,6 +930,48 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                         id: AgentId::from(name),
                         workspace: agent.workspace,
                     });
+                }
+            }
+            // #190: persist the transitions, not just broadcast them. The usage
+            // aggregate counts terminal outcomes from `StatusChanged` events in
+            // the store; before this, the k8s arm computed the diff above and
+            // threw it away after the broadcast, so every outcome facet on the
+            // dashboard read zero — including for agents that demonstrably
+            // failed. The local arm has always emitted these (fleet.rs:1193).
+            //
+            // Single-writer, via the observer lease: `try_acquire` is idempotent
+            // for a lease this process already holds, so calling it each poll
+            // doubles as the renew, and a dead owner's lease expires so a peer
+            // takes over. `SelfOwnsAll` always acquires — standalone is unchanged.
+            //
+            // Emitted here, after the diff lock is released: `emit` is async and
+            // the guard above is a `std::sync::Mutex`.
+            if session
+                .ownership
+                .try_acquire(OBSERVER_STREAM_KEY)
+                .await
+                .is_some()
+            {
+                for change in &changes {
+                    if let FleetChange::StatusChanged {
+                        id,
+                        workspace,
+                        from,
+                        to,
+                    } = change
+                    {
+                        session
+                            .emitter
+                            .emit(
+                                workspace,
+                                id.as_str(),
+                                EventKind::StatusChanged {
+                                    from: *from,
+                                    to: *to,
+                                },
+                            )
+                            .await;
+                    }
                 }
             }
             // A send error just means no live subscribers right now; `known`
@@ -1146,6 +1204,15 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         let name = task_name(&spec);
         let repo = spec.workspace.clone();
         let ct = build_calibantask(&spec, &name);
+        // #190: `apply` is a create-or-update, and `name` is derived from the
+        // spec — so an identical prompt lands on the CR that already exists and
+        // returns its id. Correct, but indistinguishable from a fresh launch
+        // unless we look first, which is why the UI used to claim "Launched" for
+        // a run it never started. One extra read on a cold path buys an honest
+        // answer. A racing peer that creates the CR between this read and the
+        // apply is reported as created by both; the apply still converges, and
+        // over-reporting a launch here is the benign direction.
+        let existed = self.api.get(&name).await?.is_some();
         // `apply` runs the operator's admission webhook synchronously, so an
         // invalid workspaceRef / empty providers still fails fast here (4xx).
         // We deliberately do NOT wait for status.phase == "Running": the shared
@@ -1157,6 +1224,7 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
             id: AgentId::from(name),
             workspace: repo,
             endpoint: None,
+            created: !existed,
         })
     }
 
@@ -1454,13 +1522,20 @@ impl MemTaskApi {
     /// endpoint, as if the operator had reconciled it. Panics if `name` isn't
     /// present (apply it first).
     fn set_running(&self, name: &str, endpoint: &str) {
+        self.set_phase(name, "Running", Some(endpoint));
+    }
+
+    /// Test helper: flip a stored CR to an arbitrary operator phase, as if the
+    /// operator had reconciled it. Panics if `name` isn't present (apply it
+    /// first).
+    fn set_phase(&self, name: &str, phase: &str, endpoint: Option<&str>) {
         let mut store = self.store.lock().unwrap();
         let task = store
             .get_mut(name)
-            .unwrap_or_else(|| panic!("no CalibanTask named {name} to mark Running"));
+            .unwrap_or_else(|| panic!("no CalibanTask named {name} to set phase {phase} on"));
         task.status = Some(crate::k8s::crd::CalibanTaskStatus {
-            phase: "Running".to_string(),
-            caliband_endpoint: Some(endpoint.to_string()),
+            phase: phase.to_string(),
+            caliband_endpoint: endpoint.map(str::to_string),
             sandbox_ref: None,
             resolved_workspace: None,
         });
@@ -1623,6 +1698,47 @@ mod tests {
             ct.spec.tools.as_deref(),
             Some(["Read".to_string(), "Edit".to_string()].as_slice())
         );
+    }
+
+    /// #190: the `CalibanTask` name is derived from the spec, so re-submitting
+    /// an identical prompt applies over the CR that already exists and hands
+    /// back its id. The idempotency is right — but the caller was told
+    /// "Launched" for a run it never started. `created` is what lets the UI tell
+    /// the two apart.
+    #[tokio::test]
+    async fn ensure_agent_reports_whether_it_actually_created_the_task() {
+        let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, store);
+
+        let first = fleet
+            .ensure_agent(spec("repo-a", "task", None))
+            .await
+            .expect("first ensure_agent");
+        assert!(
+            first.created,
+            "the first submission really does create the CR"
+        );
+
+        // Byte-identical spec => the same derived name => the same CR.
+        let second = fleet
+            .ensure_agent(spec("repo-a", "task", None))
+            .await
+            .expect("second ensure_agent");
+        assert_eq!(second.id, first.id, "idempotent: the same agent comes back");
+        assert!(
+            !second.created,
+            "re-submitting an identical prompt attaches to the existing run and \
+             must not be reported as a launch"
+        );
+
+        // A different prompt is a different name, so it is a real creation.
+        let other = fleet
+            .ensure_agent(spec("repo-a", "a different task", None))
+            .await
+            .expect("third ensure_agent");
+        assert_ne!(other.id, first.id);
+        assert!(other.created);
     }
 
     #[tokio::test]
@@ -1943,6 +2059,189 @@ mod tests {
             }
             other => panic!("expected StatusChanged, got {other:?}"),
         }
+    }
+
+    /// Poll until `f` holds or the deadline passes, so a test never races the
+    /// (~20ms) watch cadence with a fixed sleep.
+    async fn eventually<F: FnMut() -> bool>(what: &str, mut f: F) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Replay every event the watch loop persisted for `name`.
+    async fn events_for(store: &Arc<dyn Store>, name: &str) -> Vec<crate::event::FleetEvent> {
+        store.replay(name, 0).await.expect("replay")
+    }
+
+    /// Replay until `pred` accepts the event list, or the deadline passes.
+    /// A dedicated async poller rather than [`eventually`] — the store is async,
+    /// and blocking on it from inside the runtime would risk a deadlock.
+    async fn events_until(
+        store: &Arc<dyn Store>,
+        name: &str,
+        what: &str,
+        pred: impl Fn(&[crate::event::FleetEvent]) -> bool,
+    ) -> Vec<crate::event::FleetEvent> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let events = events_for(store, name).await;
+            if pred(&events) {
+                return events;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; saw {events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #190: the k8s watch loop observes the same transitions the local arm
+    /// does, but only broadcast them in-memory — nothing reached the store. The
+    /// usage aggregate counts terminal outcomes from persisted `StatusChanged`
+    /// events, so on k8s every outcome facet read zero. The loop must persist
+    /// the transition, not just publish it.
+    #[tokio::test]
+    async fn watch_loop_persists_status_changed_to_the_store() {
+        let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, Arc::clone(&store))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+        fleet
+            .api
+            .apply(&build_calibantask(&s, &name))
+            .await
+            .unwrap();
+
+        // Let the loop observe the CR once so the terminal flip is a *transition*
+        // off a known prior status rather than a first sighting.
+        eventually("the loop to observe the new task", || {
+            fleet.known.lock().unwrap().contains_key(&name)
+        })
+        .await;
+
+        fleet.api.set_phase(&name, "Completed", None);
+
+        let persisted = events_until(&store, &name, "a persisted StatusChanged", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::StatusChanged { .. }))
+        })
+        .await;
+
+        let transition = persisted
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::StatusChanged { from, to } => Some((*from, *to, e.repo.clone())),
+                _ => None,
+            })
+            .expect("a StatusChanged in the store");
+        assert_eq!(
+            transition,
+            (AgentStatus::Spawning, AgentStatus::Done, "repo-a".into()),
+            "the persisted transition must carry the real from/to and the workspace"
+        );
+    }
+
+    /// #190: every replica polls the same CRs, so an ungated emit would write N
+    /// copies of each transition and multiply every outcome count by the replica
+    /// count. A replica that loses the observer lease must stay silent — the
+    /// same single-writer discipline `own_lifecycle` gives the local arm.
+    #[tokio::test]
+    async fn status_changed_emission_is_gated_by_the_observer_lease() {
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        // A peer takes the observer lease first, so the fleet under test loses it.
+        let peer = FakeOwnership {
+            replica: "peer".into(),
+            shared: shared.clone(),
+        };
+        peer.try_acquire(OBSERVER_STREAM_KEY)
+            .await
+            .expect("peer takes the observer lease");
+
+        let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, Arc::clone(&store))
+            .with_ownership(Arc::new(FakeOwnership {
+                replica: "self".into(),
+                shared: shared.clone(),
+            }))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+        fleet
+            .api
+            .apply(&build_calibantask(&s, &name))
+            .await
+            .unwrap();
+        eventually("the loop to observe the new task", || {
+            fleet.known.lock().unwrap().contains_key(&name)
+        })
+        .await;
+        fleet.api.set_phase(&name, "Completed", None);
+
+        // Give the loop several cycles to (wrongly) emit.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let events = events_for(&store, &name).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::StatusChanged { .. })),
+            "a replica that does not hold the observer lease must not persist \
+             transitions; got {events:?}"
+        );
+    }
+
+    /// #190 acceptance: the whole point of persisting the transition is that
+    /// `Store::usage` — which the dashboard's outcome facets read — reports a
+    /// non-zero count for a terminal k8s agent.
+    #[tokio::test]
+    async fn terminal_k8s_agents_are_counted_by_the_usage_aggregate() {
+        let api = MemTaskApi::new();
+        let (bus, store) = test_seams();
+        let fleet = K8sFleet::new(api, bus, Arc::clone(&store))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        let s = spec("repo-a", "task", None);
+        let name = task_name(&s);
+        fleet
+            .api
+            .apply(&build_calibantask(&s, &name))
+            .await
+            .unwrap();
+        eventually("the loop to observe the new task", || {
+            fleet.known.lock().unwrap().contains_key(&name)
+        })
+        .await;
+        fleet.api.set_phase(&name, "Failed", None);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let rows = loop {
+            let rows = store.usage("0000", "9999").await.expect("usage");
+            if rows.iter().any(|r| r.workspace == "repo-a") {
+                break rows;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a usage row for repo-a; saw {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let row = rows.iter().find(|r| r.workspace == "repo-a").expect("row");
+        assert_eq!(row.failed, 1, "the failed facet must count the agent");
+        assert_eq!(row.done, 0);
     }
 
     /// Deleting a `CalibanTask` that `watch_fleet` had already seen must
