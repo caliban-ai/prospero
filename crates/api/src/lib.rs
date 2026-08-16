@@ -52,14 +52,22 @@ pub fn router(
         bus,
     };
     Router::new()
-        // Dashboard.
-        .route("/", get(dashboard::index))
-        .route("/app.js", get(dashboard::app_js))
-        // Dashboard v2 (Dioxus/WASM, #97) — served alongside v1 during the
-        // transition, so `/` is unaffected. The catch-all covers the JS glue,
-        // the .wasm, the stylesheet, and wasm-bindgen's hashed `snippets/` tree.
+        // Dashboard v2 (Dioxus/WASM, #97) is the default surface (#191). The
+        // scaffold parked it at `/v2` so `/` stayed untouched while epic #95
+        // landed; that transition is done, so `/` serves it now and `/v2`
+        // remains a permanent alias — the bundle's own asset URLs are absolute
+        // `/v2/...`, and existing links and bookmarks point there.
+        //
+        // The catch-all covers the JS glue, the .wasm, the stylesheet, and
+        // wasm-bindgen's hashed `snippets/` tree.
+        .route("/", get(dashboard_v2::index))
         .route("/v2", get(dashboard_v2::index))
         .route("/v2/{*path}", get(dashboard_v2::asset))
+        // Dashboard v1, deprecated (#191). Kept reachable — and only reachable
+        // under `/v1` — so an operator who hits a v2 regression has somewhere to
+        // land. Deleting it is a follow-up, once v2 has a release of real use.
+        .route("/v1", get(dashboard::index))
+        .route("/v1/app.js", get(dashboard::app_js))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/api/metrics", get(handlers::get_metrics))

@@ -1250,42 +1250,11 @@ async fn agent_input_and_end_input_and_404() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
-#[tokio::test]
-async fn serves_dashboard_index() {
-    let h = setup().await;
-    let resp = h
-        .router
-        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("Prospero"));
-}
-
-#[tokio::test]
-async fn dashboard_app_js_has_javascript_content_type() {
-    let h = setup().await;
-    let resp = h
-        .router
-        .oneshot(
-            Request::builder()
-                .uri("/app.js")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(ct.contains("javascript"));
-}
+// `serves_dashboard_index` and `dashboard_app_js_has_javascript_content_type`
+// lived here and asserted that `/` and `/app.js` served v1. #191 inverted that
+// contract, and both are superseded by `root_serves_the_v2_document_with_its_csp`
+// and `v1_script_moves_under_v1_and_the_page_points_at_it` below, which assert
+// the same things about the paths that now hold them.
 
 // --- Dashboard v2 (Dioxus/WASM bundle, #97) ---------------------------------
 
@@ -1398,14 +1367,115 @@ async fn v2_unknown_asset_is_404_not_a_panic() {
     assert_ne!(status, StatusCode::OK);
 }
 
-/// v2 is served alongside v1 during the transition; `/` must be untouched.
+// --- v2 is the default surface; v1 is deprecated (#191) ---------------------
+
+/// Fetch `uri` and return its body as a string.
+async fn body_of(h: &Harness, uri: &str) -> String {
+    let resp = h
+        .router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// #191: the transition is over — `/` is v2. The scaffold (#97) deliberately
+/// parked v2 at `/v2` so `/` stayed untouched while the feature set landed;
+/// leaving it that way would mean the surface an operator lands on is the one
+/// no longer being developed.
 #[tokio::test]
-async fn v1_dashboard_is_unaffected_by_v2() {
+async fn root_serves_the_v2_document_with_its_csp() {
     let h = setup().await;
-    let (status, ct, _) = head_of(&h, "/").await;
+    let (status, ct, csp) = head_of(&h, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.starts_with("text/html"), "content-type was {ct}");
-    let (status, ct, _) = head_of(&h, "/app.js").await;
+    assert!(csp.contains("default-src 'none'"), "csp was: {csp}");
+    assert!(csp.contains("'wasm-unsafe-eval'"), "csp was: {csp}");
+
+    // Byte-identical to /v2 — one document, two paths, no second copy to skew.
+    assert_eq!(body_of(&h, "/").await, body_of(&h, "/v2").await);
+    // It really is the wasm app, not v1's hand-written page. The bundle's index
+    // pulls its stylesheet and module entrypoint from absolute `/v2/...` URLs,
+    // which is exactly why `/v2` has to stay mounted after the swap.
+    let root = body_of(&h, "/").await;
+    assert!(
+        root.contains("/v2/boot.js"),
+        "root should boot the v2 bundle"
+    );
+    assert!(!root.contains("/v1/app.js"), "root must not be the v1 page");
+}
+
+/// `/v2` stays a permanent alias. The bundle's own asset URLs are absolute
+/// `/v2/...`, and READMEs, notes, and bookmarks point there — breaking them
+/// buys nothing.
+#[tokio::test]
+async fn v2_remains_reachable_after_the_swap() {
+    let h = setup().await;
+    let (status, ct, csp) = head_of(&h, "/v2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"));
+    assert!(csp.contains("default-src 'none'"));
+
+    // The assets it references must still resolve from their absolute paths.
+    for asset in ["/v2/app.css", "/v2/prospero-dashboard_bg.wasm"] {
+        let (status, _, _) = head_of(&h, asset).await;
+        assert_eq!(status, StatusCode::OK, "{asset} must survive the swap");
+    }
+}
+
+/// v1 is deprecated, not deleted: an operator who hits a v2 regression needs
+/// somewhere to land. It moves off `/` and says what it is.
+#[tokio::test]
+async fn v1_is_served_at_v1_and_marked_deprecated() {
+    let h = setup().await;
+    let (status, ct, _) = head_of(&h, "/v1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"), "content-type was {ct}");
+
+    let body = body_of(&h, "/v1").await;
+    assert!(
+        body.to_lowercase().contains("deprecated"),
+        "the v1 page must say it is deprecated"
+    );
+    // And point home, or the notice is a dead end.
+    assert!(
+        body.contains("href=\"/\""),
+        "the deprecation notice must link to the current dashboard"
+    );
+}
+
+/// v1's script moves with it. Left at `/app.js` it would be an orphan on a
+/// path the current dashboard doesn't use.
+#[tokio::test]
+async fn v1_script_moves_under_v1_and_the_page_points_at_it() {
+    let h = setup().await;
+    let (status, ct, _) = head_of(&h, "/v1/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.contains("javascript"), "content-type was {ct}");
+
+    assert!(
+        body_of(&h, "/v1").await.contains("/v1/app.js"),
+        "the v1 page must load its script from the new path"
+    );
+
+    // The old path is gone — v2 owns the root namespace now.
+    let (status, _, _) = head_of(&h, "/app.js").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// v2 is served alongside v1 during the transition; `/` must be untouched.
+#[tokio::test]
+async fn v1_dashboard_still_works_from_its_new_home() {
+    let h = setup().await;
+    // Was `v1_dashboard_is_unaffected_by_v2`, asserting `/` + `/app.js`. #191
+    // moved v1 off the root; it must still be *whole* at its new prefix, which
+    // is the point of deprecating rather than deleting it.
+    let (status, ct, _) = head_of(&h, "/v1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    let (status, ct, _) = head_of(&h, "/v1/app.js").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.contains("javascript"), "content-type was {ct}");
 }
