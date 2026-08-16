@@ -1600,6 +1600,187 @@ textarea.input {
   font-style: italic;
 }
 
+
+/* --- Usage charts (#181) ---------------------------------------------------- */
+.window-control {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.win-btn {
+  padding: 2px var(--sp-2);
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.win-btn:hover { color: var(--ink); }
+
+/* State carried by weight and fill, not hue alone. */
+.win-btn.is-on {
+  background: var(--accent-wash);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-5);
+}
+
+.chart {
+  margin: 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: var(--sp-2);
+}
+
+.chart-title {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+/* The headline is the number the operator actually came for. */
+.chart-headline {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.chart-svg {
+  display: block;
+  width: 100%;
+  height: 84px;
+  overflow: visible;
+}
+
+/* Recessive chrome: the axis should never compete with the data. */
+.chart-axis {
+  stroke: var(--hairline);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.area-fill { fill: currentColor; opacity: 0.16; }
+
+.area-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.bar { fill: currentColor; }
+
+/* Tone classes set `color`, so fill/stroke inherit via currentColor and one
+   rule serves fills and strokes alike. */
+.tone-accent { color: var(--accent); }
+.area-fill.tone-live, .area-line.tone-live, .bar.tone-live { color: var(--tone-live); }
+.area-fill.tone-wait, .area-line.tone-wait, .bar.tone-wait { color: var(--tone-wait); }
+.area-fill.tone-done, .area-line.tone-done, .bar.tone-done { color: var(--tone-done); }
+.area-fill.tone-bad, .area-line.tone-bad, .bar.tone-bad { color: var(--tone-bad); }
+.area-fill.tone-accent, .area-line.tone-accent, .bar.tone-accent { color: var(--accent); }
+
+.chart-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--sp-1);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
+}
+
+/* Outcome small multiples: one hue per facet, so no two status tones are ever
+   adjacent — see charts.rs for why a stacked bar could not be made separable. */
+.facets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-5);
+}
+
+.facet {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.facet-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
+}
+
+.facet-label {
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.facet-total {
+  margin-left: auto;
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.facet-svg {
+  display: block;
+  width: 100%;
+  height: 34px;
+}
+
+.chart-empty {
+  padding: var(--sp-5);
+  margin-bottom: var(--sp-5);
+  border: 1px dashed var(--hairline);
+  border-radius: var(--radius);
+  text-align: center;
+  color: var(--ink-muted);
+}
+
+.chart-empty.is-bad {
+  border-color: var(--tone-bad);
+  color: var(--tone-bad);
+}
+
+.section-subtitle {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
 /* --- Theme control ---------------------------------------------------------- */
 .theme-toggle {
   display: inline-flex;

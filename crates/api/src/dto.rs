@@ -63,6 +63,13 @@ pub struct UsageQuery {
     pub since: Option<String>,
     /// Exclusive window end (RFC-3339). Defaults to now.
     pub until: Option<String>,
+    /// How many days back to look, as an alternative to `since`.
+    ///
+    /// The dashboard's window control sends this rather than a computed
+    /// timestamp so the server resolves the bound against its own clock; a
+    /// browser whose clock has drifted would otherwise silently clip or pad the
+    /// window. Ignored when `since` is given explicitly.
+    pub days: Option<i64>,
 }
 
 /// Fold the store's flat (workspace, day) rows into the per-workspace report.

@@ -15,6 +15,7 @@ use prospero_types::{Capabilities, FleetSnapshot};
 
 mod actions;
 mod api;
+mod charts;
 mod config_form;
 mod sse;
 mod stream;

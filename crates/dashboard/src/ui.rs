@@ -9,6 +9,7 @@ use prospero_types::{
 };
 
 use crate::actions::Action;
+use crate::charts::{Measure, Point, Window};
 use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
 use crate::stream::{StreamSession, StreamState};
 use crate::theme::{STORAGE_KEY, Theme};
@@ -215,6 +216,7 @@ pub fn Overview(snapshot: FleetSnapshot) -> Element {
     let t = totals(&snapshot);
     rsx! {
         StatRow { totals: t }
+        UsagePanel {}
         div { class: "section-head",
             h2 { class: "section-title", "Workspaces" }
             span { class: "section-rule" }
@@ -1885,5 +1887,229 @@ pub(crate) fn kind_label(kind: &EventKind) -> String {
         EventKind::RepoHealth { .. } => "workspace health".into(),
         // Every other kind has its own row; this is the catch-all.
         _ => "event".into(),
+    }
+}
+
+/// The usage panel: spend and volume over time, plus one faceted chart per
+/// outcome, over a selectable window (#181).
+///
+/// Refetches whenever the window changes. It deliberately does **not** ride the
+/// 5-second fleet poll: an aggregate over 30 days does not change second to
+/// second, and re-running a store aggregate that often would be wasteful.
+#[component]
+fn UsagePanel() -> Element {
+    let mut window = use_signal(|| Window::Week);
+    let report =
+        use_resource(move || async move { crate::api::fetch_usage(window().days()).await });
+
+    let body = match &*report.read_unchecked() {
+        None => rsx! {
+            div { class: "chart-empty", "Loading usage…" }
+        },
+        Some(Err(e)) => rsx! {
+            div { class: "chart-empty is-bad", "{e}" }
+        },
+        Some(Ok(r)) => {
+            let cost = crate::charts::fleet_series(r, Measure::Cost);
+            let turns = crate::charts::fleet_series(r, Measure::Turns);
+            // An empty window gets an honest empty state rather than an axis
+            // with no marks on it.
+            if cost.is_empty() && turns.is_empty() {
+                rsx! {
+                    div { class: "chart-empty",
+                        "No agent activity in the last {window().label()}."
+                    }
+                }
+            } else {
+                let spend_total = crate::charts::format_usd(crate::charts::total(&cost));
+                let turns_total = crate::charts::format_count(crate::charts::total(&turns));
+                rsx! {
+                    div { class: "chart-grid",
+                        AreaChart {
+                            title: "Spend",
+                            headline: spend_total,
+                            points: cost,
+                            measure: Measure::Cost,
+                        }
+                        BarChart {
+                            title: "Turns",
+                            headline: turns_total,
+                            points: turns,
+                            measure: Measure::Turns,
+                        }
+                    }
+                    div { class: "section-head",
+                        h3 { class: "section-subtitle", "Outcomes" }
+                        span { class: "section-rule" }
+                    }
+                    // Faceted, not stacked: see charts.rs — no ordering of the
+                    // four status tones is separable in light mode, and one hue
+                    // per facet means no two are ever adjacent.
+                    div { class: "facets",
+                        for m in [Measure::Done, Measure::Killed, Measure::Failed, Measure::Crashed] {
+                            OutcomeFacet {
+                                key: "{m.label()}",
+                                measure: m,
+                                points: crate::charts::fleet_series(r, m),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "section-head",
+            h2 { class: "section-title", "Usage" }
+            span { class: "section-rule" }
+            div { class: "window-control", role: "group", aria_label: "Time window",
+                for w in Window::all() {
+                    button {
+                        key: "{w.label()}",
+                        class: if window() == w { "win-btn is-on" } else { "win-btn" },
+                        aria_pressed: if window() == w { "true" } else { "false" },
+                        onclick: move |_| window.set(w),
+                        "{w.label()}"
+                    }
+                }
+            }
+        }
+        {body}
+    }
+}
+
+/// Spend over time. One series, so the title names it and no legend is needed.
+#[component]
+fn AreaChart(title: String, headline: String, points: Vec<Point>, measure: Measure) -> Element {
+    // A fixed user-space viewBox scaled by CSS: the SVG stays crisp at any
+    // width without measuring the DOM.
+    let (w, h) = (600.0, 120.0);
+    let max = crate::charts::nice_max(crate::charts::peak(&points));
+    let area = crate::charts::area_path(&points, w, h, max);
+    let line = crate::charts::line_path(&points, w, h, max);
+    let tone = measure.tone();
+
+    rsx! {
+        figure { class: "chart",
+            figcaption { class: "chart-head",
+                span { class: "chart-title", "{title}" }
+                span { class: "chart-headline", "{headline}" }
+            }
+            svg {
+                class: "chart-svg",
+                view_box: "0 0 {w} {h}",
+                preserve_aspect_ratio: "none",
+                role: "img",
+                "aria-label": "{title} over time: {headline} total",
+                // Recessive baseline, so the data reads before the chrome.
+                line {
+                    class: "chart-axis",
+                    x1: "0", y1: "{h}", x2: "{w}", y2: "{h}",
+                }
+                if let Some(d) = area {
+                    path { class: "area-fill tone-{tone}", d: "{d}" }
+                }
+                if let Some(d) = line {
+                    path { class: "area-line tone-{tone}", d: "{d}" }
+                }
+            }
+            AxisTicks { points }
+        }
+    }
+}
+
+/// Volume over time as bars.
+#[component]
+fn BarChart(title: String, headline: String, points: Vec<Point>, measure: Measure) -> Element {
+    let (w, h) = (600.0, 120.0);
+    let max = crate::charts::nice_max(crate::charts::peak(&points));
+    let rects = crate::charts::bars(&points, w, h, max);
+    let tone = measure.tone();
+
+    rsx! {
+        figure { class: "chart",
+            figcaption { class: "chart-head",
+                span { class: "chart-title", "{title}" }
+                span { class: "chart-headline", "{headline}" }
+            }
+            svg {
+                class: "chart-svg",
+                view_box: "0 0 {w} {h}",
+                preserve_aspect_ratio: "none",
+                role: "img",
+                "aria-label": "{title} over time: {headline} total",
+                line {
+                    class: "chart-axis",
+                    x1: "0", y1: "{h}", x2: "{w}", y2: "{h}",
+                }
+                for (i , b) in rects.iter().enumerate() {
+                    rect {
+                        key: "b{i}",
+                        class: "bar tone-{tone}",
+                        x: "{b.x}", y: "{b.y}", width: "{b.w}", height: "{b.h}",
+                        // Native tooltip: no script, no positioning maths, and
+                        // it survives the CSP unchanged.
+                        title { "{b.day}: {crate::charts::format_count(b.value)}" }
+                    }
+                }
+            }
+            AxisTicks { points }
+        }
+    }
+}
+
+/// One outcome's own small chart. Single hue, its own scale, direct total.
+#[component]
+fn OutcomeFacet(measure: Measure, points: Vec<Point>) -> Element {
+    let (w, h) = (200.0, 48.0);
+    let max = crate::charts::nice_max(crate::charts::peak(&points));
+    let rects = crate::charts::bars(&points, w, h, max);
+    let tone = measure.tone();
+    let total = crate::charts::format_count(crate::charts::total(&points));
+
+    rsx! {
+        figure { class: "facet",
+            figcaption { class: "facet-head",
+                // Glyph + label, never hue alone — these are status colours and
+                // the design system carries state by more than colour.
+                span { class: "glyph tone-{tone}" }
+                span { class: "facet-label", "{measure.label()}" }
+                span { class: "facet-total", "{total}" }
+            }
+            svg {
+                class: "facet-svg",
+                view_box: "0 0 {w} {h}",
+                preserve_aspect_ratio: "none",
+                role: "img",
+                "aria-label": "{measure.label()}: {total} over the window",
+                for (i , b) in rects.iter().enumerate() {
+                    rect {
+                        key: "f{i}",
+                        class: "bar tone-{tone}",
+                        x: "{b.x}", y: "{b.y}", width: "{b.w}", height: "{b.h}",
+                        title { "{b.day}: {crate::charts::format_count(b.value)}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// First and last day under a chart. Only the ends are labelled — a tick per
+/// day would collide at 30 days and add nothing at 7.
+#[component]
+fn AxisTicks(points: Vec<Point>) -> Element {
+    let first = points
+        .first()
+        .map(|p| crate::charts::tick_label(&p.day).to_string());
+    let last = points
+        .last()
+        .map(|p| crate::charts::tick_label(&p.day).to_string());
+    rsx! {
+        div { class: "chart-ticks",
+            span { {first.unwrap_or_default()} }
+            span { {last.unwrap_or_default()} }
+        }
     }
 }
