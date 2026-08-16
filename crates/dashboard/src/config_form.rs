@@ -201,7 +201,11 @@ impl K8sForm {
             .map(|p| ProviderRow {
                 name: p.name.clone(),
                 kind: p.kind.clone(),
-                base_url: String::new(),
+                // Read back rather than blanked: an empty box here would save
+                // as "no base URL" and silently unpick a self-hosted provider
+                // (#188). Secret refs below stay blank — those really are
+                // unreadable, and blanking them is the documented behaviour.
+                base_url: p.base_url.clone().unwrap_or_default(),
                 model: p.model.clone().unwrap_or_default(),
                 secret_name: String::new(),
                 secret_key: String::new(),
@@ -489,6 +493,51 @@ mod tests {
         assert_eq!(valid_form().validate(), Ok(()));
     }
 
+    /// A self-hosted provider's base URL must survive create *and* the edit
+    /// round-trip. Without it the worker falls back to the in-pod default and
+    /// every agent dies at preflight with `ProviderError` (#188).
+    #[test]
+    fn k8s_provider_base_url_round_trips() {
+        let mut form = valid_form();
+        form.providers[0].base_url = " http://192.168.1.240:11434 ".into();
+
+        let cfg = form.to_config();
+        assert_eq!(
+            cfg.providers[0].base_url.as_deref(),
+            Some("http://192.168.1.240:11434"),
+            "base URL must reach the CR, trimmed"
+        );
+
+        // Reopening the editor must show it again. Projecting it away here is
+        // what made a routine model edit wipe the base URL.
+        let providers: Vec<ProviderInfo> = cfg
+            .providers
+            .iter()
+            .map(|p| ProviderInfo {
+                name: p.name.clone(),
+                kind: p.kind.clone(),
+                base_url: p.base_url.clone(),
+                model: p.model.clone(),
+                has_credentials: p.credentials_ref.is_some(),
+            })
+            .collect();
+        let reopened = K8sForm::from_summary(
+            cfg.display_name.as_deref(),
+            &cfg.sources,
+            &providers,
+            cfg.default_provider.as_deref(),
+        );
+        assert_eq!(
+            reopened.providers[0].base_url, "http://192.168.1.240:11434",
+            "the editor must show the saved base URL, not a blank box"
+        );
+        assert_eq!(
+            reopened.to_config().providers[0].base_url.as_deref(),
+            Some("http://192.168.1.240:11434"),
+            "and saving again must not drop it"
+        );
+    }
+
     #[test]
     fn k8s_requires_at_least_one_source_and_provider() {
         // The CRD's minItems:1 — submitting less produced an opaque 422.
@@ -645,6 +694,7 @@ mod tests {
         let providers = vec![ProviderInfo {
             name: "planner".into(),
             kind: "anthropic".into(),
+            base_url: None,
             model: Some("claude-opus-5".into()),
             has_credentials: true,
         }];
