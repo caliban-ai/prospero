@@ -136,7 +136,9 @@ pub fn launch_note(created: bool, agent_id: &str, workspace: &str) -> String {
     if created {
         format!("Launched {id} in {workspace}.")
     } else {
-        format!("Attached to the existing run {id} in {workspace} — an identical prompt was already in flight.")
+        format!(
+            "Attached to the existing run {id} in {workspace} — an identical prompt was already in flight."
+        )
     }
 }
 
@@ -602,7 +604,10 @@ mod tests {
             snap(vec![workspace(
                 "ws",
                 WorkspaceHealth::Healthy,
-                vec![agent("a1", AgentStatus::Running), agent("a2", AgentStatus::Idle)],
+                vec![
+                    agent("a1", AgentStatus::Running),
+                    agent("a2", AgentStatus::Idle),
+                ],
             )])
         };
         assert_eq!(activity_key(&build()), activity_key(&build()));
@@ -635,7 +640,10 @@ mod tests {
         let two = snap(vec![workspace(
             "ws",
             WorkspaceHealth::Healthy,
-            vec![agent("a1", AgentStatus::Running), agent("a2", AgentStatus::Running)],
+            vec![
+                agent("a1", AgentStatus::Running),
+                agent("a2", AgentStatus::Running),
+            ],
         )]);
         assert_ne!(activity_key(&one), activity_key(&two), "an added agent");
 
