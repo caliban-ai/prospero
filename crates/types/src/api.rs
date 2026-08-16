@@ -187,6 +187,78 @@ pub struct WorkspaceSummary {
     pub status: Option<WorkspaceStatusInfo>,
 }
 
+/// How many agents reached each terminal state.
+///
+/// These are [`crate::AgentStatus`]'s terminal variants, counted from
+/// `status_changed` transitions — deliberately *not* `AgentFinished.outcome`,
+/// which carries caliban's open-ended result subtype ("EndOfTurn",
+/// "max_turns") and cannot be charted as a fixed set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeCounts {
+    /// Finished successfully.
+    pub done: u64,
+    /// Finished with an error.
+    pub failed: u64,
+    /// Stopped via kill.
+    pub killed: u64,
+    /// Supervisor restarted while active.
+    pub crashed: u64,
+}
+
+impl OutcomeCounts {
+    /// Total agents that reached any terminal state.
+    pub fn total(&self) -> u64 {
+        self.done + self.failed + self.killed + self.crashed
+    }
+}
+
+/// One day's usage within a workspace — the unit the fleet charts plot.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageBucket {
+    /// UTC day, `YYYY-MM-DD`.
+    pub day: String,
+    /// Summed run cost in USD.
+    pub cost_usd: f64,
+    /// Summed turns.
+    pub turns: u64,
+    /// Terminal outcomes recorded on this day.
+    pub outcomes: OutcomeCounts,
+}
+
+/// One workspace's totals over the whole window, plus its daily series.
+///
+/// `cost_usd` and `outcomes` can legitimately disagree: an agent killed before
+/// it reported a result contributes to `outcomes.killed` with no cost at all, so
+/// a workspace may show outcomes against zero spend. Charts should not treat
+/// that as missing data.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageGroup {
+    /// Workspace name.
+    pub workspace: String,
+    /// Cost across the window.
+    pub cost_usd: f64,
+    /// Turns across the window.
+    pub turns: u64,
+    /// Terminal outcomes across the window.
+    pub outcomes: OutcomeCounts,
+    /// Per-day breakdown, ascending by day. Only days with activity appear.
+    pub series: Vec<UsageBucket>,
+}
+
+/// `GET /api/usage` — aggregated spend and outcomes per workspace.
+///
+/// The window is echoed back so a client rendering an axis does not have to
+/// re-derive the defaults the server applied.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageReport {
+    /// Inclusive window start (RFC-3339).
+    pub since: String,
+    /// Exclusive window end (RFC-3339).
+    pub until: String,
+    /// One entry per workspace with activity, ordered by name.
+    pub groups: Vec<UsageGroup>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

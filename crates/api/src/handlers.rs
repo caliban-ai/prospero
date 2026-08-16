@@ -9,13 +9,37 @@ use prospero_core::model::{Agent, AgentId, DrainPolicy, FleetSnapshot, TaskSpec}
 use crate::AppState;
 use crate::dto::{
     AddWorkspaceBody, AgentInputBody, FromSeq, RespawnedResponse, SetConfigBody, SpawnBody,
-    SpawnedResponse, WorkspaceSummary,
+    SpawnedResponse, UsageQuery, UsageReport, WorkspaceSummary,
 };
 use crate::error::ApiError;
+
+/// How far back `GET /api/usage` looks when the caller names no `since`.
+const DEFAULT_USAGE_WINDOW_DAYS: i64 = 7;
 
 /// `GET /api/fleet` — the whole fleet snapshot.
 pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
     Json(st.fleet.snapshot().await)
+}
+
+/// `GET /api/usage` — cost, turns, and terminal outcomes per workspace over a
+/// window, with a per-day series (#180).
+///
+/// The store does the aggregation; this only resolves the window and reshapes
+/// the rows. Bounds are compared lexically against the stored RFC-3339
+/// timestamps — the same assumption retention already makes — so the defaults
+/// are emitted with `to_rfc3339()` to match the format events are written in.
+pub async fn get_usage(
+    State(st): State<AppState>,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<UsageReport>, ApiError> {
+    let now = chrono::Utc::now();
+    let until = q.until.unwrap_or_else(|| now.to_rfc3339());
+    let since = q
+        .since
+        .unwrap_or_else(|| (now - chrono::Duration::days(DEFAULT_USAGE_WINDOW_DAYS)).to_rfc3339());
+
+    let rows = st.store.usage(&since, &until).await?;
+    Ok(Json(crate::dto::usage_report(rows, &since, &until)))
 }
 
 /// `GET /api/workspaces` — managed workspaces with health, sources, agent counts.

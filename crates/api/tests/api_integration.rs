@@ -39,6 +39,9 @@ impl Store for UnwritableStore {
     async fn prune(&self, before_ts: &str) -> Result<u64> {
         self.0.prune(before_ts).await
     }
+    async fn usage(&self, since: &str, until: &str) -> Result<Vec<prospero_core::store::UsageRow>> {
+        self.0.usage(since, until).await
+    }
 }
 
 struct Harness {
@@ -637,6 +640,122 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
             && e["kind"]["turns"] == 4),
         "agent_finished shape: {v}"
     );
+}
+
+/// `GET /api/usage` aggregates spend and outcomes per workspace over a window
+/// (#180). Seeds the store directly so the assertion is on the aggregate the
+/// charts in #181 consume, not on caliban normalization.
+#[tokio::test]
+async fn usage_endpoint_aggregates_cost_and_outcomes_by_workspace() {
+    use prospero_core::event::EventKind;
+    let h = setup().await;
+    let store = h.manager.store();
+    let ev = |seq, ts: &str, agent: &str, kind| FleetEvent {
+        seq,
+        ts: ts.to_string(),
+        repo: "repo".to_string(),
+        agent_id: agent.to_string(),
+        kind,
+    };
+
+    store
+        .append(&ev(
+            1,
+            "2026-08-01T10:00:00+00:00",
+            "a1",
+            EventKind::AgentFinished {
+                outcome: "success".to_string(),
+                cost_usd: 0.50,
+                turns: 3,
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            "2026-08-01T10:00:01+00:00",
+            "a1",
+            EventKind::StatusChanged {
+                from: AgentStatus::Running,
+                to: AgentStatus::Done,
+            },
+        ))
+        .await
+        .unwrap();
+    // Killed without ever finishing: an outcome carrying no cost.
+    store
+        .append(&ev(
+            1,
+            "2026-08-02T10:00:00+00:00",
+            "a2",
+            EventKind::StatusChanged {
+                from: AgentStatus::Running,
+                to: AgentStatus::Killed,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/usage?since=2026-08-01T00:00:00%2B00:00&until=2026-08-03T00:00:00%2B00:00")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+
+    let g = &v["groups"][0];
+    assert_eq!(g["workspace"], "repo", "payload: {v}");
+    assert_eq!(g["cost_usd"], 0.50);
+    assert_eq!(g["turns"], 3);
+    assert_eq!(g["outcomes"]["done"], 1);
+    assert_eq!(g["outcomes"]["killed"], 1);
+    assert_eq!(g["outcomes"]["failed"], 0);
+
+    // Two active days, ascending, so #181 can plot a series without re-sorting.
+    let series = g["series"].as_array().unwrap();
+    assert_eq!(series.len(), 2, "series: {v}");
+    assert_eq!(series[0]["day"], "2026-08-01");
+    assert_eq!(series[0]["cost_usd"], 0.50);
+    assert_eq!(series[1]["day"], "2026-08-02");
+    assert_eq!(series[1]["cost_usd"], 0.0);
+    assert_eq!(series[1]["outcomes"]["killed"], 1);
+}
+
+/// With no query params the endpoint must still answer, echoing back the window
+/// it chose so a client can label an axis without re-deriving the default.
+#[tokio::test]
+async fn usage_endpoint_defaults_its_window() {
+    let h = setup().await;
+    let resp = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/usage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert!(
+        v["since"].as_str().is_some_and(|s| !s.is_empty()),
+        "since must be echoed: {v}"
+    );
+    assert!(
+        v["until"].as_str().is_some_and(|s| !s.is_empty()),
+        "until must be echoed: {v}"
+    );
+    assert!(v["groups"].as_array().unwrap().is_empty(), "payload: {v}");
 }
 
 #[tokio::test]
