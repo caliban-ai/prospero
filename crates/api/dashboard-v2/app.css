@@ -1474,6 +1474,132 @@ textarea.input {
   color: var(--tone-bad);
 }
 
+/* --- Timeline (#179) -------------------------------------------------------- */
+/* The init header: the run's opening context, lifted out of the log body so it
+   reads as a heading rather than another line of chatter. */
+.tl-init {
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--raised);
+}
+
+.tl-init-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.tl-init-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.tl-init-model {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.tl-init-meta {
+  display: flex;
+  gap: var(--sp-3);
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+/* Tool call. A native <details>, so the disclosure is keyboard-operable and
+   labelled without any script — which the CSP forbids inline anyway. */
+.tl-tool {
+  margin: var(--sp-1) 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--raised);
+}
+
+.tl-tool-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  cursor: pointer;
+  list-style: none;
+}
+
+/* Replace the default disclosure triangle with one that rotates on open. */
+.tl-tool-head::-webkit-details-marker {
+  display: none;
+}
+
+.tl-tool-head::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 4px solid var(--ink-dim);
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  transition: transform 120ms ease;
+}
+
+.tl-tool[open] > .tl-tool-head::before {
+  transform: rotate(90deg);
+}
+
+.tl-tool-head:hover {
+  background: var(--surface);
+}
+
+.tl-tool-name {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* Pushes the duration to the right edge regardless of name length. */
+.tl-tool-dur {
+  margin-left: auto;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-tool-body {
+  padding: 0 var(--sp-2) var(--sp-2) var(--sp-2);
+  border-top: 1px solid var(--hairline);
+}
+
+.tl-tool-section + .tl-tool-section {
+  margin-top: var(--sp-2);
+}
+
+.tl-tool-legend {
+  margin: var(--sp-2) 0 var(--sp-1);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.tl-tool-input {
+  margin: 0;
+  padding: var(--sp-2);
+  border-radius: var(--radius-sm);
+  background: var(--ground);
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 18vh;
+  overflow-y: auto;
+}
+
+/* Stated absence, not an empty panel — a blank box reads as a broken view. */
+.tl-tool-absent {
+  margin: 0;
+  color: var(--ink-muted);
+  font-style: italic;
+}
+
 /* --- Theme control ---------------------------------------------------------- */
 .theme-toggle {
   display: inline-flex;
