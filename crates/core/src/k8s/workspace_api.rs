@@ -286,6 +286,7 @@ fn workspace_info(ws: &Workspace) -> crate::registry::WorkspaceInfo {
             .map(|p| ProviderInfo {
                 name: p.name.clone(),
                 kind: p.kind.clone(),
+                base_url: p.base_url.clone(),
                 model: p.model.clone(),
                 has_credentials: p.credentials_ref.is_some(),
             })

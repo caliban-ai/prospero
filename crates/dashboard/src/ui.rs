@@ -516,15 +516,35 @@ fn AgentRow(agent: Agent) -> Element {
 }
 
 /// No workspaces registered yet.
+///
+/// Backend-aware: under k8s a workspace is a `Workspace` CR created through the
+/// button directly above this message, so telling the operator to run the local
+/// CLI would send them somewhere that does not apply (#188).
 #[component]
 fn EmptyState() -> Element {
+    let ui = use_context::<Ui>();
+    let caps = ui.caps.read();
     rsx! {
         div { class: "state",
             h2 { class: "state-title", "No workspaces registered" }
-            p { class: "state-detail",
-                "Register one with "
-                code { "prospero repo add <name> <path>" }
-                " and it will appear here."
+            if caps.async_workspace_ops {
+                p { class: "state-detail",
+                    "Add one with the button above — it becomes a "
+                    code { "Workspace" }
+                    " resource the operator reconciles."
+                }
+            } else if caps.admin {
+                p { class: "state-detail",
+                    "Add one with the button above, or run "
+                    code { "prospero repo add <name> <path>" }
+                    "."
+                }
+            } else {
+                p { class: "state-detail",
+                    "Register one with "
+                    code { "prospero repo add <name> <path>" }
+                    " and it will appear here."
+                }
             }
         }
     }
@@ -1562,6 +1582,17 @@ fn K8sFields(form: Signal<K8sForm>, env: Signal<Vec<(String, String)>>) -> Eleme
                         placeholder: "model",
                         value: "{form.read().providers[i].model}",
                         oninput: move |e| form.write().providers[i].model = e.value(),
+                    }
+                    // Without this a self-hosted provider falls back to the
+                    // in-pod default (localhost:11434) and every agent dies at
+                    // preflight with ProviderError (#188). The field existed in
+                    // `ProviderRow` and mapped through `to_config`; only the
+                    // input was missing.
+                    input {
+                        class: "input",
+                        placeholder: "base URL (optional)",
+                        value: "{form.read().providers[i].base_url}",
+                        oninput: move |e| form.write().providers[i].base_url = e.value(),
                     }
                     input {
                         class: "input",

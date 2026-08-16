@@ -136,6 +136,14 @@ pub struct ProviderInfo {
     pub name: String,
     /// Provider kind (e.g. `ollama`, `anthropic`).
     pub kind: String,
+    /// Override base URL, if set.
+    ///
+    /// On the read side because the config editor round-trips it: without it,
+    /// reopening a workspace showed a blank base URL and saving silently
+    /// dropped the stored one, pointing every agent back at the in-pod default
+    /// (#188). Unlike the credential Secret, a base URL is not sensitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// Default model for this provider, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
