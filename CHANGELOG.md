@@ -9,6 +9,25 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dashboard v2 is now the default surface.** `GET /` serves the Dioxus/WASM
+  dashboard; `/v2` stays mounted as a permanent alias, since the bundle's own
+  asset URLs are absolute `/v2/...` and existing links point there. The scaffold
+  deliberately parked v2 at `/v2` so `/` stayed untouched while epic #95 landed —
+  that transition is complete
+  ([#191](https://github.com/caliban-ai/prospero/issues/191)).
+
+### Deprecated
+
+- **The v1 dashboard has moved to `/v1` and is deprecated.** It renders a notice
+  pointing at `/`, and its script now lives at `/v1/app.js` (`GET /app.js` is
+  gone). It is kept rather than removed so an operator hitting a v2 regression
+  has somewhere to land, but it receives no further work and carries defects v2
+  was built to fix — most visibly #106, where a tool call whose finish frame has
+  a blank name stays "running" forever. Removal is a follow-up once v2 has a
+  release of real-world use ([#191](https://github.com/caliban-ai/prospero/issues/191)).
+
 ### Fixed
 
 - **Terminal outcomes are now recorded under `PROSPERO_FLEET=k8s`.** The usage

@@ -17,6 +17,12 @@
         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
         background: #0f1115;
         color: #d7dae0;
+        /* A flex column so `main` can claim the remaining height. It used to be
+           `calc(100vh - 49px)` — a hardcoded header height that the #191
+           deprecation bar would have silently pushed off-screen. */
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
       }
       header {
         padding: 12px 18px;
@@ -27,7 +33,22 @@
       }
       header h1 { font-size: 16px; margin: 0; color: #8ab4f8; }
       header .sub { color: #6b7280; font-size: 12px; }
-      main { display: grid; grid-template-columns: 360px 1fr; height: calc(100vh - 49px); }
+      /* #191: v1 is deprecated. The notice is a full-width bar above the header
+         rather than a subtitle, because an operator who lands here by an old
+         bookmark needs to see it without looking for it. Amber, not the red
+         `.banner` tone — this is not a failure, and reusing the error colour
+         would cry wolf on every page load. */
+      .deprecated {
+        padding: 8px 18px;
+        background: #2b2413;
+        color: #e8c26a;
+        border-bottom: 1px solid #4a3d1c;
+        font-size: 12px;
+      }
+      .deprecated a { color: #f0d48a; }
+      /* `min-height: 0` lets the two scroll panes below actually shrink; without
+         it a flex item floors at its content height and the page scrolls instead. */
+      main { display: grid; grid-template-columns: 360px 1fr; flex: 1; min-height: 0; }
       #fleet { overflow-y: auto; border-right: 1px solid #232733; padding: 0 12px 12px; }
       #fleet-head { display: flex; justify-content: space-between; align-items: center;
                     position: sticky; top: 0; z-index: 3; background: #0f1115;
@@ -167,6 +188,10 @@
     </style>
   </head>
   <body>
+    <div class="deprecated" role="status">
+      This is the <strong>deprecated</strong> dashboard (v1). The current one is
+      at <a href="/">/</a> — it supersedes this page and is where fixes land.
+    </div>
     <header>
       <h1>Prospero</h1>
       <span class="sub">fleet control plane · <span id="host">…</span></span>
@@ -186,6 +211,6 @@
       </section>
     </main>
     <div id="modal-root" class="modal-root hidden"></div>
-    <script src="/app.js"></script>
+    <script src="/v1/app.js"></script>
   </body>
 </html>
