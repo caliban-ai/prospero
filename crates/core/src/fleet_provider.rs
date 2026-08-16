@@ -86,6 +86,9 @@ impl FleetProvider for LocalFleet {
             id: AgentId::from(id),
             workspace: spec.workspace,
             endpoint: Some(endpoint),
+            // Local always spawns: caliband assigns a fresh id per request, so
+            // there is no name-derived CR to collide with the way k8s has (#190).
+            created: true,
         })
     }
 

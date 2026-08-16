@@ -9,6 +9,30 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Terminal outcomes are now recorded under `PROSPERO_FLEET=k8s`.** The usage
+  aggregate counts `done`/`failed`/`killed`/`crashed` from persisted
+  `status_changed` events. The local arm has always emitted them, but the k8s
+  watch loop computed the identical transition diff and only broadcast it
+  in-memory — so on k8s every outcome facet in the dashboard read zero,
+  including for agents that had demonstrably failed. The loop now persists the
+  transition it observes, elected by a single-writer observer lease so replicas
+  don't multiply the counts
+  ([#190](https://github.com/caliban-ai/prospero/issues/190)).
+- **The dashboard's usage panel refreshes on its own.** It fetched once per
+  window selection and never again, so a finished agent's spend could sit
+  invisible until the operator toggled the window by hand. It now refetches when
+  the fleet poll observes an agent appear, change status, or disappear, and on a
+  one-minute heartbeat — without re-running a 30-day store aggregate on every
+  five-second poll ([#190](https://github.com/caliban-ai/prospero/issues/190)).
+- **Re-submitting an identical prompt no longer claims a launch that didn't
+  happen.** Spawning is idempotent and the k8s `CalibanTask` name is derived
+  from the spec, so an identical prompt resolves to the run already in flight.
+  `POST /api/workspaces/{name}/agents` now reports `created`, and the dashboard
+  says it attached to the existing run instead of "Launched"
+  ([#190](https://github.com/caliban-ai/prospero/issues/190)).
+
 ## [0.4.0] - 2026-07-27
 
 Makes the `PROSPERO_FLEET=k8s` fleet **interactive**. Since 0.3.0 a k8s agent

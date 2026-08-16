@@ -29,6 +29,16 @@ pub struct AgentHandle {
     /// Endpoint the agent's per-agent socket is reachable at. `None` until the
     /// backend has resolved one — e.g. a k8s agent between spawn and Running.
     pub endpoint: Option<crate::caliband::wire::Endpoint>,
+    /// Whether this call actually started a new agent (#190).
+    ///
+    /// `ensure_agent` is idempotent, and under k8s the `CalibanTask` name is
+    /// derived from the spec — so re-submitting an identical prompt resolves to
+    /// the *existing* agent. That is the right behaviour, but the caller must be
+    /// able to tell, or the UI reports a launch that never happened.
+    ///
+    /// `false` from [`crate::k8s::fleet::handle_from`], which only ever observes
+    /// a `CalibanTask` that already exists.
+    pub created: bool,
 }
 
 /// How to stop an agent. `Kill` preserves today's unconditional behavior.

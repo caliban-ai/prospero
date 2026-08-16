@@ -314,7 +314,12 @@ impl Emitter {
         next
     }
 
-    async fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
+    /// Sequence, persist, and publish one event.
+    ///
+    /// `pub(crate)` — matching `Emitter` itself — so the k8s watch loop can
+    /// persist the transitions it observes (#190), the same way this module's
+    /// `reconcile` does for the local arm.
+    pub(crate) async fn emit(&self, repo: &str, agent_id: &str, kind: EventKind) {
         let mut event = self.next_event(repo, agent_id, kind).await;
         let append_err = self.append_with_seq_retry(&mut event).await;
         let lost_seq = event.seq;

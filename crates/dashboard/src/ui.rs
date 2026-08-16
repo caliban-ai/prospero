@@ -45,6 +45,15 @@ pub struct Ui {
     pub workspaces: Signal<Vec<WorkspaceSummary>>,
     /// Browser clock, in epoch milliseconds, sampled once per render pass.
     pub now_ms: Signal<f64>,
+    /// Bumped when the fleet poll observes something that could change the
+    /// usage aggregate — an agent appearing, changing status, or disappearing —
+    /// and on a slow heartbeat regardless (#190).
+    ///
+    /// Distinct from [`Self::refresh`], which forces a *fleet* refetch after a
+    /// mutation. This one exists so the usage panel can refetch on real activity
+    /// without riding the 5-second poll, which is the trade #181 deliberately
+    /// made and then landed on the wrong side of: it never refetched at all.
+    pub activity: Signal<u32>,
 }
 
 impl Ui {
@@ -922,10 +931,13 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
         spawn(async move {
             match crate::api::spawn_agent(&ws, &body).await {
                 Ok(spawned) => {
-                    ui.note.set(Some(format!(
-                        "Launched {} in {}.",
-                        short_id(&spawned.agent_id),
-                        spawned.workspace
+                    // #190: `created` distinguishes a real launch from an
+                    // idempotent re-submission that resolved to the run already
+                    // in flight; reporting both as "Launched" was a lie.
+                    ui.note.set(Some(crate::view_model::launch_note(
+                        spawned.created,
+                        &spawned.agent_id,
+                        &spawned.workspace,
                     )));
                     ui.banner.set(None);
                     ui.request_refresh();
@@ -1929,9 +1941,16 @@ pub(crate) fn kind_label(kind: &EventKind) -> String {
 /// second, and re-running a store aggregate that often would be wasteful.
 #[component]
 fn UsagePanel() -> Element {
+    let activity = use_context::<Ui>().activity;
     let mut window = use_signal(|| Window::Week);
-    let report =
-        use_resource(move || async move { crate::api::fetch_usage(window().days()).await });
+    // Reading `activity` inside the resource is what subscribes to it: Dioxus
+    // re-runs this fetch when the poll loop reports fleet activity (#190), so
+    // the panel tracks reality without re-running a 30-day store aggregate on
+    // every 5-second poll.
+    let report = use_resource(move || async move {
+        let _ = activity();
+        crate::api::fetch_usage(window().days()).await
+    });
 
     let body = match &*report.read_unchecked() {
         None => rsx! {
