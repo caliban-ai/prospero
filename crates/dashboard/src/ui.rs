@@ -4,14 +4,15 @@
 
 use dioxus::prelude::*;
 use prospero_types::{
-    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetEvent, FleetSnapshot, SpawnBody,
-    Workspace, WorkspaceSummary,
+    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetSnapshot, SpawnBody, Workspace,
+    WorkspaceSummary,
 };
 
 use crate::actions::Action;
 use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
-use crate::stream::{Entry, StreamSession, StreamState};
+use crate::stream::{StreamSession, StreamState};
 use crate::theme::{STORAGE_KEY, Theme};
+use crate::timeline::{Segment, ToolCall};
 use crate::view_model::{
     AgentControls, FleetTotals, StatusCounts, awaits_input, basename, controls_for, count_statuses,
     elapsed, health_reason, is_healthy, is_launchable, short_id, status_label, status_tone, totals,
@@ -1728,25 +1729,129 @@ pub fn StreamPane(agent: Agent) -> Element {
                         }
                     }
                 }
-                for (i , entry) in current.entries.iter().enumerate() {
-                    match entry {
-                        Entry::Event(ev) => rsx! {
-                            StreamEvent { key: "e{i}", event: (**ev).clone() }
-                        },
-                        // Rendered inline so the timeline is honest about being
-                        // discontinuous rather than quietly skipping.
-                        Entry::Gap { skipped } => rsx! {
-                            div { key: "g{i}", class: "stream-gap",
-                                span { class: "glyph tone-wait" }
-                                "{skipped} events were dropped and replayed from the store"
-                            }
-                        },
-                        Entry::Undecodable { why } => rsx! {
-                            div { key: "u{i}", class: "stream-gap is-bad",
-                                span { class: "glyph tone-bad" }
-                                "could not decode a frame — {why}"
-                            }
-                        },
+                // Grouped rather than a flat log: tool calls pair start with
+                // finish, output coalesces, and the opening/closing context
+                // becomes a header and a summary (#179).
+                for (i , segment) in crate::timeline::group(&current.entries).into_iter().enumerate() {
+                    TimelineSegment { key: "s{i}", segment }
+                }
+            }
+        }
+    }
+}
+
+/// One timeline segment.
+///
+/// Tool calls use a native `<details>` rather than a hand-rolled disclosure: it
+/// is keyboard-operable and screen-reader-labelled for free, and the CSP here
+/// forbids inline script, so a JS toggle would have to live in a module anyway.
+#[component]
+fn TimelineSegment(segment: Segment) -> Element {
+    match segment {
+        Segment::Init {
+            model,
+            tools,
+            session_id,
+        } => rsx! {
+            div { class: "tl-init",
+                div { class: "tl-init-head",
+                    span { class: "tl-init-label", "session" }
+                    span { class: "tl-init-model", "{model}" }
+                }
+                div { class: "tl-init-meta",
+                    span { class: "tl-init-id", "{session_id}" }
+                    if !tools.is_empty() {
+                        span { class: "tl-init-tools", "{tools.len()} tools" }
+                    }
+                }
+            }
+        },
+        Segment::Output { text } => rsx! {
+            pre { class: "ev-out", "{text}" }
+        },
+        Segment::Tool(call) => rsx! {
+            ToolEntry { call }
+        },
+        Segment::Status { from, to } => rsx! {
+            div { class: "ev-line",
+                span { class: "ev-kind",
+                    "{status_label(from)} → {status_label(to)}"
+                }
+            }
+        },
+        Segment::Finished {
+            outcome,
+            cost_usd,
+            turns,
+        } => rsx! {
+            div { class: "ev-finish",
+                span { class: "glyph tone-done" }
+                "finished · {outcome} · {turns} turns · ${cost_usd:.4}"
+            }
+        },
+        // Kept inline so a discontinuous timeline says so rather than quietly
+        // skipping.
+        Segment::Gap { skipped } => rsx! {
+            div { class: "stream-gap",
+                span { class: "glyph tone-wait" }
+                "{skipped} events were dropped and replayed from the store"
+            }
+        },
+        Segment::Undecodable { why } => rsx! {
+            div { class: "stream-gap is-bad",
+                span { class: "glyph tone-bad" }
+                "could not decode a frame — {why}"
+            }
+        },
+        Segment::Other { label } => rsx! {
+            div { class: "ev-line",
+                span { class: "ev-kind", "{label}" }
+            }
+        },
+    }
+}
+
+/// One tool call: collapsed to name/outcome/duration, expanding to its input.
+#[component]
+fn ToolEntry(call: ToolCall) -> Element {
+    let duration = call
+        .duration_ms
+        .map(format_duration)
+        .unwrap_or_else(|| "—".to_string());
+    // Caliban's ToolCallEnd omits the name, so a call whose start was missed
+    // (replay began mid-call) falls back to the correlation id rather than
+    // rendering a blank row.
+    let name = if call.name.is_empty() {
+        call.id.clone()
+    } else {
+        call.name.clone()
+    };
+    let input =
+        serde_json::to_string_pretty(&call.input).unwrap_or_else(|_| call.input.to_string());
+
+    rsx! {
+        details { class: "tl-tool",
+            summary { class: "tl-tool-head",
+                span { class: "tl-tool-name", "{name}" }
+                span { class: "pill {call.outcome.tone()}",
+                    span { class: "glyph {call.outcome.tone()}" }
+                    "{call.outcome.label()}"
+                }
+                span { class: "tl-tool-dur", "{duration}" }
+            }
+            div { class: "tl-tool-body",
+                div { class: "tl-tool-section",
+                    div { class: "tl-tool-legend", "input" }
+                    pre { class: "tl-tool-input", "{input}" }
+                }
+                // Stated rather than shown as an empty panel: the result body
+                // is genuinely not on the wire, and a blank box reads as a bug.
+                div { class: "tl-tool-section",
+                    div { class: "tl-tool-legend", "result" }
+                    p { class: "tl-tool-absent",
+                        "The event stream carries this call's input and whether it "
+                        "succeeded, but not the result body — that needs a "
+                        "caliban-side change."
                     }
                 }
             }
@@ -1754,55 +1859,21 @@ pub fn StreamPane(agent: Agent) -> Element {
     }
 }
 
-/// One event line.
-#[component]
-fn StreamEvent(event: FleetEvent) -> Element {
-    let seq = event.seq;
-    match &event.kind {
-        EventKind::Output { chunk, .. } => rsx! {
-            pre { class: "ev-out", "{chunk}" }
-        },
-        EventKind::ToolStarted { name, .. } => rsx! {
-            div { class: "ev-line",
-                span { class: "ev-seq", "{seq}" }
-                span { class: "ev-tool", "{name}" }
-                span { class: "ev-kind", "started" }
-            }
-        },
-        EventKind::ToolFinished { id, name, ok } => rsx! {
-            div { class: "ev-line",
-                span { class: "ev-seq", "{seq}" }
-                // Caliban's ToolCallEnd omits the name (#106); fall back to the
-                // correlation id so the row is never blank.
-                span { class: "ev-tool",
-                    if name.is_empty() { "{id}" } else { "{name}" }
-                }
-                span { class: if *ok { "pill tone-done" } else { "pill tone-bad" },
-                    if *ok { "ok" } else { "failed" }
-                }
-            }
-        },
-        EventKind::AgentFinished {
-            outcome,
-            turns,
-            cost_usd,
-        } => rsx! {
-            div { class: "ev-finish",
-                span { class: "glyph tone-done" }
-                "finished · {outcome} · {turns} turns · ${cost_usd:.4}"
-            }
-        },
-        other => rsx! {
-            div { class: "ev-line",
-                span { class: "ev-seq", "{seq}" }
-                span { class: "ev-kind", "{kind_label(other)}" }
-            }
-        },
+/// Render a duration the way an operator scans it: sub-second in ms, then
+/// seconds, then minutes.
+fn format_duration(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        format!("{}m {}s", secs / 60, secs % 60)
     }
 }
 
 /// Short label for the event kinds without a dedicated row.
-fn kind_label(kind: &EventKind) -> String {
+pub(crate) fn kind_label(kind: &EventKind) -> String {
     match kind {
         EventKind::AgentInit { model, .. } => format!("init · {model}"),
         EventKind::StatusChanged { from, to } => {

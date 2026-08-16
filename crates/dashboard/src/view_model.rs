@@ -207,7 +207,7 @@ pub fn elapsed(started_at: &str, now_ms: f64) -> Option<String> {
 /// ships to a browser, and one timestamp format does not justify the bytes.
 /// Only the shape prospero actually emits is accepted — `YYYY-MM-DDTHH:MM:SS`
 /// with an optional fractional part and an optional `Z`/offset.
-fn rfc3339_to_millis(ts: &str) -> Option<f64> {
+pub(crate) fn rfc3339_to_millis(ts: &str) -> Option<f64> {
     let bytes = ts.as_bytes();
     if bytes.len() < 19 {
         return None;
