@@ -34,6 +34,9 @@ struct FakeState {
     next_id: u64,
     /// How many `Shutdown` requests have been received.
     shutdowns: u32,
+    /// How many `List` requests have been served. Lets a test assert that a
+    /// polling caller stops dialling once there is nothing left to learn (#194).
+    lists: u32,
     /// Set to `true` after the first `Shutdown`; the accept loop exits.
     should_stop: bool,
 }
@@ -233,6 +236,14 @@ impl FakeCaliband {
         self.state.lock().unwrap().shutdowns
     }
 
+    /// Number of `List` requests the fake has served. Used to prove a polling
+    /// caller stops dialling a pod once it has nothing left to learn (#194) —
+    /// without which the k8s watch loop would re-dial finished agents forever,
+    /// since their CR phase never stops saying `Running`.
+    pub fn lists(&self) -> u32 {
+        self.state.lock().unwrap().lists
+    }
+
     /// Set an agent's status (to simulate lifecycle transitions across polls).
     pub fn set_status(&self, id: &str, status: AgentStatus) {
         if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
@@ -336,12 +347,15 @@ async fn handle_control_conn(
     let (reply, new_listener): (CtlReply, Option<(PathBuf, Vec<serde_json::Value>)>) = {
         let mut st = state.lock().unwrap();
         match req {
-            CtlRequest::List => (
-                CtlReply::Listed {
-                    agents: st.agents.values().cloned().collect(),
-                },
-                None,
-            ),
+            CtlRequest::List => {
+                st.lists += 1;
+                (
+                    CtlReply::Listed {
+                        agents: st.agents.values().cloned().collect(),
+                    },
+                    None,
+                )
+            }
             CtlRequest::Spawn { spec } => {
                 st.received_specs.push(spec.clone());
                 st.next_id += 1;
