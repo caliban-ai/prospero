@@ -835,6 +835,14 @@ type KnownAgents = Arc<Mutex<HashMap<String, Agent>>>;
 /// `_`, so no agent can ever collide with this key.
 pub(crate) const OBSERVER_STREAM_KEY: &str = "__fleet_observer";
 
+/// How long one pod-caliband `List` may take during a status overlay (#194).
+///
+/// Bounded because the watch loop now depends on it: an unreachable pod that
+/// black-holes its SYN (rather than refusing it) would otherwise hang until the
+/// OS connect timeout and stall fleet observation for every other agent. Well
+/// under the default ~2s poll cadence, and a miss simply retries next poll.
+const OVERLAY_DIAL_TIMEOUT: Duration = Duration::from_millis(750);
+
 fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
     api: Arc<A>,
     known: KnownAgents,
@@ -862,6 +870,58 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
             // the lock. `session.attach` itself is gated by the #108 ownership
             // lease, so exactly one replica actually attaches each.
             let mut to_attach: Vec<(String, String, Endpoint, SpawnSpec)> = Vec::new();
+
+            // #194: diff against the SAME status `snapshot()` displays, not the
+            // CR phase. The operator never advances `status.phase` past
+            // `Running` — CRs whose agents finished a day earlier still read
+            // Running — so a CR-phase diff never produces a terminal transition
+            // and every outcome facet stayed at zero. Pod truth is the only
+            // place an agent's finish is observable.
+            //
+            // Agents already known terminal are excluded: terminal is terminal,
+            // and since the CR never stops saying `Running`, without this we
+            // would re-dial dead agents' pods forever. Steady-state cost is
+            // therefore proportional to *live* agents.
+            //
+            // Done before taking the diff lock — this awaits on the network, and
+            // the guard below is a `std::sync::Mutex`.
+            let mut overlaid: Vec<Agent> = tasks.iter().map(agent_from_task).collect();
+            // name -> the terminal status already observed for this incarnation.
+            let settled: HashMap<String, AgentStatus> = {
+                let known = known.lock().unwrap_or_else(|e| e.into_inner());
+                overlaid
+                    .iter()
+                    .filter_map(|a| {
+                        let prev = known.get(&a.id)?;
+                        // Matching `started_at` means this is the same
+                        // incarnation. `restart_agent` deletes the CR and
+                        // re-applies the SAME name, so name alone would let a
+                        // terminal verdict stick to a fresh agent when the
+                        // delete/re-apply lands between two polls.
+                        (prev.status.is_terminal() && prev.started_at == a.started_at)
+                            .then_some((a.id.clone(), prev.status))
+                    })
+                    .collect()
+            };
+            overlay_pod_status(&session, &tasks, &mut overlaid, |name| {
+                !settled.contains_key(name)
+            })
+            .await;
+            // Carry the settled verdict forward. Skipping the overlay must NOT
+            // leave the agent holding its CR-phase status: the CR says `Running`
+            // forever, so it would look like a `done -> running` transition, the
+            // agent would un-settle, the next poll would re-dial and emit a
+            // second `running -> done`, and the outcome facets would inflate
+            // without bound — every ~2s, forever. (Measured at 10 duplicate
+            // terminal events in 500ms before this was added.)
+            for agent in &mut overlaid {
+                if let Some(status) = settled.get(&agent.id) {
+                    agent.status = *status;
+                }
+            }
+            let mut overlaid: HashMap<String, Agent> =
+                overlaid.into_iter().map(|a| (a.id.clone(), a)).collect();
+
             // Diff under the lock so a concurrent `watch_fleet` seed sees a
             // consistent snapshot, then broadcast after releasing it.
             let mut changes: Vec<FleetChange> = Vec::new();
@@ -876,7 +936,13 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                         continue;
                     };
                     seen.insert(name.clone());
-                    let agent = agent_from_task(task);
+                    // The overlaid projection built above; the CR-only fallback
+                    // covers a task with no matching entry (it cannot happen —
+                    // both are built from `tasks` — but a silent `unwrap` here
+                    // would be a poor trade for a poll loop).
+                    let agent = overlaid
+                        .remove(&name)
+                        .unwrap_or_else(|| agent_from_task(task));
                     // #113: queue an attach for a Running, attachable agent. A
                     // malformed endpoint on a Running CR is logged and skipped
                     // (same defensive posture as `handle_from`'s callers), not
@@ -1092,73 +1158,111 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     }
 }
 
-impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
-    /// #130: refine each projected agent's `interactive` + `status` from its pod
-    /// caliband's control `List`, in place. The CR only carries the coarse
-    /// reconciled phase; the pod caliband carries the interactive flag and the
-    /// fine-grained `Idle` ("awaiting input") state the dashboard reply box needs.
-    ///
-    /// Only `Running`, attachable CRs are consulted (via [`handle_from`], which
-    /// yields `Some` exactly for those). One `List` is issued per distinct pod
-    /// endpoint, and each pod's record overlays the agent whose CR named that
-    /// endpoint — matched by **endpoint**, not by agent id, because caliband
-    /// assigns the agent its own id (#159) and it is not the CR name. A pod that
-    /// fails to answer is logged and skipped: that agent keeps its CR-phase
-    /// status rather than dropping out or failing the whole snapshot (#148).
-    async fn overlay_pod_status(&self, tasks: &[CalibanTask], agents: &mut [Agent]) {
-        // CR name -> its pod endpoint, plus the distinct endpoints to query
-        // (dedup: one List per pod).
-        let mut agent_endpoint: HashMap<String, String> = HashMap::new();
-        let mut endpoints: Vec<String> = Vec::new();
-        for task in tasks {
-            let repo = task.spec.workspace_ref.name.clone();
-            if let Ok(Some(handle)) = handle_from(task, repo)
-                && let Some(Endpoint::Tcp { addr }) = &handle.endpoint
-            {
-                agent_endpoint.insert(task.metadata.name.clone().unwrap_or_default(), addr.clone());
-                if !endpoints.contains(addr) {
-                    endpoints.push(addr.clone());
-                }
-            }
+/// #130: refine each projected agent's `interactive` + `status` from its pod
+/// caliband's control `List`, in place. The CR only carries the coarse
+/// reconciled phase; the pod caliband carries the interactive flag and the
+/// fine-grained `Idle` ("awaiting input") state the dashboard reply box needs.
+///
+/// Only `Running`, attachable CRs are consulted (via [`handle_from`], which
+/// yields `Some` exactly for those). One `List` is issued per distinct pod
+/// endpoint, and each pod's record overlays the agent whose CR named that
+/// endpoint — matched by **endpoint**, not by agent id, because caliband
+/// assigns the agent its own id (#159) and it is not the CR name. A pod that
+/// fails to answer is logged and skipped: that agent keeps its CR-phase
+/// status rather than dropping out or failing the whole snapshot (#148).
+/// A free function over [`SessionPlane`] rather than a `K8sFleet` method, so the
+/// watch loop can apply the identical overlay before it diffs (#194). That the
+/// loop and `snapshot` disagreed about an agent's status was the whole defect:
+/// the loop emitted events from the CR phase while the dashboard displayed pod
+/// truth, and on a real cluster the CR phase never leaves `Running`.
+async fn overlay_pod_status(
+    session: &SessionPlane,
+    tasks: &[CalibanTask],
+    agents: &mut [Agent],
+    include: impl Fn(&str) -> bool,
+) {
+    // CR name -> its pod endpoint, plus the distinct endpoints to query
+    // (dedup: one List per pod).
+    let mut agent_endpoint: HashMap<String, String> = HashMap::new();
+    let mut endpoints: Vec<String> = Vec::new();
+    for task in tasks {
+        let name = task.metadata.name.clone().unwrap_or_default();
+        // #194: the caller can exclude agents it already knows are terminal.
+        // Terminal is terminal — there is nothing further to learn from the
+        // pod, and the CR stays `Running` forever, so without this the watch
+        // loop would re-dial dead agents' pods on every poll.
+        if !include(&name) {
+            continue;
         }
-        if endpoints.is_empty() {
-            return;
-        }
-
-        // endpoint -> that pod's live record. Keyed by *endpoint*, not agent id:
-        // caliband names the agent itself (#159), so `rec.id` is not the CR name
-        // and an id-keyed lookup silently misses — which is how #130's overlay
-        // regressed. One CalibanTask ⇒ one pod ⇒ one caliband ⇒ at most one
-        // agent (see `ensure_pod_agent`), so the pod's sole record is
-        // unambiguously the one belonging to the CR that named this endpoint.
-        let mut records: HashMap<String, crate::caliband::wire::AgentRecord> = HashMap::new();
-        for addr in endpoints {
-            let client = CalibandClient::connect_tcp(
-                addr.clone(),
-                self.session.tls.clone(),
-                self.session.token.clone(),
-            );
-            match client.list().await {
-                Ok(recs) => {
-                    if let Some(rec) = recs.into_iter().next() {
-                        records.insert(addr.clone(), rec);
-                    }
-                }
-                Err(e) => tracing::debug!(
-                    target: "prospero_k8s_fleet", endpoint = %addr, error = %e,
-                    "snapshot overlay: pod caliband List failed; keeping CR-phase status"
-                ),
-            }
-        }
-
-        for agent in agents.iter_mut() {
-            if let Some(rec) = agent_endpoint.get(&agent.id).and_then(|a| records.get(a)) {
-                agent.interactive = rec.spec.interactive;
-                agent.status = rec.status;
+        let repo = task.spec.workspace_ref.name.clone();
+        if let Ok(Some(handle)) = handle_from(task, repo)
+            && let Some(Endpoint::Tcp { addr }) = &handle.endpoint
+        {
+            agent_endpoint.insert(name, addr.clone());
+            if !endpoints.contains(addr) {
+                endpoints.push(addr.clone());
             }
         }
     }
+    if endpoints.is_empty() {
+        return;
+    }
 
+    // endpoint -> that pod's live record. Keyed by *endpoint*, not agent id:
+    // caliband names the agent itself (#159), so `rec.id` is not the CR name
+    // and an id-keyed lookup silently misses — which is how #130's overlay
+    // regressed. One CalibanTask ⇒ one pod ⇒ one caliband ⇒ at most one
+    // agent (see `ensure_pod_agent`), so the pod's sole record is
+    // unambiguously the one belonging to the CR that named this endpoint.
+    // Dialled concurrently and under a deadline (#194). Sequential, unbounded
+    // dials were survivable when only `snapshot()` did this — one slow pod made
+    // one HTTP request slow. On the watch loop they are not: a single pod that
+    // black-holes its SYN would stall the whole fleet's observation cadence, and
+    // N unreachable pods would stall it N times over. A timeout here is not a
+    // degradation either — the loop retries every poll, so a transient miss
+    // self-heals on the next pass.
+    let dials = endpoints.into_iter().map(|addr| {
+        let tls = session.tls.clone();
+        let token = session.token.clone();
+        async move {
+            let client = CalibandClient::connect_tcp(addr.clone(), tls, token);
+            match tokio::time::timeout(OVERLAY_DIAL_TIMEOUT, client.list()).await {
+                Ok(Ok(recs)) => recs.into_iter().next().map(|rec| (addr, rec)),
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        target: "prospero_k8s_fleet", endpoint = %addr, error = %e,
+                        "pod caliband List failed; keeping CR-phase status"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "prospero_k8s_fleet", endpoint = %addr,
+                        timeout_ms = OVERLAY_DIAL_TIMEOUT.as_millis() as u64,
+                        "pod caliband List timed out; keeping CR-phase status"
+                    );
+                    None
+                }
+            }
+        }
+    });
+    // endpoint -> that pod's live record.
+    let records: HashMap<String, crate::caliband::wire::AgentRecord> =
+        futures::future::join_all(dials)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+    for agent in agents.iter_mut() {
+        if let Some(rec) = agent_endpoint.get(&agent.id).and_then(|a| records.get(a)) {
+            agent.interactive = rec.spec.interactive;
+            agent.status = rec.status;
+        }
+    }
+}
+
+impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     /// Dial `endpoint` (the agent's pod-caliband **control** endpoint) over
     /// #75's transport, resolve/attach the pod's agent, and feed normalized
     /// frames into the same bus + `Store` `FleetManager`'s own attach loop feeds
@@ -1385,7 +1489,9 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
         // CR still supplies membership/lifecycle above; this only refines the
         // per-turn detail of the Running agents (ADR 0004's hybrid-observability
         // split applied to k8s).
-        self.overlay_pod_status(&tasks, &mut agents).await;
+        // No exclusion here: a read of the whole fleet reports every agent's
+        // current state, including ones the watch loop has already settled.
+        overlay_pod_status(&self.session, &tasks, &mut agents, |_| true).await;
 
         // When the Workspace registry is wired (k8s config plane, #142), the
         // fleet's workspaces ARE the registered `Workspace` CRs (#149/#151):
@@ -1508,6 +1614,9 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 #[cfg(all(test, feature = "k8s"))]
 pub(crate) struct MemTaskApi {
     store: std::sync::Mutex<std::collections::HashMap<String, CalibanTask>>,
+    /// Stamps a distinct creationTimestamp per create, so a delete + re-apply of
+    /// the same name is observably a new incarnation (#194).
+    creations: AtomicU64,
 }
 
 #[cfg(all(test, feature = "k8s"))]
@@ -1515,7 +1624,27 @@ impl MemTaskApi {
     fn new() -> Self {
         Self {
             store: std::sync::Mutex::new(std::collections::HashMap::new()),
+            creations: AtomicU64::new(0),
         }
+    }
+
+    /// Test helper: replace a stored CR with a fresh incarnation of the same
+    /// name — a new creationTimestamp and no status — under a single lock.
+    ///
+    /// Models a `restart_agent` (delete + re-apply the same name) that completes
+    /// entirely **between two polls**, so the watch loop never observes the CR's
+    /// absence and never drops it from `known`. That is the only case in which
+    /// the settled-exclusion's incarnation check does any work; a restart the
+    /// loop *does* see a gap for is already handled by the `Gone` path.
+    fn restart_in_place(&self, name: &str, ct: &CalibanTask) {
+        let mut store = self.store.lock().unwrap();
+        let mut fresh = ct.clone();
+        let n = self.creations.fetch_add(1, Ordering::Relaxed) as i64;
+        fresh.metadata.creation_timestamp =
+            k8s_openapi::jiff::Timestamp::from_second(1_900_000_000 + n)
+                .ok()
+                .map(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time);
+        store.insert(name.to_string(), fresh);
     }
 
     /// Test helper: flip a stored CR's status to `Running` with the given
@@ -1551,7 +1680,25 @@ impl CalibanTaskApi for MemTaskApi {
             .name
             .clone()
             .ok_or_else(|| CoreError::Fleet("CalibanTask missing metadata.name".to_string()))?;
-        self.store.lock().unwrap().insert(name, ct.clone());
+        let mut store = self.store.lock().unwrap();
+        let mut ct = ct.clone();
+        // #194: model the apiserver's creationTimestamp. It is stamped once, at
+        // create, and preserved across updates — which is what makes a
+        // delete + re-apply of the same name (`restart_agent`) observably a new
+        // incarnation. Without this the fake reported an empty timestamp for
+        // every CR forever, so any logic keyed on incarnation was untestable.
+        // Counter-derived rather than wall-clock, so the sequence is
+        // deterministic and two applies in the same millisecond still differ.
+        ct.metadata.creation_timestamp = store
+            .get(&name)
+            .and_then(|existing| existing.metadata.creation_timestamp.clone())
+            .or_else(|| {
+                let n = self.creations.fetch_add(1, Ordering::Relaxed) as i64;
+                k8s_openapi::jiff::Timestamp::from_second(1_800_000_000 + n)
+                    .ok()
+                    .map(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time)
+            });
+        store.insert(name, ct);
         Ok(())
     }
 
@@ -2750,6 +2897,308 @@ mod tests {
             !agent.interactive,
             "no interactive overlay when the pod List fails"
         );
+    }
+
+    // --- #194: terminal outcomes come from the pod, not the CR phase ---------
+    //
+    // These model the cluster as actually observed, which is where #190 went
+    // wrong: the operator leaves `status.phase` at `Running` forever, so a CR
+    // NEVER reports terminal. `MemTaskApi::set_phase("Completed")` — what #190's
+    // tests used — describes a cluster that does not exist. Here the CR is
+    // pinned at `Running` for the whole test and only the pod's caliband ever
+    // says the agent finished.
+
+    /// Drive a watch loop against a CR pinned at `Running` whose pod reports
+    /// `final_status`, and return the events persisted for it.
+    ///
+    /// Returns once a terminal `StatusChanged` is persisted, or panics on
+    /// timeout — which is the #194 failure mode.
+    async fn events_after_pod_reaches(
+        final_status: AgentStatus,
+    ) -> (Vec<crate::event::FleetEvent>, Arc<dyn Store>) {
+        let token = "terminal-outcome-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-terminal-probe";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        // Starts live, so the loop's first sighting is non-terminal and the
+        // finish below is a real transition rather than a first observation.
+        fake.set_status(id, AgentStatus::Running);
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        // The CR says Running, and NOTHING in this test ever changes that.
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, Arc::clone(&store))
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        // Let the loop observe the agent alive first.
+        eventually("the loop to observe the running agent", || {
+            fleet
+                .known
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.status == AgentStatus::Running)
+        })
+        .await;
+
+        // The agent finishes. Only the pod knows.
+        fake.set_status(id, final_status);
+
+        let events = events_until(&store, id, "a terminal StatusChanged", |events| {
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if to.is_terminal()))
+        })
+        .await;
+        (events, store)
+    }
+
+    /// #194: the cluster bug in a test. The CR phase never advances, so #190's
+    /// CR-phase diff saw nothing; the watch loop must read the pod like
+    /// `snapshot()` already does.
+    #[tokio::test]
+    async fn terminal_pod_status_is_persisted_when_the_cr_phase_never_advances() {
+        let (events, _store) = events_after_pod_reaches(AgentStatus::Done).await;
+        let transition = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::StatusChanged { from, to } if to.is_terminal() => Some((*from, *to)),
+                _ => None,
+            })
+            .expect("a terminal StatusChanged");
+        assert_eq!(transition, (AgentStatus::Running, AgentStatus::Done));
+    }
+
+    /// #194: a settled agent must be counted **once**. Skipping the overlay must
+    /// not drop the agent back to its CR-phase status — the CR says `Running`
+    /// forever, so falling back to it would un-settle the agent on the next
+    /// poll, re-run the overlay, and emit a second `running -> done`. That
+    /// oscillation would inflate every outcome facet without bound.
+    #[tokio::test]
+    async fn a_settled_agent_is_counted_exactly_once() {
+        let token = "count-once-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-count-once";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, AgentStatus::Running);
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, Arc::clone(&store))
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        eventually("the loop to observe the running agent", || {
+            fleet
+                .known
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.status == AgentStatus::Running)
+        })
+        .await;
+        fake.set_status(id, AgentStatus::Done);
+        events_until(&store, id, "the terminal StatusChanged", |events| {
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if to.is_terminal()))
+        })
+        .await;
+
+        // ~25 further polls. The count must not move.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let terminal = events_for(&store, id)
+            .await
+            .into_iter()
+            .filter(|e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if to.is_terminal()))
+            .count();
+        assert_eq!(
+            terminal, 1,
+            "the agent finished once; it must be counted once"
+        );
+
+        let rows = store.usage("0000", "9999").await.expect("usage");
+        let row = rows.iter().find(|r| r.workspace == "repo-a").expect("row");
+        assert_eq!(row.done, 1, "the done facet must not inflate over time");
+    }
+
+    /// #194 acceptance: the whole point is that the dashboard's outcome facets
+    /// stop reading zero for a k8s agent that finished.
+    #[tokio::test]
+    async fn terminal_pod_status_reaches_the_usage_aggregate() {
+        let (_events, store) = events_after_pod_reaches(AgentStatus::Done).await;
+        let rows = store.usage("0000", "9999").await.expect("usage");
+        let row = rows
+            .iter()
+            .find(|r| r.workspace == "repo-a")
+            .expect("a usage row for repo-a");
+        assert_eq!(row.done, 1, "the done facet must count the finished agent");
+        assert_eq!(row.failed, 0);
+    }
+
+    /// The counted outcome is the pod's real status, not a hardcoded Done — a
+    /// run that failed must show up in the `failed` facet.
+    #[tokio::test]
+    async fn a_failed_pod_agent_is_counted_as_failed() {
+        let (_events, store) = events_after_pod_reaches(AgentStatus::Failed).await;
+        let rows = store.usage("0000", "9999").await.expect("usage");
+        let row = rows
+            .iter()
+            .find(|r| r.workspace == "repo-a")
+            .expect("a usage row for repo-a");
+        assert_eq!(row.failed, 1);
+        assert_eq!(row.done, 0);
+    }
+
+    /// #194 cost bound: the overlay must not dial a pod the caller has already
+    /// settled. Without the exclusion it would run forever on finished agents,
+    /// because their CR phase never stops reporting `Running` — the very
+    /// staleness that made this fix necessary would become a permanent load.
+    ///
+    /// Exercised directly rather than through the watch loop: the loop also
+    /// dials via `ensure_pod_agent` when it re-attaches, and that re-attach
+    /// churn on a terminal agent is #170, a separate defect this ticket does not
+    /// fix. Asserting on the loop's total dial count would therefore measure
+    /// #170, not the exclusion.
+    #[tokio::test]
+    async fn the_overlay_does_not_dial_a_pod_for_an_excluded_agent() {
+        let token = "settled-dial-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-settled";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, AgentStatus::Done);
+
+        let mut ct = build_calibantask(&spec("repo-a", "p", None), id);
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            // As on the real cluster: the CR still insists it is Running.
+            phase: "Running".to_string(),
+            caliband_endpoint: Some(tls.addr.clone()),
+            sandbox_ref: None,
+            resolved_workspace: None,
+        });
+
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let session = SessionPlane {
+            emitter: {
+                let (bus, store) = test_seams();
+                Emitter::new(bus, store)
+            },
+            tls: Some(client_tls),
+            token: Some(token.to_string()),
+            attached: Arc::new(Mutex::new(HashMap::new())),
+            ownership: Arc::new(SelfOwnsAll),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let tasks = [ct];
+
+        // Included: the pod is consulted and its terminal status wins over the
+        // CR's stale `Running`. This is the behaviour the whole ticket is about.
+        let mut agents: Vec<Agent> = tasks.iter().map(agent_from_task).collect();
+        overlay_pod_status(&session, &tasks, &mut agents, |_| true).await;
+        assert_eq!(agents[0].status, AgentStatus::Done);
+        let after_included = fake.lists();
+        assert!(after_included > 0, "an included agent must be dialled");
+
+        // Excluded: no dial at all, and the agent keeps its CR-phase status.
+        let mut agents: Vec<Agent> = tasks.iter().map(agent_from_task).collect();
+        overlay_pod_status(&session, &tasks, &mut agents, |_| false).await;
+        assert_eq!(
+            fake.lists(),
+            after_included,
+            "an excluded agent must not be dialled at all"
+        );
+        assert_eq!(agents[0].status, AgentStatus::Running);
+    }
+
+    /// #194: `restart_agent` deletes the CR and re-applies the SAME name, so a
+    /// terminal verdict keyed on the name alone could stick to the fresh agent
+    /// and suppress its overlay forever. The exclusion is keyed on the
+    /// incarnation (`started_at`) for exactly that reason.
+    #[tokio::test]
+    async fn a_restarted_agent_is_not_treated_as_still_settled() {
+        let token = "restart-settled-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-restarted";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, AgentStatus::Running);
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api, bus, Arc::clone(&store))
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        // Run, finish, and get marked settled.
+        fake.set_status(id, AgentStatus::Done);
+        eventually("the agent to settle as Done", || {
+            fleet
+                .known
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.status == AgentStatus::Done)
+        })
+        .await;
+
+        // Restart: delete + re-apply the SAME name, as `restart_agent` does —
+        // atomically, so the poll loop never sees the CR missing and therefore
+        // never drops the terminal verdict from `known` via the `Gone` path.
+        // This is what makes the incarnation check load-bearing rather than
+        // incidental.
+        fleet
+            .api
+            .restart_in_place(id, &build_calibantask(&spec("repo-a", "p", None), id));
+        fleet.api.set_running(id, &tls.addr);
+        // `Idle` deliberately: the CR's phase is `Running`, which
+        // `phase_to_status` maps to `Running`, so **only** a live overlay can
+        // make this agent read `Idle`. Asserting on `Running` would pass even
+        // with the overlay skipped entirely — the CR alone produces it.
+        fake.set_status(id, AgentStatus::Idle);
+
+        eventually("the restarted agent to be consulted again", || {
+            fleet
+                .known
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.status == AgentStatus::Idle)
+        })
+        .await;
     }
 
     /// #130: `send_input` must resolve the agent's per-agent endpoint via an

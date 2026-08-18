@@ -30,6 +30,22 @@ the patch version for fixes.
 
 ### Fixed
 
+- **Terminal outcomes are now derived from the pod, not the CalibanTask phase.**
+  #190 made the watch loop persist the transitions it observed, but it observed
+  `status.phase`, and the operator never advances that past `Running` — CRs whose
+  agents finished a day earlier still read `Running`, so no terminal transition
+  ever occurred and the outcome facets stayed at zero on a real cluster. The loop
+  now applies the same pod-caliband overlay `snapshot()` has always used, so the
+  component that emits events and the one that renders them finally agree. Pod
+  dials are bounded and concurrent, and an agent is consulted only until it is
+  observed terminal ([#194](https://github.com/caliban-ai/prospero/issues/194)).
+- **An unreachable pod can no longer stall fleet observation.** The status
+  overlay dialled each pod sequentially with no deadline. A pod that black-holes
+  its SYN (rather than refusing it) blocked until the OS connect timeout, which
+  was survivable when only `GET /api/fleet` did this and is not now that the
+  watch loop depends on it. Dials are concurrent and bounded; a miss retries on
+  the next poll ([#194](https://github.com/caliban-ai/prospero/issues/194)).
+
 - **Terminal outcomes are now recorded under `PROSPERO_FLEET=k8s`.** The usage
   aggregate counts `done`/`failed`/`killed`/`crashed` from persisted
   `status_changed` events. The local arm has always emitted them, but the k8s
