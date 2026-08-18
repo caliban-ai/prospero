@@ -835,6 +835,44 @@ type KnownAgents = Arc<Mutex<HashMap<String, Agent>>>;
 /// `_`, so no agent can ever collide with this key.
 pub(crate) const OBSERVER_STREAM_KEY: &str = "__fleet_observer";
 
+/// Whether `agent_id`'s durable stream already carries a terminal
+/// `StatusChanged`, so the watch loop never records one twice (#196).
+///
+/// `cache` memoises the answer for this process: once an agent is known to have
+/// a recorded outcome it stays known, and an agent we emit for is inserted by
+/// the caller. So the store is consulted at most once per agent per process,
+/// on the single poll where a terminal transition is first derived.
+///
+/// A store read failure returns `false` — emit anyway. Losing an outcome is a
+/// silent undercount; a duplicate is at least visible and, with this guard in
+/// place, self-limiting.
+async fn already_recorded_terminal(
+    session: &SessionPlane,
+    cache: &mut HashSet<String>,
+    agent_id: &str,
+) -> bool {
+    if cache.contains(agent_id) {
+        return true;
+    }
+    let store = session.emitter.store();
+    let recorded = match store.replay(agent_id, 0).await {
+        Ok(events) => events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if to.is_terminal())),
+        Err(e) => {
+            tracing::warn!(
+                target: "prospero_k8s_fleet", %agent_id, error = %e,
+                "could not read the agent's history to dedupe its outcome; emitting"
+            );
+            false
+        }
+    };
+    // Either way this agent now has a terminal outcome on record after this
+    // poll, so no later poll needs to ask again.
+    cache.insert(agent_id.to_string());
+    recorded
+}
+
 /// How long one pod-caliband `List` may take during a status overlay (#194).
 ///
 /// Bounded because the watch loop now depends on it: an unreachable pod that
@@ -851,6 +889,12 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
     session: SessionPlane,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // #196: agents whose terminal outcome is already durably recorded, so it
+        // is never written twice. Populated lazily from the store the first time
+        // this process is about to emit a terminal transition for an agent —
+        // which is exactly when a restart would otherwise duplicate one that
+        // pre-dates the process. At most one replay per agent per process.
+        let mut terminal_recorded: HashSet<String> = HashSet::new();
         loop {
             let tasks = match api.list().await {
                 Ok(tasks) => tasks,
@@ -940,9 +984,9 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     // covers a task with no matching entry (it cannot happen —
                     // both are built from `tasks` — but a silent `unwrap` here
                     // would be a poor trade for a poll loop).
-                    let agent = overlaid
-                        .remove(&name)
-                        .unwrap_or_else(|| agent_from_task(task));
+                    let Some(agent) = overlaid.remove(&name) else {
+                        continue;
+                    };
                     // #113: queue an attach for a Running, attachable agent. A
                     // malformed endpoint on a Running CR is logged and skipped
                     // (same defensive posture as `handle_from`'s callers), not
@@ -967,6 +1011,19 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                             "watch loop: Running CR has a malformed endpoint; skipping attach"
                         ),
                     }
+                    // #196: no observation this pass. Carry the last known
+                    // status rather than inventing one; with nothing known yet,
+                    // record nothing at all and wait for a real reading. Placed
+                    // after the attach queueing above so #113's behaviour is
+                    // unchanged — an attach that would have been queued still is.
+                    // NB: an agent whose pod did not answer deliberately keeps
+                    // its CR-phase status here, matching what `snapshot()` does
+                    // on a failed dial (#130/#148). Carrying the last known
+                    // status forward instead was tried and reverted: it made the
+                    // loop and `snapshot` disagree again, which is precisely the
+                    // class of defect #194 fixed. The duplicate-outcome problem
+                    // #196 describes is handled where it belongs — at the emit,
+                    // against the durable log — not by second-guessing status.
                     match known.get(&name) {
                         None => changes.push(FleetChange::Discovered {
                             id: AgentId::from(name.clone()),
@@ -1026,6 +1083,24 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                         to,
                     } = change
                     {
+                        // #196: an agent finishes once, so its outcome must be
+                        // recorded once. A restarted process starts with an
+                        // empty `known` and re-derives the transition it already
+                        // wrote before the restart — measured on the live
+                        // cluster as 3 done / 3 failed becoming 6 / 6 with
+                        // nothing having run. Consult the durable log, which
+                        // outlives the process, rather than in-memory state,
+                        // which does not.
+                        if to.is_terminal()
+                            && already_recorded_terminal(
+                                &session,
+                                &mut terminal_recorded,
+                                id.as_str(),
+                            )
+                            .await
+                        {
+                            continue;
+                        }
                         session
                             .emitter
                             .emit(
@@ -1612,19 +1687,24 @@ impl<A: CalibanTaskApi + 'static> FleetProvider for K8sFleet<A> {
 /// `FakeK8s`. Deliberately minimal: a name-keyed store behind a `Mutex`, no
 /// watch support (that's B3/B5's concern).
 #[cfg(all(test, feature = "k8s"))]
+/// Cloning shares the same backing store, so two `K8sFleet`s can be built over
+/// one set of CalibanTasks — which is how a prosperod restart is modelled: the
+/// cluster's CRs persist while the process's in-memory `known` map does not
+/// (#196).
+#[derive(Clone)]
 pub(crate) struct MemTaskApi {
-    store: std::sync::Mutex<std::collections::HashMap<String, CalibanTask>>,
+    store: Arc<std::sync::Mutex<std::collections::HashMap<String, CalibanTask>>>,
     /// Stamps a distinct creationTimestamp per create, so a delete + re-apply of
     /// the same name is observably a new incarnation (#194).
-    creations: AtomicU64,
+    creations: Arc<AtomicU64>,
 }
 
 #[cfg(all(test, feature = "k8s"))]
 impl MemTaskApi {
     fn new() -> Self {
         Self {
-            store: std::sync::Mutex::new(std::collections::HashMap::new()),
-            creations: AtomicU64::new(0),
+            store: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            creations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -3041,6 +3121,109 @@ mod tests {
         let rows = store.usage("0000", "9999").await.expect("usage");
         let row = rows.iter().find(|r| r.workspace == "repo-a").expect("row");
         assert_eq!(row.done, 1, "the done facet must not inflate over time");
+    }
+
+    /// #196: restarting prosperod must not re-count outcomes it already
+    /// recorded. Measured on the live cluster, one pod restart took the fleet
+    /// from 3 done / 3 failed to 6 done / 6 failed with nothing having run.
+    ///
+    /// The trigger is that a fresh process starts with an empty `known` map, the
+    /// CR still reports phase `Running` (the operator never advances it,
+    /// caliban-operator#37), and the pod overlay does not resolve on the very
+    /// first poll. The agent is therefore *recorded* as Running — a status
+    /// nobody observed — and the next poll's real reading looks like a fresh
+    /// `Running -> Done`, duplicating the one already in the store.
+    ///
+    /// The endpoint is pointed at a refused port for the first stretch to make
+    /// that race deterministic rather than timing-dependent.
+    #[tokio::test]
+    async fn a_restart_does_not_recount_an_outcome_already_in_the_store() {
+        let token = "restart-recount-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-recount";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, AgentStatus::Running);
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+
+        let terminal_count = |store: Arc<dyn Store>, id: &'static str| async move {
+            events_for(&store, id)
+                .await
+                .into_iter()
+                .filter(
+                    |e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if to.is_terminal()),
+                )
+                .count()
+        };
+
+        // --- First process: the agent runs and finishes. One transition. ---
+        {
+            let fleet = K8sFleet::new(api.clone(), Arc::clone(&bus), Arc::clone(&store))
+                .with_network(Some(client_tls.clone()), Some(token.to_string()))
+                .with_watch_poll_interval(Duration::from_millis(20));
+            eventually("the first process to observe the agent running", || {
+                fleet
+                    .known
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .is_some_and(|a| a.status == AgentStatus::Running)
+            })
+            .await;
+            fake.set_status(id, AgentStatus::Done);
+            events_until(&store, id, "the terminal StatusChanged", |events| {
+                events.iter().any(
+                    |e| matches!(&e.kind, EventKind::StatusChanged { to, .. } if to.is_terminal()),
+                )
+            })
+            .await;
+        } // fleet dropped -> its watch loop is aborted, as on a pod restart.
+
+        assert_eq!(
+            terminal_count(Arc::clone(&store), id).await,
+            1,
+            "precondition: exactly one outcome recorded before the restart"
+        );
+
+        // The pod becomes briefly unreachable, so the restarted process's first
+        // polls cannot resolve the overlay — the race, made deterministic.
+        api.set_running(id, "127.0.0.1:1");
+
+        // --- Second process: same store, empty `known`. ---
+        let _fleet = K8sFleet::new(api.clone(), bus, Arc::clone(&store))
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
+        // Let the restarted process poll several times while the pod is
+        // unreachable. This is the window in which it used to record the CR's
+        // stale `Running` as though it were an observation.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The pod comes back. Its status is unchanged — still Done.
+        api.set_running(id, &tls.addr);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            terminal_count(Arc::clone(&store), id).await,
+            1,
+            "the agent finished once; a restart must not record its outcome again"
+        );
+        let rows = store.usage("0000", "9999").await.expect("usage");
+        let row = rows.iter().find(|r| r.workspace == "repo-a").expect("row");
+        assert_eq!(
+            row.done, 1,
+            "the done facet must not double across a restart"
+        );
     }
 
     /// #194 acceptance: the whole point is that the dashboard's outcome facets
