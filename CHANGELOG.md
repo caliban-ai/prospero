@@ -30,6 +30,15 @@ the patch version for fixes.
 
 ### Fixed
 
+- **Restarting prosperod no longer re-counts outcomes it already recorded.** A
+  fresh process starts with an empty view of the fleet and re-derives the
+  terminal transition it had already written before the restart, so every
+  outcome facet doubled on each restart — measured on a live cluster as
+  3 done / 3 failed becoming 6 / 6 with nothing having run. The watch loop now
+  checks the durable log (which outlives the process) before recording an
+  agent's outcome, so an agent that finished once is counted once
+  ([#196](https://github.com/caliban-ai/prospero/issues/196)).
+
 - **Terminal outcomes are now derived from the pod, not the CalibanTask phase.**
   #190 made the watch loop persist the transitions it observed, but it observed
   `status.phase`, and the operator never advances that past `Running` — CRs whose
