@@ -9,8 +9,94 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-22
+
+Replaces the dashboard. The hand-written vanilla-JS page is superseded by a
+Rust → WASM single-page app that shares the server's own types, and it now
+serves `/`; the old page remains at `/v1`, deprecated. Everything an operator
+previously needed v1 for — launching, killing, replying to an interactive
+agent, editing a workspace's config, watching a live stream — is in v2, along
+with things v1 never had: a per-agent timeline with a tool-call inspector, and
+fleet-wide spend, turns, and outcome charts over a selectable window.
+
+The other half of this release is the k8s fleet telling the truth about what it
+ran. Terminal outcomes were structurally invisible under `PROSPERO_FLEET=k8s`:
+the watch loop derived agent status from the `CalibanTask` phase, and the
+operator never advances that past `Running`, so the new outcome charts read a
+permanent zero — including for runs that had demonstrably failed. Outcomes are
+now taken from the pod, recorded once per agent, and survive a restart.
+
+**Upgrade note.** `GET /` now serves dashboard v2 rather than v1, and
+`GET /app.js` is gone — v1's script moved to `/v1/app.js` along with the page.
+`/v2` remains a permanent alias for the new dashboard, so existing links to it
+keep working.
+
+### Added
+
+- **Dashboard v2 — a Rust → WASM single-page app, and now the dashboard.** A
+  Dioxus SPA in `crates/dashboard`, compiled to `wasm32-unknown-unknown` and
+  embedded in `prosperod`, replacing the hand-written vanilla-JS page. The read
+  model and the control-plane DTOs are the *same* Rust types the server uses, so
+  the client cannot drift from the API the way a hand-maintained JS copy did.
+  The crate sits outside the cargo workspace on purpose (a wasm-only crate would
+  break the host-target build and sink the coverage floor) and has its own CI
+  job; its built bundle is committed and `include_bytes!`'d, so an ordinary
+  `cargo build` still needs no wasm toolchain and one binary still ships the UI
+  ([#97](https://github.com/caliban-ai/prospero/issues/97)).
+- **Full operator control from the dashboard.** Launch, kill, remove, respawn,
+  interactive input, end-input, and workspace removal — every action gated on
+  `/api/capabilities`, so the UI never offers an operation the active backend
+  would answer with a 405
+  ([#173](https://github.com/caliban-ai/prospero/issues/173)).
+- **Workspace registration and configuration from the dashboard**, with two form
+  shapes chosen at runtime: the local single-provider/env form, and the k8s
+  `Workspace`-CR editor with sources, named providers, and Secret references,
+  plus the reconciliation-status pill and a provider picker on launch. This also
+  fixed a lossy read: `GET /api/workspaces` was projecting the CR's source spec
+  down and dropping the git remote and ref, so editing a k8s workspace meant
+  retyping every remote from memory
+  ([#175](https://github.com/caliban-ai/prospero/issues/175)).
+- **Live agent stream viewer** — replay history from the store, then tail over
+  SSE. A reconnect resumes at `last_seq + 1` and anything at or below the
+  high-water mark is dropped, which is the defence against the v1 reconnect
+  storm that duplicated the timeline unboundedly (#105); a close after
+  `AgentFinished` reads as "finished" rather than an error, so a healthy
+  completed run does not sit there retrying
+  ([#178](https://github.com/caliban-ai/prospero/issues/178)).
+- **Per-agent timeline with a tool-call inspector.** Tool calls pair start with
+  finish into a collapsible entry, consecutive output coalesces, and the opening
+  context and final accounting become a header and a summary. Pairing is on the
+  tool id and never the name — caliban's `ToolCallEnd` carries the id but leaves
+  the name empty, which is what left every tool stuck "running" in v1 (#106)
+  ([#179](https://github.com/caliban-ai/prospero/issues/179)).
+- **`GET /api/usage` — cost, turns, and terminal outcomes aggregated per
+  workspace per UTC day** over a window (`since`/`until`, or `days`). Computed
+  by the store rather than by replaying the log, with identical semantics across
+  the JSONL, SQLite, and Postgres backends, held there by a shared conformance
+  suite ([#180](https://github.com/caliban-ai/prospero/issues/180)).
+- **Fleet overview charts** for spend, turns, and outcomes over a selectable
+  24h / 7d / 30d window. Outcomes are faceted rather than stacked: measured
+  against the real tokens, no ordering of a four-way stack is separable in light
+  mode, so one single-hue chart per outcome is the fix rather than a mitigation.
+  Hand-rolled SVG with native `<title>` tooltips — the page is served under
+  `default-src 'none'`, so there is no script and nothing for the CSP to refuse
+  ([#181](https://github.com/caliban-ai/prospero/issues/181)).
+- **An explicit theme setting** (System / Light / Dark), persisted in
+  `localStorage`, replacing "whatever `prefers-color-scheme` says". The explicit
+  choice wins in both directions, and the theme is applied before first paint so
+  there is no flash of the wrong one
+  ([#183](https://github.com/caliban-ai/prospero/issues/183)).
+
 ### Changed
 
+- **The control-plane DTOs moved to `prospero-types`** and now carry both
+  `Serialize` and `Deserialize`. They previously lived in `prospero-api`, which
+  pulls axum and tokio and so compiles for no wasm target, and each carried only
+  the server's half of the contract — so a WASM client would have had to
+  hand-duplicate all eight, reintroducing exactly the drift Rust/WASM was chosen
+  to avoid. They are re-exported from their original paths and the serde output
+  is unchanged, so this is additive for existing consumers
+  ([#172](https://github.com/caliban-ai/prospero/issues/172)).
 - **Dashboard v2 is now the default surface.** `GET /` serves the Dioxus/WASM
   dashboard; `/v2` stays mounted as a permanent alias, since the bundle's own
   asset URLs are absolute `/v2/...` and existing links point there. The scaffold
@@ -70,6 +156,23 @@ the patch version for fixes.
   the fleet poll observes an agent appear, change status, or disappear, and on a
   one-minute heartbeat — without re-running a 30-day store aggregate on every
   five-second poll ([#190](https://github.com/caliban-ai/prospero/issues/190)).
+- **A k8s workspace's provider base URL survives an edit.** The v2 editor had no
+  base-URL input and `ProviderInfo` did not carry the field, so reopening the
+  editor showed a blank box and saving wrote it back — a routine model edit
+  silently unpicked a self-hosted provider, after which agents died instantly
+  with a `ProviderError` against `localhost`
+  ([#188](https://github.com/caliban-ai/prospero/issues/188)).
+- **k8s-spawned agents get the resolved provider and model.**
+  `spawn_spec_from_task` sent `provider`/`model` as `None` on the premise that
+  pod env would drive selection; the caliban worker selects from `SpawnSpec` and
+  nothing else, so every k8s agent fell back to caliban's default and died at
+  preflight with `ANTHROPIC_API_KEY is not set`. The operator already pins the
+  resolved provider into `status.resolvedWorkspace`, so its kind and model are
+  projected onto the spawn. `ensure_pod_agent` also no longer attaches to an
+  agent already in a terminal state — caliband keeps a failed agent in its
+  registry with the endpoint it advertised, but the worker died before binding
+  that port, turning a one-shot failure into a silent reconnect loop
+  ([#169](https://github.com/caliban-ai/prospero/issues/169)).
 - **Re-submitting an identical prompt no longer claims a launch that didn't
   happen.** Spawning is idempotent and the k8s `CalibanTask` name is derived
   from the spec, so an identical prompt resolves to the run already in flight.
@@ -369,7 +472,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/caliban-ai/prospero/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/prospero/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/caliban-ai/prospero/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/caliban-ai/prospero/compare/v0.3.1...v0.3.2
