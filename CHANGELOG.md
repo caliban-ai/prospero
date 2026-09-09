@@ -11,6 +11,19 @@ the patch version for fixes.
 
 ### Added
 
+- test: load/soak coverage for streaming under fan-out. Forty concurrent attach
+  tasks must each stream to completion with their own output and monotonic
+  sequence numbers, so a crossed or silently-unattached stream fails loudly
+  rather than going unnoticed. Alongside it, the in-process bus now has
+  bounded-buffer coverage: a slow subscriber is told exactly how much it lost
+  and keeps working, a subscriber that keeps up never lags, sixty-four
+  subscribers lag independently rather than sharing a cursor, and dropping one
+  mid-pressure leaves the rest untouched. Asserted on observable state instead
+  of elapsed time, so they can run in the gate rather than becoming the next
+  ignored test. (#8)
+
+### Added
+
 - `DistributedBus::subscribe_all_ready`, an unfiltered subscription whose
   `LISTEN` is established before it returns rather than lazily on the stream's
   first poll. Connection and `LISTEN` failures surface as an error instead of
