@@ -9,6 +9,22 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-09
+
+Finishes what v0.5.0 started. That release made the Rust → WASM dashboard the
+default and left the old vanilla-JS page at `/v1` as a landing spot in case v2
+regressed. It didn't, so both the page and the version suffix that existed to
+distinguish the two are gone: there is one dashboard, served at `/`, and its
+files live under `/assets/`.
+
+The rest is the k8s fleet and its test coverage getting more honest. A pod agent
+that dies at spawn is a stable state, and prospero now treats it as one instead
+of re-dialing it every two seconds for as long as the process lives — a loop
+measured running for twenty-four days against a single stuck task. Two long-open
+gaps in coverage close alongside it: cross-stream delivery on the clustered bus,
+which had been `#[ignore]`d as too flaky to gate on, and streaming under
+fan-out, which had no coverage at all.
+
 ### Removed
 
 - **Breaking:** the v1 dashboard. The hand-written vanilla-JS page that served
@@ -25,47 +41,49 @@ the patch version for fixes.
   the bare root, so the bundle cannot shadow the API namespace. `GET /v2` now
   404s. Internally the same rename: `crates/api/dashboard-v2/` is
   `crates/api/dashboard/`, the handler module is `dashboard`, and the CI job is
-  "dashboard wasm build".
+  "dashboard wasm build". (#204)
 
 ### Added
 
-- test: load/soak coverage for streaming under fan-out. Forty concurrent attach
-  tasks must each stream to completion with their own output and monotonic
-  sequence numbers, so a crossed or silently-unattached stream fails loudly
-  rather than going unnoticed. Alongside it, the in-process bus now has
-  bounded-buffer coverage: a slow subscriber is told exactly how much it lost
-  and keeps working, a subscriber that keeps up never lags, sixty-four
-  subscribers lag independently rather than sharing a cursor, and dropping one
-  mid-pressure leaves the rest untouched. Asserted on observable state instead
-  of elapsed time, so they can run in the gate rather than becoming the next
-  ignored test. (#8)
+- **`DistributedBus::subscribe_all_ready`** — an unfiltered subscription whose
+  `LISTEN` is established before it returns, rather than lazily on the stream's
+  first poll. The lazy form cannot tell a caller when it is safe to publish, and
+  a doorbell rung in that gap is simply not heard. Connection and `LISTEN`
+  failures now surface as an error instead of silently ending the stream. (#132)
 
-### Added
-
-- `DistributedBus::subscribe_all_ready`, an unfiltered subscription whose
-  `LISTEN` is established before it returns rather than lazily on the stream's
-  first poll. Connection and `LISTEN` failures surface as an error instead of
-  silently ending the stream. (#132)
+- **Load and soak coverage for streaming under pressure.** Forty concurrent
+  attach tasks must each stream to completion carrying their own output and
+  monotonic sequence numbers, so a crossed or silently-unattached stream fails
+  loudly rather than going unnoticed. The in-process bus gains bounded-buffer
+  coverage: a slow subscriber is told exactly how much it lost and keeps
+  working, a subscriber that keeps up never lags, sixty-four subscribers lag
+  independently rather than sharing a cursor, and dropping one mid-pressure
+  leaves the rest untouched. Asserted on observable state rather than elapsed
+  time, so they run in the gate instead of becoming the next ignored test. (#8)
 
 ### Fixed
 
-- test: cross-stream `subscribe_all` delivery is covered in CI again. The test
-  was `#[ignore]`d because the lazy subscription gave it no way to know when it
-  was safe to ring the doorbell, so it re-rang up to 440 times over 44s and
-  still starved to zero deliveries on a contended runner. It now establishes
-  `LISTEN` first and asserts on delivery rather than on patience. (#132)
+- **A terminal pod agent is resolved once, not on every poll.** Rejecting a
+  terminal record (#168) removed the reconnect budget that had been incidentally
+  throttling the retry, so the ~2s watch loop re-resolved the same dead agent
+  forever — one warning per poll, indefinitely, for a state that cannot resolve
+  on its own. Observed running for 24 days against a single stuck task. The
+  session plane now remembers terminal agent ids, skips them, and logs the cause
+  once per transition. An explicit stop or restart, or the CR going away, clears
+  the mark so a respawn is re-checked. (#170)
 
-### Fixed
+- **Cross-stream `subscribe_all` delivery is covered in CI again.** The test was
+  `#[ignore]`d because the lazy subscription gave it no way to know when it was
+  safe to ring the doorbell, so it re-rang up to 440 times over 44s and still
+  starved to zero deliveries on a contended runner. It now establishes `LISTEN`
+  first and asserts on delivery rather than on patience — about a second,
+  including under the coverage instrumentation the flake was worst under. (#132)
 
-- k8s: a pod agent that died at spawn is now resolved once, not re-dialed on
-  every poll. Rejecting a terminal record (#168) removed the reconnect budget
-  that had been incidentally throttling the retry, so the ~2s watch loop
-  re-resolved the same dead agent forever — one warning per poll, indefinitely,
-  for a state that cannot resolve on its own (observed running for 24 days
-  against a single stuck task). The session plane now remembers terminal agent
-  ids, skips them, and logs the cause once per transition. An explicit stop or
-  restart, or the CR going away, clears the mark so a respawn is re-checked.
-  (#170)
+### Security
+
+- `anyhow` bumped to 1.0.104, clearing RUSTSEC-2026-0190 (unsoundness in
+  `Error::downcast_mut()`). Lockfile only; nothing here calls `downcast_mut`,
+  but a release should not carry a known-unsound dependency. (#205)
 
 ## [0.5.0] - 2026-08-22
 
@@ -530,7 +548,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/caliban-ai/prospero/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/caliban-ai/prospero/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/prospero/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/caliban-ai/prospero/compare/v0.3.2...v0.3.3
