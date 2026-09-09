@@ -53,6 +53,79 @@ impl DistributedBus {
     pub fn new(pool: PgPool, store: Arc<dyn Store>) -> Self {
         Self { pool, store }
     }
+
+    /// [`EventBus::subscribe_all`], but the `LISTEN` is established **before**
+    /// this returns rather than lazily on the stream's first poll (#132).
+    ///
+    /// The lazy form cannot tell a caller when it is safe to publish. A
+    /// doorbell rung in the gap is simply not heard, and because the per-key
+    /// high-water starts at 0, the miss is only repaired by the *next* doorbell
+    /// for that key — which, for a stream that just went quiet, may never come.
+    /// Ringing repeatedly and hoping is what the #132 test was doing, and it
+    /// still starved to zero deliveries on a contended runner.
+    ///
+    /// Connection and `LISTEN` failures surface here as an `Err` instead of
+    /// silently ending the stream, which is the other thing the lazy form
+    /// cannot express.
+    pub async fn subscribe_all_ready(&self) -> Result<BusSubscription> {
+        let mut listener = PgListener::connect_with(&self.pool)
+            .await
+            .map_err(|e| crate::error::CoreError::Store(format!("PgListener connect: {e}")))?;
+        listener
+            .listen(CHANNEL)
+            .await
+            .map_err(|e| crate::error::CoreError::Store(format!("LISTEN {CHANNEL}: {e}")))?;
+        Ok(Box::pin(Self::drain_doorbell(listener, self.store.clone())))
+    }
+
+    /// The unfiltered doorbell loop, over an already-established `LISTEN`.
+    ///
+    /// Shared by [`EventBus::subscribe_all`] and [`Self::subscribe_all_ready`]
+    /// so the two differ only in *when* they start listening, never in what
+    /// they deliver.
+    ///
+    /// Unlike `subscribe` (one stream, one `last_seq`), an unfiltered doorbell
+    /// can arrive for any stream key, so the high-water mark is tracked per key,
+    /// seeded at 0 the same way and for the same reason (see `subscribe`'s
+    /// comment): correctness over a late-seed race, at the cost of one deduped
+    /// re-read per stream on its first doorbell.
+    fn drain_doorbell(
+        mut listener: PgListener,
+        store: Arc<dyn Store>,
+    ) -> impl futures::Stream<Item = BusEvent> + Send {
+        async_stream::stream! {
+            let mut last_seq: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+            loop {
+                let notif = match listener.recv().await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(target: "prospero_bus", error = %e, "LISTEN recv failed");
+                        break;
+                    }
+                };
+                let Some((nkey, _seq)) = notif.payload().rsplit_once(':') else {
+                    continue;
+                };
+                let from = last_seq.get(nkey).copied().unwrap_or(0) + 1;
+                match store.replay(nkey, from).await {
+                    Ok(events) => {
+                        for ev in events {
+                            let cur = last_seq.entry(nkey.to_string()).or_insert(0);
+                            if ev.seq <= *cur {
+                                continue;
+                            }
+                            *cur = ev.seq;
+                            yield BusEvent::Event(ev);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "prospero_bus", error = %e, "doorbell replay failed");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl EventBus for DistributedBus {
@@ -164,42 +237,13 @@ impl EventBus for DistributedBus {
                 tracing::warn!(target: "prospero_bus", error = %e, "LISTEN failed");
                 return;
             }
-
-            // Unlike `subscribe` (one stream, one `last_seq`), an unfiltered
-            // doorbell can arrive for any stream key, so the high-water mark is
-            // tracked per key, seeded at 0 the same way and for the same reason
-            // (see `subscribe`'s comment): correctness over a late-seed race,
-            // at the cost of one deduped re-read per stream on its first
-            // doorbell.
-            let mut last_seq: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-
-            loop {
-                let notif = match listener.recv().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!(target: "prospero_bus", error = %e, "LISTEN recv failed");
-                        break;
-                    }
-                };
-                let Some((nkey, _seq)) = notif.payload().rsplit_once(':') else {
-                    continue;
-                };
-                let from = last_seq.get(nkey).copied().unwrap_or(0) + 1;
-                match store.replay(nkey, from).await {
-                    Ok(events) => {
-                        for ev in events {
-                            let cur = last_seq.entry(nkey.to_string()).or_insert(0);
-                            if ev.seq <= *cur {
-                                continue;
-                            }
-                            *cur = ev.seq;
-                            yield BusEvent::Event(ev);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "prospero_bus", error = %e, "doorbell replay failed");
-                    }
-                }
+            // Same machinery as `subscribe_all_ready` from here on — only the
+            // moment `LISTEN` is established differs (lazily, on this first
+            // poll, versus before the call returns).
+            let inner = DistributedBus::drain_doorbell(listener, store);
+            futures::pin_mut!(inner);
+            while let Some(item) = futures::StreamExt::next(&mut inner).await {
+                yield item;
             }
         })
     }
@@ -405,29 +449,36 @@ mod tests {
         );
     }
 
+    /// Ring the doorbell for `agent` **synchronously**, so the test controls
+    /// exactly when the NOTIFY lands relative to a subscription's `LISTEN`.
+    /// `DistributedBus::publish` spawns its notify, which is fine in production
+    /// but makes ordering unobservable in a test.
+    async fn ring(bus: &DistributedBus, agent: &str, seq: u64) {
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(CHANNEL)
+            .bind(format!("{agent}:{seq}"))
+            .execute(&bus.pool)
+            .await
+            .expect("pg_notify");
+    }
+
     /// `subscribe_all` (unlike `subscribe`) has no stream-key filter, and
     /// tracks a `last_seq` per discovered key rather than one fixed key. This
     /// is the opposite assertion from `doorbell_ignores_other_streams`: two
     /// DIFFERENT streams must both reach one unfiltered subscription, and
     /// ringing either doorbell repeatedly must not re-deliver an already-seen
     /// event on either key (per-key high-water advances independently).
-    // Multi-threaded runtime: these tests spawn a consumer task and the bus
-    // spawns a pg_notify task per publish, all of which must make progress
-    // concurrently with the publish loop. On the default current-thread runtime
-    // they contend cooperatively on one thread and — under the slow, instrumented
-    // coverage build especially — can starve the listener so no doorbell is ever
-    // processed. Real threads keep the listener draining while we publish.
-    // Manual/local integration test (run with `cargo test -- --ignored`).
-    // `subscribe_all` replays from the store for EVERY doorbell on the shared
-    // NOTIFY channel, so on an oversubscribed CI runner — where many test
-    // binaries hammer one Postgres in parallel — its listener can be starved
-    // long enough that no doorbell is ever processed (observed: zero deliveries
-    // in 45s). Serializing the bus tests and a multi-thread runtime made it far
-    // more reliable but not deterministic on CI, so we keep it out of the CI
-    // gate rather than let it flake unrelated PRs. The `subscribe()` doorbell
-    // path (the same LISTEN/replay machinery, filtered) stays covered by the
-    // other three bus tests, which run in CI. Deterministic redesign: #132.
-    #[ignore = "environment-sensitive live-doorbell integration test; run with --ignored (see comment)"]
+    ///
+    /// #132: this used to be `#[ignore]`d. `subscribe_all` returns a lazy
+    /// stream whose `LISTEN` is only established on the first poll, so a test
+    /// had no way to know when it was safe to ring. The old version worked
+    /// around that by re-ringing both doorbells up to 440 times over 44s and
+    /// waiting up to 45s — which still starved to zero deliveries on an
+    /// oversubscribed CI runner, so it was pulled from the gate entirely.
+    ///
+    /// `subscribe_all_ready` removes the guess: `LISTEN` is established before
+    /// it returns, so one ring per stream is enough and the assertion is about
+    /// delivery rather than about how long we were willing to wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn subscribe_all_delivers_events_from_multiple_streams() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -445,69 +496,87 @@ mod tests {
         let agent_a = unique_agent("agent-all-a");
         let agent_b = unique_agent("agent-all-b");
 
+        store.append(&ev(1, &agent_a)).await.unwrap();
+        store.append(&ev(1, &agent_b)).await.unwrap();
+
+        // Established `LISTEN` before the first ring: both doorbells below are
+        // rung at a listener that is already on the channel.
+        let mut sub = bus.subscribe_all_ready().await.unwrap();
+        ring(&bus, &agent_a, 1).await;
+        ring(&bus, &agent_b, 1).await;
+
         // `subscribe_all` is global and unfiltered by design, so under a shared
         // test database it also observes events from *sibling* tests running
         // concurrently (their own `unique_agent(...)` streams). This test is
         // only about OUR two streams: consume until both have arrived, skipping
         // any foreign stream key (and lag signals), while asserting neither of
-        // ours is ever delivered twice. Taking "the first two events" verbatim
-        // would flake whenever a concurrent test's event interleaves first.
-        let mut sub = bus.subscribe_all();
-        let a_recv = agent_a.clone();
-        let b_recv = agent_b.clone();
-        let recv = tokio::spawn(async move {
-            let mut seen = std::collections::HashSet::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-            while seen.len() < 2 {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(remaining, sub.next()).await {
-                    Ok(Some(BusEvent::Event(ev))) => {
-                        if ev.agent_id == a_recv || ev.agent_id == b_recv {
-                            assert!(
-                                seen.insert(ev.agent_id.clone()),
-                                "duplicate delivery for stream {} (per-key high-water not advancing)",
-                                ev.agent_id
-                            );
-                        }
-                        // Foreign stream keys (concurrent tests) are expected — skip them.
+        // ours is ever delivered twice.
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < 2 {
+            match tokio::time::timeout(Duration::from_secs(30), sub.next()).await {
+                Ok(Some(BusEvent::Event(delivered))) => {
+                    if delivered.agent_id == agent_a || delivered.agent_id == agent_b {
+                        assert!(
+                            seen.insert(delivered.agent_id.clone()),
+                            "duplicate delivery for stream {} (per-key high-water not advancing)",
+                            delivered.agent_id
+                        );
                     }
-                    // Lag signals aren't a delivery of one of our streams — keep waiting.
-                    Ok(Some(BusEvent::Lagged(_))) => {}
-                    Ok(None) => panic!("subscription closed before both streams arrived"),
-                    Err(_) => panic!("doorbell timed out; saw {seen:?} of our two streams"),
+                    // Foreign stream keys (concurrent tests) are expected — skip them.
                 }
+                // Lag signals aren't a delivery of one of our streams — keep waiting.
+                Ok(Some(BusEvent::Lagged(_))) => {}
+                Ok(None) => panic!("subscription closed before both streams arrived"),
+                Err(_) => panic!("doorbell timed out; saw {seen:?} of our two streams"),
             }
-            seen
-        });
-
-        // Same bounded-retry doorbell-ring pattern as
-        // `doorbell_delivers_a_live_event_to_a_subscriber`: the LISTEN
-        // connection is established lazily on first poll, so ring both
-        // doorbells repeatedly (idempotent — replay starts from last_seq+1 per
-        // key). Crucially, keep ringing until the subscriber has actually
-        // consumed both events (`recv.is_finished()`), NOT for a fixed window:
-        // under a saturated runtime (the full parallel test suite) the
-        // subscribe_all task's lazy LISTEN can take several seconds to come up,
-        // and if the nudges stop before then, no later doorbell ever replays our
-        // rows and the subscriber times out having seen nothing.
-        let event_a = ev(1, &agent_a);
-        let event_b = ev(1, &agent_b);
-        store.append(&event_a).await.unwrap();
-        store.append(&event_b).await.unwrap();
-        for _ in 0..440 {
-            if recv.is_finished() {
-                break;
-            }
-            bus.publish(event_a.clone());
-            bus.publish(event_b.clone());
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let seen = recv.await.unwrap();
         assert_eq!(
             seen.len(),
             2,
             "subscribe_all must deliver events from both streams, unfiltered"
         );
+    }
+
+    /// #132: the guarantee the test above rests on, asserted on its own.
+    ///
+    /// Exactly **one** doorbell is rung, after `subscribe_all_ready` returns
+    /// and never again. That is what the lazy `subscribe_all` cannot survive:
+    /// its `LISTEN` is established on the first poll, which here happens after
+    /// the ring, so the notification is already gone and — with no later
+    /// doorbell for the key to trigger the catch-up replay — the event is never
+    /// delivered. This is the exact hazard the old test's 440-ring loop existed
+    /// to paper over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribe_all_ready_is_listening_before_it_returns() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "SKIP subscribe_all_ready_is_listening_before_it_returns: DATABASE_URL unset"
+            );
+            return;
+        };
+        let _serial = BUS_TEST_SERIAL.lock().await;
+
+        let store = PostgresStore::connect(&url).await.unwrap();
+        let store: Arc<dyn Store> = Arc::new(store);
+        let bus = DistributedBus::connect(&url, store.clone()).await.unwrap();
+
+        let agent = unique_agent("agent-ready");
+        store.append(&ev(1, &agent)).await.unwrap();
+
+        let mut sub = bus.subscribe_all_ready().await.unwrap();
+        ring(&bus, &agent, 1).await;
+
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), sub.next()).await {
+                Ok(Some(BusEvent::Event(delivered))) if delivered.agent_id == agent => break,
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("subscription closed before our event arrived"),
+                Err(_) => panic!(
+                    "a single doorbell rung after subscribe_all_ready was not delivered — \
+                     the subscription was not listening when it returned"
+                ),
+            }
+        }
     }
 }

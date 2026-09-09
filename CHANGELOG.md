@@ -9,6 +9,21 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Added
+
+- `DistributedBus::subscribe_all_ready`, an unfiltered subscription whose
+  `LISTEN` is established before it returns rather than lazily on the stream's
+  first poll. Connection and `LISTEN` failures surface as an error instead of
+  silently ending the stream. (#132)
+
+### Fixed
+
+- test: cross-stream `subscribe_all` delivery is covered in CI again. The test
+  was `#[ignore]`d because the lazy subscription gave it no way to know when it
+  was safe to ring the doorbell, so it re-rang up to 440 times over 44s and
+  still starved to zero deliveries on a contended runner. It now establishes
+  `LISTEN` first and asserts on delivery rather than on patience. (#132)
+
 ### Fixed
 
 - k8s: a pod agent that died at spawn is now resolved once, not re-dialed on
