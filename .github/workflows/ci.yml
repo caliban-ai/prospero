@@ -136,10 +136,10 @@ jobs:
       - name: cargo build -p prospero-types --target wasm32-unknown-unknown
         run: cargo build -p prospero-types --target wasm32-unknown-unknown
 
-  # Dashboard v2 (#97). The crate is excluded from the cargo workspace, so the
+  # Dashboard (#97). The crate is excluded from the cargo workspace, so the
   # `check` job above never sees it — this is its gate.
   dashboard-wasm:
-    name: dashboard v2 wasm build
+    name: dashboard wasm build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -195,7 +195,7 @@ jobs:
       # so it is testable without a headless browser.
       - name: cargo test
         run: cd crates/dashboard && cargo test
-      # crates/api/dashboard-v2/ is a COMMITTED build artifact — it is
+      # crates/api/dashboard/ is a COMMITTED build artifact — it is
       # include_bytes!'d into prosperod so an ordinary `cargo build` needs no
       # wasm toolchain. This proves it was regenerated after its sources last
       # changed, so a stale bundle fails the build instead of shipping.

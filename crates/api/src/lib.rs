@@ -5,7 +5,7 @@
 //! (replay-then-tail); and a static dashboard. The CLI and the browser both
 //! talk to this one surface.
 
-pub mod dashboard_v2;
+pub mod dashboard;
 pub mod dto;
 pub mod error;
 pub mod handlers;
@@ -51,17 +51,17 @@ pub fn router(
         bus,
     };
     Router::new()
-        // The dashboard (Dioxus/WASM, #97) serves `/`. `/v2` remains a
-        // permanent alias because the bundle's own asset URLs are absolute
-        // `/v2/...`, and existing links and bookmarks point there. The old
-        // vanilla-JS page that once held `/` was deprecated to `/v1` in #191
-        // and deleted in #197; nothing is served under `/v1` any more.
+        // The dashboard (Dioxus/WASM, #97) is the only UI: the document at
+        // `/`, its files under `/assets/`. It shared the server with a
+        // vanilla-JS page until #197 removed that, and the version-suffixed
+        // `/v1` and `/v2` paths went with it.
         //
-        // The catch-all covers the JS glue, the .wasm, the stylesheet, and
-        // wasm-bindgen's hashed `snippets/` tree.
-        .route("/", get(dashboard_v2::index))
-        .route("/v2", get(dashboard_v2::index))
-        .route("/v2/{*path}", get(dashboard_v2::asset))
+        // Assets sit under a prefix rather than at the root so the bundle
+        // cannot shadow the API namespace. The catch-all covers the JS glue,
+        // the .wasm, the stylesheet, and wasm-bindgen's hashed `snippets/`
+        // tree, whose filenames change with every dependency bump.
+        .route("/", get(dashboard::index))
+        .route("/assets/{*path}", get(dashboard::asset))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/api/metrics", get(handlers::get_metrics))
