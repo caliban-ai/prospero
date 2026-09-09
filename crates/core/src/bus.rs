@@ -154,4 +154,116 @@ mod tests {
         assert_eq!(sub.next().await, Some(BusEvent::Event(ev_for(1, "a"))));
         assert_eq!(sub.next().await, Some(BusEvent::Event(ev_for(2, "b"))));
     }
+
+    // ---- #8: bounded-buffer behaviour under pressure -----------------------
+    //
+    // These are deliberately *not* timing tests. `broadcast` buffers on `send`,
+    // so a receiver that is registered and then not polled falls behind by an
+    // amount the test chooses exactly. That makes the drop count, the surviving
+    // window, and the recovery all assertable without sleeping or racing —
+    // which is the mistake that got the last soak-shaped test `#[ignore]`d
+    // (#132).
+
+    /// Capacity 4, 10 events published before a single poll: the subscriber
+    /// must be told it lost the 6 oldest rather than silently skipping them,
+    /// must then receive exactly the 4 the buffer still holds, and must keep
+    /// working afterwards. That last part is the one that matters — a lag is
+    /// only acceptable if the subscription survives it.
+    #[tokio::test]
+    async fn a_slow_subscriber_drops_a_bounded_prefix_then_keeps_working() {
+        let bus = InProcessBus::new(4);
+        let mut sub = bus.subscribe_all();
+
+        for seq in 1..=10 {
+            bus.publish(ev_for(seq, "a"));
+        }
+
+        assert_eq!(
+            sub.next().await,
+            Some(BusEvent::Lagged(6)),
+            "10 published into a 4-deep buffer must report exactly the 6 dropped"
+        );
+        for seq in 7..=10 {
+            assert_eq!(
+                sub.next().await,
+                Some(BusEvent::Event(ev_for(seq, "a"))),
+                "the buffer's surviving window is the newest `capacity` events"
+            );
+        }
+
+        // Liveness after the drop: the subscription self-heals rather than
+        // wedging or ending.
+        bus.publish(ev_for(11, "a"));
+        assert_eq!(
+            sub.next().await,
+            Some(BusEvent::Event(ev_for(11, "a"))),
+            "a subscription must survive its own lag"
+        );
+    }
+
+    /// The other half of the contract: a consumer that keeps up is never
+    /// penalised. Interleaving publish and receive keeps the receiver at most
+    /// one event behind, so no `Lagged` may appear at any point.
+    #[tokio::test]
+    async fn a_subscriber_that_keeps_up_never_lags() {
+        let bus = InProcessBus::new(4);
+        let mut sub = bus.subscribe_all();
+
+        for seq in 1..=64 {
+            bus.publish(ev_for(seq, "a"));
+            assert_eq!(
+                sub.next().await,
+                Some(BusEvent::Event(ev_for(seq, "a"))),
+                "a consumer draining each event must never be told it lagged"
+            );
+        }
+    }
+
+    /// Fan-out under pressure: every subscriber has its own read position, so
+    /// one slow consumer must not corrupt or starve the others. All 64 fall
+    /// behind identically here, and each must independently report the same
+    /// bounded loss and then recover — no shared cursor, no cross-talk.
+    #[tokio::test]
+    async fn many_concurrent_subscribers_each_lag_independently_and_recover() {
+        const SUBSCRIBERS: usize = 64;
+        let bus = InProcessBus::new(4);
+        let mut subs: Vec<_> = (0..SUBSCRIBERS).map(|_| bus.subscribe_all()).collect();
+
+        for seq in 1..=10 {
+            bus.publish(ev_for(seq, "a"));
+        }
+        bus.publish(ev_for(11, "a"));
+
+        for (i, sub) in subs.iter_mut().enumerate() {
+            assert_eq!(
+                sub.next().await,
+                Some(BusEvent::Lagged(7)),
+                "subscriber {i} must report its own loss, not a shared one"
+            );
+            for seq in 8..=11 {
+                assert_eq!(
+                    sub.next().await,
+                    Some(BusEvent::Event(ev_for(seq, "a"))),
+                    "subscriber {i} must still receive the surviving window"
+                );
+            }
+        }
+    }
+
+    /// A subscriber that goes away mid-pressure must not affect the ones that
+    /// remain — dropping a receiver is normal SSE client behaviour (a closed
+    /// browser tab), not an error the bus should propagate.
+    #[tokio::test]
+    async fn dropping_one_subscriber_under_pressure_does_not_disturb_the_rest() {
+        let bus = InProcessBus::new(4);
+        let mut staying = bus.subscribe_all();
+        let leaving = bus.subscribe_all();
+
+        bus.publish(ev_for(1, "a"));
+        drop(leaving);
+        bus.publish(ev_for(2, "a"));
+
+        assert_eq!(staying.next().await, Some(BusEvent::Event(ev_for(1, "a"))));
+        assert_eq!(staying.next().await, Some(BusEvent::Event(ev_for(2, "a"))));
+    }
 }

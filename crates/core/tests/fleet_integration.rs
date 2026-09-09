@@ -718,3 +718,94 @@ async fn non_owner_suppresses_repo_health_events() {
         "non-owner must not emit WorkspaceHealth"
     );
 }
+
+/// #8: fan-out soak. Streaming work scales with one attach task per active
+/// agent, and nothing covered what happens when many run at once — the risk is
+/// not that a single attach breaks but that some agents are quietly never
+/// attached, or that concurrent writers interleave into each other's streams.
+///
+/// Each agent emits text unique to itself, so a crossed stream is detectable
+/// rather than merely suspected. The assertion is completeness and per-agent
+/// ordering, not latency: the wait below is a generous liveness cap that turns
+/// a hang into a legible failure, never a performance bar. (Asserting on a
+/// deadline is what got the last soak-shaped test `#[ignore]`d — #132.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_concurrent_attach_tasks_all_stream_to_completion() {
+    const AGENTS: usize = 40;
+
+    let mut h = setup().await;
+    let dir = h.socket_dir();
+
+    let ids: Vec<String> = (0..AGENTS).map(|i| format!("soak{i:03}")).collect();
+    for id in &ids {
+        let rec = test_record(id, &dir, AgentStatus::Running, true);
+        h.fake
+            .add_agent(
+                rec,
+                vec![
+                    serde_json::json!({"type":"TurnStart","turn_index":0,"message_id":"s","model":"m"}),
+                    // Unique per agent: proves this text reached *this* stream.
+                    serde_json::json!({"type":"AssistantTextDelta","turn_index":0,"content_block_index":0,"text":id}),
+                    serde_json::json!({"type":"RunEnd","final_messages":[],"total_usage":{},"turn_count":1,"stopped_for":"EndOfTurn"}),
+                ],
+            )
+            .await;
+    }
+
+    h.manager.poll_repo_once("repo").await;
+
+    // Liveness: wait for every agent to reach its terminal frame. Bounded, so a
+    // stalled attach fails with a count instead of hanging the suite.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut finished: Vec<&String> = Vec::new();
+    while finished.len() < AGENTS && tokio::time::Instant::now() < deadline {
+        finished.clear();
+        for id in &ids {
+            let history = h.manager.history(id, 0).await.unwrap_or_default();
+            if history
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::AgentFinished { .. }))
+            {
+                finished.push(id);
+            }
+        }
+        if finished.len() < AGENTS {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(
+        finished.len(),
+        AGENTS,
+        "only {} of {AGENTS} attach tasks streamed to completion",
+        finished.len()
+    );
+
+    // Correctness under fan-out: each stream carries its own text and nobody
+    // else's, and its sequence numbers are monotonic despite the concurrency.
+    for id in &ids {
+        let history = h.manager.history(id, 0).await.unwrap();
+
+        assert!(
+            history
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::Output { chunk, .. } if chunk == id)),
+            "{id} never received its own output"
+        );
+        for other in &ids {
+            if other == id {
+                continue;
+            }
+            assert!(
+                !history
+                    .iter()
+                    .any(|e| matches!(&e.kind, EventKind::Output { chunk, .. } if chunk == other)),
+                "{id}'s stream carried {other}'s output — concurrent attaches crossed"
+            );
+        }
+
+        let seqs: Vec<u64> = history.iter().map(|e| e.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "{id}'s history is out of order under fan-out");
+    }
+}
