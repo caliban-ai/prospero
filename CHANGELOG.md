@@ -9,6 +9,17 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** the v1 dashboard. The hand-written vanilla-JS page that served
+  `/` before v0.5.0, deprecated to `/v1` in #191, is deleted along with its
+  embedded assets and routes. `/v1` and `/v1/app.js` now 404 — deliberately no
+  redirect and no fallback, so a dead surface does not linger in bookmarks and
+  access logs. The Dioxus/WASM dashboard at `/` is the UI; `/v2` remains a
+  permanent alias because the bundle's asset URLs are absolute. Removing it also
+  drops ~200KB of embedded assets from every binary and the known defects v2 was
+  built to fix, most visibly #106's permanently-"running" tool calls. (#197)
+
 ### Added
 
 - test: load/soak coverage for streaming under fan-out. Forty concurrent attach

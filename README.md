@@ -46,7 +46,7 @@ NDJSON client and does not depend on the caliban crates.
 | `prospero-api` | — | axum REST + SSE + embedded dashboard over `FleetManager` |
 | `prospero-daemon` | `prosperod` | Long-running control-plane daemon |
 | `prospero-cli` | `prospero` | Operator CLI (thin HTTP client over `prosperod`) |
-| `prospero-dashboard` | — | Dashboard v2: Dioxus → WASM SPA (outside the workspace — see below) |
+| `prospero-dashboard` | — | Dashboard: Dioxus → WASM SPA (outside the workspace — see below) |
 
 ## Usage
 
@@ -55,7 +55,6 @@ Start the daemon (serves the API + dashboard on `127.0.0.1:7878` by default):
 ```bash
 cargo run --bin prosperod
 # dashboard:  http://127.0.0.1:7878      (Dioxus/WASM; also at /v2)
-# deprecated: http://127.0.0.1:7878/v1   (the old vanilla-JS page)
 ```
 
 Drive it with the CLI:
@@ -91,16 +90,14 @@ The test suite runs entirely against an in-process `FakeCaliband` harness (in
 sockets — so the whole control plane, including the end-to-end CLI path, is
 tested with no real caliban and no LLM calls.
 
-### Dashboard v2 (Dioxus/WASM)
+### Dashboard (Dioxus/WASM)
 
 `crates/dashboard` is a Rust → WASM SPA and **the dashboard**: it serves `/`,
 and `/v2` stays mounted as a permanent alias because the bundle's own asset URLs
-are absolute `/v2/...`. The previous vanilla-JS page is deprecated and moved to
-`/v1`; it is kept only as a fallback and carries defects v2 fixed (#106's stuck
-tool calls, most visibly). It is **excluded from
-the cargo workspace** on purpose: the workspace gates and the 85% coverage floor
-run over members, and a wasm-only UI crate would either fail the host-target
-build or sink measured coverage. It has its own `Cargo.lock` and its own CI job.
+are absolute `/v2/...`. It is **excluded from the cargo workspace** on purpose:
+the workspace gates and the 85% coverage floor run over members, and a wasm-only
+UI crate would either fail the host-target build or sink measured coverage. It
+has its own `Cargo.lock` and its own CI job.
 
 Its built bundle is **committed** to `crates/api/dashboard-v2/` and
 `include_bytes!`'d into prosperod, so an ordinary `cargo build` needs no wasm

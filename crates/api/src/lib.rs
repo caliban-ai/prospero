@@ -5,7 +5,6 @@
 //! (replay-then-tail); and a static dashboard. The CLI and the browser both
 //! talk to this one surface.
 
-pub mod dashboard;
 pub mod dashboard_v2;
 pub mod dto;
 pub mod error;
@@ -52,22 +51,17 @@ pub fn router(
         bus,
     };
     Router::new()
-        // Dashboard v2 (Dioxus/WASM, #97) is the default surface (#191). The
-        // scaffold parked it at `/v2` so `/` stayed untouched while epic #95
-        // landed; that transition is done, so `/` serves it now and `/v2`
-        // remains a permanent alias — the bundle's own asset URLs are absolute
-        // `/v2/...`, and existing links and bookmarks point there.
+        // The dashboard (Dioxus/WASM, #97) serves `/`. `/v2` remains a
+        // permanent alias because the bundle's own asset URLs are absolute
+        // `/v2/...`, and existing links and bookmarks point there. The old
+        // vanilla-JS page that once held `/` was deprecated to `/v1` in #191
+        // and deleted in #197; nothing is served under `/v1` any more.
         //
         // The catch-all covers the JS glue, the .wasm, the stylesheet, and
         // wasm-bindgen's hashed `snippets/` tree.
         .route("/", get(dashboard_v2::index))
         .route("/v2", get(dashboard_v2::index))
         .route("/v2/{*path}", get(dashboard_v2::asset))
-        // Dashboard v1, deprecated (#191). Kept reachable — and only reachable
-        // under `/v1` — so an operator who hits a v2 regression has somewhere to
-        // land. Deleting it is a follow-up, once v2 has a release of real use.
-        .route("/v1", get(dashboard::index))
-        .route("/v1/app.js", get(dashboard::app_js))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/api/metrics", get(handlers::get_metrics))
