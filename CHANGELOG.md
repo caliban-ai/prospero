@@ -9,6 +9,18 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- k8s: a pod agent that died at spawn is now resolved once, not re-dialed on
+  every poll. Rejecting a terminal record (#168) removed the reconnect budget
+  that had been incidentally throttling the retry, so the ~2s watch loop
+  re-resolved the same dead agent forever — one warning per poll, indefinitely,
+  for a state that cannot resolve on its own (observed running for 24 days
+  against a single stuck task). The session plane now remembers terminal agent
+  ids, skips them, and logs the cause once per transition. An explicit stop or
+  restart, or the CR going away, clears the mark so a respawn is re-checked.
+  (#170)
+
 ## [0.5.0] - 2026-08-22
 
 Replaces the dashboard. The hand-written vanilla-JS page is superseded by a

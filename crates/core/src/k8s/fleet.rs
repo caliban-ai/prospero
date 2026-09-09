@@ -228,27 +228,80 @@ fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
 /// `spec` is `None` for a pure re-attach (`start_agent_stream`): then an empty
 /// pod is an error (nothing to attach and no spec to create one), surfaced to
 /// the caller so the attach task exits and the poll loop retries.
-async fn ensure_pod_agent(client: &CalibandClient, spec: Option<&SpawnSpec>) -> Result<String> {
-    let agents = client.list().await?;
+///
+/// Failures are classified as [`PodAgentError`]: `Terminal` for the stable
+/// not-attachable record above, `Transient` for everything the next poll could
+/// legitimately see differently. Only the attach path acts on the distinction
+/// (#170) — it stops re-resolving a terminal agent instead of warning about it
+/// once per poll forever.
+async fn ensure_pod_agent(
+    client: &CalibandClient,
+    spec: Option<&SpawnSpec>,
+) -> std::result::Result<String, PodAgentError> {
+    let agents = client.list().await.map_err(PodAgentError::Transient)?;
     if let Some(rec) = agents.iter().find(|rec| !rec.status.is_terminal()) {
         return Ok(rec.id.clone());
     }
     if let Some(rec) = agents.first() {
-        return Err(CoreError::Fleet(format!(
+        return Err(PodAgentError::Terminal(CoreError::Fleet(format!(
             "pod caliband's agent {} is in terminal state {:?}; not attaching \
              (its per-agent endpoint will never bind). The worker died at or \
              after spawn — check the pod's caliband for the cause.",
             rec.id, rec.status,
-        )));
+        ))));
     }
     match spec {
         Some(spec) => {
-            let (id, _endpoint) = client.spawn(spec.clone()).await?;
+            let (id, _endpoint) = client
+                .spawn(spec.clone())
+                .await
+                .map_err(PodAgentError::Transient)?;
             Ok(id)
         }
-        None => Err(CoreError::Fleet(
+        None => Err(PodAgentError::Transient(CoreError::Fleet(
             "pod caliband has no registered agent and no spawn spec to create one".to_string(),
-        )),
+        ))),
+    }
+}
+
+/// Why [`ensure_pod_agent`] could not hand back an attachable agent id.
+///
+/// The distinction is the whole point (#170): a *terminal* record is a stable
+/// state that cannot become attachable without an explicit respawn, so retrying
+/// it can never learn anything new. Everything else — an unreachable pod, a
+/// refused spawn, an empty pod with no spec — is genuinely transient and is
+/// still worth another look on the next poll.
+#[derive(Debug)]
+enum PodAgentError {
+    /// The pod's only agent record is terminal (#168). Do not re-resolve.
+    Terminal(CoreError),
+    /// Transient: retry on a later poll.
+    Transient(CoreError),
+}
+
+impl PodAgentError {
+    /// Whether this failure is the stable, do-not-retry kind.
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminal(_))
+    }
+}
+
+impl std::fmt::Display for PodAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal(e) | Self::Transient(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Callers that only need "it failed" (e.g. `send_input`'s one-shot resolve)
+/// keep using `?` and simply lose the terminal/transient distinction, which
+/// only the poll-driven attach path acts on.
+impl From<PodAgentError> for CoreError {
+    fn from(e: PodAgentError) -> Self {
+        match e {
+            PodAgentError::Terminal(e) | PodAgentError::Transient(e) => e,
+        }
     }
 }
 
@@ -634,6 +687,14 @@ struct SessionPlane {
     ownership: Arc<dyn Ownership>,
     /// Monotonic source for [`AttachTask::generation`].
     generation: Arc<AtomicU64>,
+    /// Agent ids whose pod-side agent was observed in a **terminal** state
+    /// (#170). Terminal is stable: the worker is gone and its per-agent
+    /// endpoint will never bind, so re-resolving it on the ~2s poll cadence
+    /// can only re-learn the same thing and emit the same warning forever.
+    /// Membership makes [`Self::attach`] a silent no-op; [`Self::stop`] and the
+    /// watch loop's `Gone` path clear it, so an explicit restart/respawn — or a
+    /// recreated CR of the same name — re-checks the pod.
+    terminal: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SessionPlane {
@@ -663,6 +724,19 @@ impl SessionPlane {
                 return;
             }
         };
+
+        // #170: a pod agent already observed terminal cannot become attachable
+        // on its own. Skip before dialing, or the poll loop re-resolves a dead
+        // pod every ~2s forever and warns on every cycle. Cleared by `stop` and
+        // by the watch loop's `Gone` path, so a respawn still re-checks.
+        if self
+            .terminal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(agent_id)
+        {
+            return;
+        }
 
         // Fast dedup before the (possibly remote) lease call: already streaming
         // this agent here? Its task holds — and heartbeats — the lease; leave it.
@@ -714,6 +788,7 @@ impl SessionPlane {
         let emitter = self.emitter.clone();
         let attached = Arc::clone(&self.attached);
         let ownership = Arc::clone(&self.ownership);
+        let terminal = Arc::clone(&self.terminal);
 
         let handle = tokio::spawn(async move {
             // #159: resolve caliband's own agent id for this pod, spawning the
@@ -725,6 +800,25 @@ impl SessionPlane {
             // cycle once the pod is reachable.
             let attach_id = match ensure_pod_agent(&client, spec.as_ref()).await {
                 Ok(id) => id,
+                Err(e) if e.is_terminal() => {
+                    // #170: stable state — record it so no later poll re-dials,
+                    // and warn exactly once per terminal transition so the cause
+                    // stays discoverable without a 0.5 Hz log flood.
+                    let first_observation = terminal
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(task_agent_id.clone());
+                    if first_observation {
+                        tracing::warn!(
+                            target: "prospero_k8s_fleet", %repo, agent_id = %task_agent_id, error = %e,
+                            "k8s session-plane: the pod's agent is in a terminal state; \
+                             not attaching, and not re-resolving it until it is restarted"
+                        );
+                    }
+                    cleanup_attach(&attached, &task_agent_id, generation);
+                    ownership.release(&task_agent_id).await;
+                    return;
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "prospero_k8s_fleet", %repo, agent_id = %task_agent_id, error = %e,
@@ -793,10 +887,33 @@ impl SessionPlane {
                 abort.abort();
             }
         }
+        // #170: an explicit stop is the caller saying "forget what you knew" —
+        // drop any terminal mark so a subsequent restart/respawn re-checks the
+        // pod instead of being suppressed by a state we were just told to leave.
+        self.forget_terminal(agent_id);
         // Release the per-agent lease so a peer (or a future re-attach here) can
         // claim it promptly rather than waiting out the TTL. Idempotent /
         // no-op under `SelfOwnsAll`.
         self.ownership.release(agent_id).await;
+    }
+
+    /// Drop `agent_id`'s terminal mark (#170), so the next [`Self::attach`]
+    /// re-resolves the pod. Idempotent.
+    fn forget_terminal(&self, agent_id: &str) {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id);
+    }
+
+    /// Mark `agent_id` terminal without dialing, so a test can assert the
+    /// throttle is scoped to one agent.
+    #[cfg(test)]
+    fn note_terminal_for_test(&self, agent_id: &str) {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(agent_id.to_string());
     }
 
     /// Live attach count — the `metrics()` active gauge.
@@ -1115,6 +1232,14 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     }
                 }
             }
+            // #170: a CR that's gone takes its terminal mark with it, so the
+            // set tracks live agents only and a recreated CR of the same name is
+            // re-checked rather than suppressed by its predecessor's verdict.
+            for change in &changes {
+                if let FleetChange::Gone { id, .. } = change {
+                    session.forget_terminal(id.as_str());
+                }
+            }
             // A send error just means no live subscribers right now; `known`
             // stays canonical for later subscribers.
             for change in changes {
@@ -1153,6 +1278,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
             // clustered via [`Self::with_ownership`].
             ownership: Arc::new(SelfOwnsAll),
             generation: Arc::new(AtomicU64::new(0)),
+            terminal: Arc::new(Mutex::new(HashSet::new())),
         };
         let poll_task = spawn_watch_loop(
             Arc::clone(&api),
@@ -2861,6 +2987,117 @@ mod tests {
         assert!(fake.received_specs().is_empty(), "no re-spawn (#159)");
     }
 
+    /// #170: a terminal pod agent is a *stable* state, not a transient one.
+    ///
+    /// #168 made `ensure_pod_agent` reject a terminal record immediately, which
+    /// was right — but it also removed the thing that had been incidentally
+    /// throttling the retry. Before it, `attach_loop` burned its full reconnect
+    /// budget (~26s) against the dead port before the task exited; after it the
+    /// task exits at once and the ~2s poll loop re-resolves the same dead agent
+    /// forever. Measured on a live cluster: one WARN every ~2s for 24 days, for
+    /// a condition that by definition cannot resolve on its own.
+    ///
+    /// So: dial once to learn the agent is terminal, then never again.
+    #[tokio::test]
+    async fn a_terminal_pod_agent_is_resolved_once_not_on_every_poll() {
+        let token = "terminal-throttle-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+        let id = "dead-agent";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, crate::model::AgentStatus::Failed);
+
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let session = session_with_tls(Some(client_tls), token);
+        let ep = Endpoint::Tcp {
+            addr: tls.addr.clone(),
+        };
+
+        // First poll: the plane must actually dial to learn the agent is dead.
+        session.attach("repo-a", "ct-dead", &ep, None).await;
+        wait_for_lists(&fake, 1).await;
+
+        // Later polls: terminal is terminal. Re-resolving cannot learn anything
+        // new, so the plane must not dial caliband again.
+        for _ in 0..3 {
+            session.attach("repo-a", "ct-dead", &ep, None).await;
+        }
+        settle().await;
+
+        assert_eq!(
+            fake.lists(),
+            1,
+            "a terminal agent must be resolved once, not re-dialed on every poll"
+        );
+    }
+
+    /// #170: the throttle must be scoped to the agent that is actually
+    /// terminal — a different agent on the same plane still resolves normally.
+    #[tokio::test]
+    async fn the_terminal_throttle_does_not_suppress_a_healthy_agent() {
+        let token = "terminal-scope-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+        fake.add_agent_tcp("live-agent", Vec::new()).await;
+        fake.set_status("live-agent", crate::model::AgentStatus::Running);
+
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let session = session_with_tls(Some(client_tls), token);
+        let ep = Endpoint::Tcp {
+            addr: tls.addr.clone(),
+        };
+
+        // Mark an unrelated id terminal, then attach the healthy one.
+        session.note_terminal_for_test("ct-dead");
+        session.attach("repo-a", "ct-live", &ep, None).await;
+        wait_for_lists(&fake, 1).await;
+
+        assert_eq!(
+            fake.lists(),
+            1,
+            "a healthy agent must still be resolved when another id is terminal"
+        );
+    }
+
+    /// #170: stopping an agent clears its terminal mark, so an explicit
+    /// `restart`/`respawn` re-checks the pod instead of being suppressed
+    /// forever by a state the user just asked us to leave behind.
+    #[tokio::test]
+    async fn stopping_a_terminal_agent_clears_its_throttle_so_a_respawn_re_checks() {
+        let token = "terminal-clear-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+        let id = "dead-agent";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, crate::model::AgentStatus::Failed);
+
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let session = session_with_tls(Some(client_tls), token);
+        let ep = Endpoint::Tcp {
+            addr: tls.addr.clone(),
+        };
+
+        session.attach("repo-a", "ct-dead", &ep, None).await;
+        wait_for_lists(&fake, 1).await;
+
+        // An explicit stop is the user saying "forget what you knew about it".
+        session.stop("ct-dead").await;
+        session.attach("repo-a", "ct-dead", &ep, None).await;
+        wait_for_lists(&fake, 2).await;
+
+        assert_eq!(
+            fake.lists(),
+            2,
+            "stop() must clear the terminal mark so the next attach re-checks"
+        );
+    }
+
     /// #163: caliband assigns its own agent id (#159), so it is **not** the CR
     /// name. The overlay must key off the pod it queried, not off a matching id
     /// — otherwise `records.get(&agent.id)` misses and `interactive`/`idle`
@@ -3296,6 +3533,7 @@ mod tests {
             attached: Arc::new(Mutex::new(HashMap::new())),
             ownership: Arc::new(SelfOwnsAll),
             generation: Arc::new(AtomicU64::new(0)),
+            terminal: Arc::new(Mutex::new(HashSet::new())),
         };
         let tasks = [ct];
 
@@ -3584,7 +3822,44 @@ mod tests {
             attached: Arc::new(Mutex::new(HashMap::new())),
             ownership,
             generation: Arc::new(AtomicU64::new(0)),
+            terminal: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// A session plane wired to dial a `FakeCaliband` over TCP+TLS.
+    fn session_with_tls(tls: Option<TlsClient>, token: &str) -> SessionPlane {
+        let (bus, store) = test_seams();
+        SessionPlane {
+            emitter: Emitter::new(bus, store),
+            tls,
+            token: Some(token.to_string()),
+            attached: Arc::new(Mutex::new(HashMap::new())),
+            ownership: Arc::new(SelfOwnsAll),
+            generation: Arc::new(AtomicU64::new(0)),
+            terminal: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Wait until the fake has served at least `want` `list()` calls. Polls
+    /// rather than sleeping a fixed span so the test is not timing-fragile.
+    async fn wait_for_lists(fake: &FakeCaliband, want: u32) {
+        for _ in 0..300 {
+            if fake.lists() >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "caliband never served {want} list call(s); saw {}",
+            fake.lists()
+        );
+    }
+
+    /// Give any spawned attach task room to dial *before* asserting it did not.
+    /// Without this the "no second dial" assertion could pass simply because
+    /// the task had not been scheduled yet.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     /// #108 CORE: two replicas sharing one lease backing both try to attach the
