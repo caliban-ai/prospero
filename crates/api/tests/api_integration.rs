@@ -1251,10 +1251,10 @@ async fn agent_input_and_end_input_and_404() {
 }
 
 // `serves_dashboard_index` and `dashboard_app_js_has_javascript_content_type`
-// lived here and asserted that `/` and `/app.js` served v1. #191 inverted that
-// contract, and both are superseded by `root_serves_the_v2_document_with_its_csp`
-// and `v1_script_moves_under_v1_and_the_page_points_at_it` below, which assert
-// the same things about the paths that now hold them.
+// lived here and asserted that `/` and `/app.js` served the old vanilla-JS
+// page. #191 inverted that contract and #197 deleted that page outright; the
+// root document is covered by `root_serves_the_v2_document_with_its_csp`, and
+// `v1_is_gone_outright_with_no_redirect_or_fallback` pins its absence.
 
 // --- Dashboard v2 (Dioxus/WASM bundle, #97) ---------------------------------
 
@@ -1425,57 +1425,31 @@ async fn v2_remains_reachable_after_the_swap() {
     }
 }
 
-/// v1 is deprecated, not deleted: an operator who hits a v2 regression needs
-/// somewhere to land. It moves off `/` and says what it is.
+/// #197: v1 is deleted outright — not redirected, not kept as a fallback.
+///
+/// It was deprecated at `/v1` in #191 only so an operator hitting a v2
+/// regression had somewhere to land. That grace period is over, and there was
+/// no real user base to strand, so a redirect would only keep a dead surface
+/// alive in bookmarks and access logs. `/v1` must be a plain 404, and
+/// specifically not a 3xx.
 #[tokio::test]
-async fn v1_is_served_at_v1_and_marked_deprecated() {
+async fn v1_is_gone_outright_with_no_redirect_or_fallback() {
     let h = setup().await;
-    let (status, ct, _) = head_of(&h, "/v1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(ct.starts_with("text/html"), "content-type was {ct}");
 
-    let body = body_of(&h, "/v1").await;
-    assert!(
-        body.to_lowercase().contains("deprecated"),
-        "the v1 page must say it is deprecated"
-    );
-    // And point home, or the notice is a dead end.
-    assert!(
-        body.contains("href=\"/\""),
-        "the deprecation notice must link to the current dashboard"
-    );
-}
+    for uri in ["/v1", "/v1/app.js"] {
+        let (status, _, _) = head_of(&h, uri).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri} must be gone outright, not served and not redirected"
+        );
+        assert!(
+            !status.is_redirection(),
+            "{uri} must not redirect — v1 leaves no forwarding address"
+        );
+    }
 
-/// v1's script moves with it. Left at `/app.js` it would be an orphan on a
-/// path the current dashboard doesn't use.
-#[tokio::test]
-async fn v1_script_moves_under_v1_and_the_page_points_at_it() {
-    let h = setup().await;
-    let (status, ct, _) = head_of(&h, "/v1/app.js").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(ct.contains("javascript"), "content-type was {ct}");
-
-    assert!(
-        body_of(&h, "/v1").await.contains("/v1/app.js"),
-        "the v1 page must load its script from the new path"
-    );
-
-    // The old path is gone — v2 owns the root namespace now.
+    // The pre-#191 root paths it used to own stay gone too.
     let (status, _, _) = head_of(&h, "/app.js").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-/// v2 is served alongside v1 during the transition; `/` must be untouched.
-#[tokio::test]
-async fn v1_dashboard_still_works_from_its_new_home() {
-    let h = setup().await;
-    // Was `v1_dashboard_is_unaffected_by_v2`, asserting `/` + `/app.js`. #191
-    // moved v1 off the root; it must still be *whole* at its new prefix, which
-    // is the point of deprecating rather than deleting it.
-    let (status, ct, _) = head_of(&h, "/v1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(ct.starts_with("text/html"), "content-type was {ct}");
-    let (status, ct, _) = head_of(&h, "/v1/app.js").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(ct.contains("javascript"), "content-type was {ct}");
 }
