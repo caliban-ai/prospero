@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build Dashboard v2 (Dioxus → WASM, #97) and write the embeddable bundle to
-# crates/api/dashboard-v2/.
+# Build the dashboard (Dioxus → WASM, #97) and write the embeddable bundle to
+# crates/api/dashboard/.
 #
 # This is the single entrypoint used by both humans and CI (.github/workflows/
 # ci.yml), so the local and CI code paths are identical — same shape as
 # scripts/coverage.sh.
 #
-# Why the output is committed: crates/api/src/dashboard_v2.rs `include_bytes!`s
+# Why the output is committed: crates/api/src/dashboard.rs `include_bytes!`s
 # this bundle into prosperod, which keeps the "one binary ships the UI" property
 # and means an ordinary `cargo build` needs no wasm toolchain. The cost is a
 # build artifact in git, so CI reruns this script and diffs the tree — a stale
@@ -32,7 +32,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CRATE_DIR="crates/dashboard"
-OUT_DIR="crates/api/dashboard-v2"
+OUT_DIR="crates/api/dashboard"
 TARGET="wasm32-unknown-unknown"
 OUT_NAME="prospero-dashboard"
 STAMP="$OUT_DIR/SOURCE_HASH"

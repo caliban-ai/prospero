@@ -15,10 +15,17 @@ the patch version for fixes.
   `/` before v0.5.0, deprecated to `/v1` in #191, is deleted along with its
   embedded assets and routes. `/v1` and `/v1/app.js` now 404 — deliberately no
   redirect and no fallback, so a dead surface does not linger in bookmarks and
-  access logs. The Dioxus/WASM dashboard at `/` is the UI; `/v2` remains a
-  permanent alias because the bundle's asset URLs are absolute. Removing it also
-  drops ~200KB of embedded assets from every binary and the known defects v2 was
-  built to fix, most visibly #106's permanently-"running" tool calls. (#197)
+  access logs. Removing it also drops ~200KB of embedded assets from every
+  binary and the known defects v2 was built to fix, most visibly #106's
+  permanently-"running" tool calls. (#197)
+
+- **Breaking:** the `/v2` alias, and the version suffix generally. With only one
+  dashboard left there is nothing to disambiguate, so the document is served at
+  `/` and its files move from `/v2/...` to `/assets/...`. A prefix rather than
+  the bare root, so the bundle cannot shadow the API namespace. `GET /v2` now
+  404s. Internally the same rename: `crates/api/dashboard-v2/` is
+  `crates/api/dashboard/`, the handler module is `dashboard`, and the CI job is
+  "dashboard wasm build".
 
 ### Added
 

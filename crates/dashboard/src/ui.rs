@@ -118,7 +118,7 @@ pub fn Shell(host: String, freshness: Freshness, children: Element) -> Element {
             nav { class: "nav", aria_label: "Sections",
                 span { class: "nav-heading", "Fleet" }
                 button { class: "nav-item", aria_current: "page", "Overview" }
-                span { class: "nav-foot", "v2 · wasm" }
+                span { class: "nav-foot", "wasm" }
             }
             main { class: "main", {children} }
         }

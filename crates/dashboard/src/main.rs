@@ -1,4 +1,4 @@
-//! Prospero Dashboard v2 — a Dioxus/WASM single-page app (#97, epic #95).
+//! Prospero Dashboard — a Dioxus/WASM single-page app (#97, epic #95).
 //!
 //! Renders live fleet data fetched from `/api/fleet` and deserialised into
 //! [`prospero_types::FleetSnapshot`] — the exact serde type `prospero-api`

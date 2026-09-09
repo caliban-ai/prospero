@@ -54,7 +54,7 @@ Start the daemon (serves the API + dashboard on `127.0.0.1:7878` by default):
 
 ```bash
 cargo run --bin prosperod
-# dashboard:  http://127.0.0.1:7878      (Dioxus/WASM; also at /v2)
+# dashboard:  http://127.0.0.1:7878      (Dioxus/WASM)
 ```
 
 Drive it with the CLI:
@@ -92,14 +92,13 @@ tested with no real caliban and no LLM calls.
 
 ### Dashboard (Dioxus/WASM)
 
-`crates/dashboard` is a Rust → WASM SPA and **the dashboard**: it serves `/`,
-and `/v2` stays mounted as a permanent alias because the bundle's own asset URLs
-are absolute `/v2/...`. It is **excluded from the cargo workspace** on purpose:
-the workspace gates and the 85% coverage floor run over members, and a wasm-only
-UI crate would either fail the host-target build or sink measured coverage. It
-has its own `Cargo.lock` and its own CI job.
+`crates/dashboard` is a Rust → WASM SPA and **the dashboard**: the document is
+served at `/` and its files under `/assets/`. It is **excluded from the cargo
+workspace** on purpose: the workspace gates and the 85% coverage floor run over
+members, and a wasm-only UI crate would either fail the host-target build or
+sink measured coverage. It has its own `Cargo.lock` and its own CI job.
 
-Its built bundle is **committed** to `crates/api/dashboard-v2/` and
+Its built bundle is **committed** to `crates/api/dashboard/` and
 `include_bytes!`'d into prosperod, so an ordinary `cargo build` needs no wasm
 toolchain and one binary still ships the UI. Rebuild it after changing anything
 under `crates/dashboard/`:

@@ -1250,13 +1250,11 @@ async fn agent_input_and_end_input_and_404() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
-// `serves_dashboard_index` and `dashboard_app_js_has_javascript_content_type`
-// lived here and asserted that `/` and `/app.js` served the old vanilla-JS
-// page. #191 inverted that contract and #197 deleted that page outright; the
-// root document is covered by `root_serves_the_v2_document_with_its_csp`, and
-// `v1_is_gone_outright_with_no_redirect_or_fallback` pins its absence.
-
-// --- Dashboard v2 (Dioxus/WASM bundle, #97) ---------------------------------
+// --- Dashboard (Dioxus/WASM bundle, #97) ------------------------------------
+//
+// The document is served at `/`, its files under `/assets/`. Earlier revisions
+// also mounted it at `/v2` while a hand-written vanilla-JS page held `/`; that
+// page was removed in #197 and the version-suffixed paths went with it.
 
 /// Fetch `uri` through the real router and return (status, content-type, csp).
 async fn head_of(h: &Harness, uri: &str) -> (StatusCode, String, String) {
@@ -1280,10 +1278,12 @@ async fn head_of(h: &Harness, uri: &str) -> (StatusCode, String, String) {
     )
 }
 
+/// The dashboard document is what `/` serves, under a CSP tight enough that a
+/// self-contained bundle is the only thing that could run.
 #[tokio::test]
-async fn v2_index_serves_html_with_locked_down_csp() {
+async fn root_serves_the_dashboard_document_with_its_csp() {
     let h = setup().await;
-    let (status, ct, csp) = head_of(&h, "/v2").await;
+    let (status, ct, csp) = head_of(&h, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.starts_with("text/html"), "content-type was {ct}");
     // The bundle is fully self-contained, so everything is denied by default;
@@ -1291,25 +1291,32 @@ async fn v2_index_serves_html_with_locked_down_csp() {
     assert!(csp.contains("default-src 'none'"), "csp was: {csp}");
     assert!(csp.contains("'wasm-unsafe-eval'"), "csp was: {csp}");
     assert!(csp.contains("connect-src 'self'"), "csp was: {csp}");
+
+    // It really is the wasm app, and it boots from the asset prefix.
+    let root = body_of(&h, "/").await;
+    assert!(
+        root.contains("/assets/boot.js"),
+        "root must boot the wasm bundle from /assets/"
+    );
 }
 
 #[tokio::test]
-async fn v2_serves_wasm_with_the_correct_mime() {
+async fn dashboard_serves_wasm_with_the_correct_mime() {
     let h = setup().await;
     // WebAssembly.instantiateStreaming rejects anything but application/wasm.
-    let (status, ct, _) = head_of(&h, "/v2/prospero-dashboard_bg.wasm").await;
+    let (status, ct, _) = head_of(&h, "/assets/prospero-dashboard_bg.wasm").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ct, "application/wasm");
 }
 
 #[tokio::test]
-async fn v2_serves_js_glue_and_stylesheet() {
+async fn dashboard_serves_js_glue_and_stylesheet() {
     let h = setup().await;
-    let (status, ct, _) = head_of(&h, "/v2/prospero-dashboard.js").await;
+    let (status, ct, _) = head_of(&h, "/assets/prospero-dashboard.js").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.contains("javascript"), "content-type was {ct}");
 
-    let (status, ct, _) = head_of(&h, "/v2/app.css").await;
+    let (status, ct, _) = head_of(&h, "/assets/app.css").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.starts_with("text/css"), "content-type was {ct}");
 }
@@ -1320,14 +1327,14 @@ async fn v2_serves_js_glue_and_stylesheet() {
 /// asset table rather than a hardcoded file list — if these 404 the app never
 /// boots.
 #[tokio::test]
-async fn v2_serves_the_wasm_bindgen_snippets() {
+async fn dashboard_serves_the_wasm_bindgen_snippets() {
     let h = setup().await;
     let glue = h
         .router
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/v2/prospero-dashboard.js")
+                .uri("/assets/prospero-dashboard.js")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1346,7 +1353,7 @@ async fn v2_serves_the_wasm_bindgen_snippets() {
         let Some(end) = rest.find(['\'', '"']) else {
             continue;
         };
-        let (status, ct, _) = head_of(&h, &format!("/v2/{}", &rest[..end])).await;
+        let (status, ct, _) = head_of(&h, &format!("/assets/{}", &rest[..end])).await;
         assert_eq!(status, StatusCode::OK, "missing snippet {}", &rest[..end]);
         assert!(ct.contains("javascript"), "snippet content-type was {ct}");
         checked += 1;
@@ -1358,16 +1365,14 @@ async fn v2_serves_the_wasm_bindgen_snippets() {
 }
 
 #[tokio::test]
-async fn v2_unknown_asset_is_404_not_a_panic() {
+async fn dashboard_unknown_asset_is_404_not_a_panic() {
     let h = setup().await;
-    let (status, _, _) = head_of(&h, "/v2/does-not-exist.js").await;
+    let (status, _, _) = head_of(&h, "/assets/does-not-exist.js").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     // Path traversal cannot escape a static table, but prove it 404s.
-    let (status, _, _) = head_of(&h, "/v2/../Cargo.toml").await;
+    let (status, _, _) = head_of(&h, "/assets/../Cargo.toml").await;
     assert_ne!(status, StatusCode::OK);
 }
-
-// --- v2 is the default surface; v1 is deprecated (#191) ---------------------
 
 /// Fetch `uri` and return its body as a string.
 async fn body_of(h: &Harness, uri: &str) -> String {
@@ -1379,77 +1384,4 @@ async fn body_of(h: &Harness, uri: &str) -> String {
         .unwrap();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
-}
-
-/// #191: the transition is over — `/` is v2. The scaffold (#97) deliberately
-/// parked v2 at `/v2` so `/` stayed untouched while the feature set landed;
-/// leaving it that way would mean the surface an operator lands on is the one
-/// no longer being developed.
-#[tokio::test]
-async fn root_serves_the_v2_document_with_its_csp() {
-    let h = setup().await;
-    let (status, ct, csp) = head_of(&h, "/").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(ct.starts_with("text/html"), "content-type was {ct}");
-    assert!(csp.contains("default-src 'none'"), "csp was: {csp}");
-    assert!(csp.contains("'wasm-unsafe-eval'"), "csp was: {csp}");
-
-    // Byte-identical to /v2 — one document, two paths, no second copy to skew.
-    assert_eq!(body_of(&h, "/").await, body_of(&h, "/v2").await);
-    // It really is the wasm app, not v1's hand-written page. The bundle's index
-    // pulls its stylesheet and module entrypoint from absolute `/v2/...` URLs,
-    // which is exactly why `/v2` has to stay mounted after the swap.
-    let root = body_of(&h, "/").await;
-    assert!(
-        root.contains("/v2/boot.js"),
-        "root should boot the v2 bundle"
-    );
-    assert!(!root.contains("/v1/app.js"), "root must not be the v1 page");
-}
-
-/// `/v2` stays a permanent alias. The bundle's own asset URLs are absolute
-/// `/v2/...`, and READMEs, notes, and bookmarks point there — breaking them
-/// buys nothing.
-#[tokio::test]
-async fn v2_remains_reachable_after_the_swap() {
-    let h = setup().await;
-    let (status, ct, csp) = head_of(&h, "/v2").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(ct.starts_with("text/html"));
-    assert!(csp.contains("default-src 'none'"));
-
-    // The assets it references must still resolve from their absolute paths.
-    for asset in ["/v2/app.css", "/v2/prospero-dashboard_bg.wasm"] {
-        let (status, _, _) = head_of(&h, asset).await;
-        assert_eq!(status, StatusCode::OK, "{asset} must survive the swap");
-    }
-}
-
-/// #197: v1 is deleted outright — not redirected, not kept as a fallback.
-///
-/// It was deprecated at `/v1` in #191 only so an operator hitting a v2
-/// regression had somewhere to land. That grace period is over, and there was
-/// no real user base to strand, so a redirect would only keep a dead surface
-/// alive in bookmarks and access logs. `/v1` must be a plain 404, and
-/// specifically not a 3xx.
-#[tokio::test]
-async fn v1_is_gone_outright_with_no_redirect_or_fallback() {
-    let h = setup().await;
-
-    for uri in ["/v1", "/v1/app.js"] {
-        let (status, _, _) = head_of(&h, uri).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "{uri} must be gone outright, not served and not redirected"
-        );
-        assert!(
-            !status.is_redirection(),
-            "{uri} must not redirect — v1 leaves no forwarding address"
-        );
-    }
-
-    // The pre-#191 root paths it used to own stay gone too.
-    let (status, _, _) = head_of(&h, "/app.js").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 }

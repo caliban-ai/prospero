@@ -1,6 +1,6 @@
 //! The operator's theme preference.
 //!
-//! v2 ships a designed light theme and a designed dark one, but until now which
+//! The dashboard ships a designed light theme and a designed dark one, but until now which
 //! you got was decided entirely by the OS. This makes it a choice: follow the
 //! system, or pin one.
 //!

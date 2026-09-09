@@ -25,6 +25,6 @@ try {
   // No storage available — fall back to following the system.
 }
 
-import init from "/v2/prospero-dashboard.js";
+import init from "/assets/prospero-dashboard.js";
 
 init();
