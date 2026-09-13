@@ -368,6 +368,22 @@ pub fn phase_to_status(phase: &str) -> AgentStatus {
 /// - `started_at` comes from `metadata.creationTimestamp` (RFC-3339 via
 ///   `Display`), or `""` if unset (a CR that hasn't round-tripped through
 ///   the apiserver yet, e.g. straight out of `MemTaskApi` in tests).
+// Names whose CR uid changed since the last poll. A delete+recreate reuses the
+// name but gets a fresh uid (#213), and the recreated CR must not inherit its
+// predecessor's terminal verdict, so the poll loop clears the mark for these.
+// Only names in both maps with differing uids qualify; a new or departed name is
+// already handled by the `Discovered`/`Gone` diff.
+fn recreated_names(
+    last_uids: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|(name, uid)| last_uids.get(*name).is_some_and(|prev| prev != *uid))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 #[must_use]
 pub fn agent_from_task(task: &CalibanTask) -> Agent {
     let name = task.metadata.name.clone().unwrap_or_default();
@@ -1012,6 +1028,12 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
         // which is exactly when a restart would otherwise duplicate one that
         // pre-dates the process. At most one replay per agent per process.
         let mut terminal_recorded: HashSet<String> = HashSet::new();
+        // #213: last-seen CR uid per name. A delete+recreate reuses the name but
+        // gets a fresh uid, so a uid change marks a new incarnation whose
+        // predecessor's terminal verdict must not suppress it — a fast recreate
+        // produces no `Gone` to clear the mark. Local to this task; gone names
+        // drop when `last_uids` is replaced each poll.
+        let mut last_uids: HashMap<String, String> = HashMap::new();
         loop {
             let tasks = match api.list().await {
                 Ok(tasks) => tasks,
@@ -1030,6 +1052,19 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
             // the diff lock, `handle_from` is pure), then attach after releasing
             // the lock. `session.attach` itself is gated by the #108 ownership
             // lease, so exactly one replica actually attaches each.
+            // #213: detect same-name recreates by uid change before the diff, so
+            // a healthy re-spawn isn't left suppressed by its predecessor's
+            // terminal mark. `forget_terminal` for these runs after the lock.
+            let current_uids: HashMap<String, String> = tasks
+                .iter()
+                .filter_map(|t| {
+                    let name = t.metadata.name.clone()?;
+                    Some((name, t.metadata.uid.clone().unwrap_or_default()))
+                })
+                .collect();
+            let recreated = recreated_names(&last_uids, &current_uids);
+            last_uids = current_uids;
+
             let mut to_attach: Vec<(String, String, Endpoint, SpawnSpec)> = Vec::new();
 
             // #194: diff against the SAME status `snapshot()` displays, not the
@@ -1239,6 +1274,13 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                 if let FleetChange::Gone { id, .. } = change {
                     session.forget_terminal(id.as_str());
                 }
+            }
+            // #213: a fast delete+recreate under the same name produces no `Gone`
+            // (the name never leaves a poll snapshot), so also clear the terminal
+            // mark for any CR whose uid changed this poll — the healthy new
+            // incarnation must not inherit its predecessor's verdict.
+            for name in &recreated {
+                session.forget_terminal(name);
             }
             // A send error just means no live subscribers right now; `known`
             // stays canonical for later subscribers.
@@ -2282,6 +2324,32 @@ mod tests {
                 .expect("no status is Ok")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn recreated_names_flags_only_same_name_uid_changes() {
+        let last: HashMap<String, String> = [
+            ("a".to_string(), "uid-1".to_string()),
+            ("b".to_string(), "uid-b".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let current: HashMap<String, String> = [
+            ("a".to_string(), "uid-2".to_string()), // recreated: same name, new uid
+            ("b".to_string(), "uid-b".to_string()), // unchanged
+            ("c".to_string(), "uid-c".to_string()), // brand new (Discovered handles it)
+        ]
+        .into_iter()
+        .collect();
+
+        let mut got = recreated_names(&last, &current);
+        got.sort();
+        assert_eq!(got, vec!["a".to_string()]);
+
+        // No prior uids → nothing is a "recreate" (all are first-sightings).
+        assert!(recreated_names(&HashMap::new(), &current).is_empty());
+        // Identical snapshots → nothing changed.
+        assert!(recreated_names(&current, &current).is_empty());
     }
 
     #[test]
