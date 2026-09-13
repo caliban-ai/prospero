@@ -9,6 +9,30 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-13
+
+Follows caliban's removal of its bespoke `ollama` provider (caliban ADR 0056).
+prospero fills the caliban worker's `SpawnSpec.provider` from a repo's stored
+config, so a repo pinned to `ollama` now spawns a worker that fails at startup —
+this release migrates prospero off Ollama and onto the OpenAI-compatible path.
+
+### Changed
+
+- **Ollama removed; local inference via `openai` + `base_url`** (#207): the
+  dropdown, defaults, fixtures, and the dedicated `ollama` env-projection arm are
+  gone. `validate_provider_env` now treats a provider with an overridden
+  `base_url` as **keyless** — mirroring caliban's keyless local-endpoint change —
+  so a migrated local config (`openai` + `base_url`, no key) keeps the keyless UX
+  that `ollama` had, instead of being rejected for a missing `OPENAI_API_KEY`. (#208)
+- Reworded the remaining rationale comments off the removed provider's name; the
+  history lives in caliban ADR 0056 (#209). (#210)
+
+```admonish warning
+A repo or workspace still configured with `provider: "ollama"` will spawn a
+caliban worker that fails loudly at startup. Migrate it to `openai` with a
+`base_url` pointing at a local `/v1` endpoint.
+```
+
 ## [0.6.0] - 2026-09-09
 
 Finishes what v0.5.0 started. That release made the Rust → WASM dashboard the
@@ -548,7 +572,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/caliban-ai/prospero/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/caliban-ai/prospero/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/caliban-ai/prospero/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/prospero/compare/v0.3.3...v0.4.0
