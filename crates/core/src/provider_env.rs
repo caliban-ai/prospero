@@ -84,8 +84,8 @@ pub fn resolve_env(
 /// self-hosted / proxied endpoint (a local `openai`-compatible server such as
 /// llama.cpp, mlx-lm, or llama-swap) supplies its own auth or none. This mirrors
 /// caliban#641, which makes the OpenAI adapter keyless for local `base_url`
-/// endpoints, and preserves the keyless local-inference path that the removed
-/// `ollama` provider used to offer.
+/// endpoints, and preserves the keyless local-inference path the removed
+/// bespoke local provider used to offer (caliban ADR 0056).
 pub fn validate_provider_env(
     cfg: &RepoProviderConfig,
     resolved: &BTreeMap<String, String>,
@@ -287,7 +287,7 @@ mod tests {
     fn validate_accepts_keyed_provider_when_base_url_is_set() {
         // A local openai-compatible endpoint is keyless (mirrors caliban#641):
         // a keyed provider with an overridden base_url validates without a key —
-        // this is the keyless local-inference path that replaced ollama.
+        // the keyless local-inference path (caliban ADR 0056).
         let mut c = cfg();
         c.provider = Some("openai".into());
         c.base_url = Some("http://192.168.1.240:9292/v1".into());

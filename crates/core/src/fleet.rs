@@ -2000,7 +2000,7 @@ mod tests {
             RepoProviderConfig {
                 provider: Some("openai".into()),
                 // A local openai-compatible endpoint: keyless (base_url set), the
-                // migration target for the removed ollama provider.
+                // local-inference migration target (caliban ADR 0056).
                 base_url: Some("http://h:9292/v1".into()),
                 ..Default::default()
             },
