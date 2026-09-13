@@ -1,6 +1,6 @@
 # ADR 0010 · Inbound API authentication with scoped, declarative tokens
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-09-13
 - **Source:** [`docs/superpowers/specs/2026-09-13-api-auth-design.md`](../superpowers/specs/2026-09-13-api-auth-design.md)
 
