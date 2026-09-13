@@ -14,6 +14,12 @@ pub enum ApiError {
     /// The operation exists but the active fleet backend does not support it
     /// (e.g. workspace-registry ops under k8s) → 405. (#76)
     MethodNotAllowed(String),
+    /// Missing, malformed, unknown, expired or revoked credential → 401.
+    Unauthorized,
+    /// Authenticated but not permitted → 403.
+    Forbidden(String),
+    /// Resource absent (e.g. `POST /api/session` with auth disabled) → 404.
+    NotFound(String),
 }
 
 impl ApiError {
@@ -44,10 +50,18 @@ impl From<CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let www_authenticate = matches!(self, ApiError::Unauthorized);
         let (status, kind, error) = match self {
             ApiError::MethodNotAllowed(msg) => {
                 (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", msg)
             }
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "unauthorized".to_string(),
+            ),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg),
             ApiError::Core(e) => {
                 let (status, kind) = match &e {
                     CoreError::AgentNotFound(_) | CoreError::WorkspaceNotFound(_) => {
@@ -72,6 +86,13 @@ impl IntoResponse for ApiError {
             }
         };
         let body = ErrorBody { error, kind };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if www_authenticate {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer realm=\"prospero\""),
+            );
+        }
+        response
     }
 }
