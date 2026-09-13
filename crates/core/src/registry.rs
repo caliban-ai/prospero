@@ -221,8 +221,8 @@ mod tests {
         let mut reg = Registry::default();
         reg.add("p", "/r").unwrap();
         let cfg = RepoProviderConfig {
-            provider: Some("ollama".into()),
-            base_url: Some("http://host:11434".into()),
+            provider: Some("openai".into()),
+            base_url: Some("http://host:9292/v1".into()),
             ..Default::default()
         };
         assert!(reg.set_config("p", cfg.clone()));

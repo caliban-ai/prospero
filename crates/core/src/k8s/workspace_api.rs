@@ -327,8 +327,8 @@ mod tests {
                 },
                 ProviderSpec {
                     name: "workers".to_string(),
-                    kind: "ollama".to_string(),
-                    base_url: Some("http://192.168.1.240:11434".to_string()),
+                    kind: "openai".to_string(),
+                    base_url: Some("http://192.168.1.240:9292/v1".to_string()),
                     model: Some("qwen2.5-coder".to_string()),
                     credentials_ref: None,
                 },
@@ -495,7 +495,7 @@ mod tests {
         // Credentials reduced to a bool; the Secret ref is not surfaced.
         assert!(wi.providers[0].has_credentials);
         assert!(!wi.providers[1].has_credentials);
-        assert_eq!(wi.providers[1].kind, "ollama");
+        assert_eq!(wi.providers[1].kind, "openai");
         // Reconciliation status flows through for the dashboard pill/tooltip.
         let status = wi.status.as_ref().unwrap();
         assert_eq!(status.phase, "Failed");

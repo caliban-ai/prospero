@@ -59,16 +59,16 @@ pub struct WorkspaceSourceSpec {
 pub struct ProviderSpec {
     /// Provider identifier, unique within the workspace (e.g. `planner`).
     pub name: String,
-    /// Provider kind (e.g. `ollama`, `anthropic`, `openai`).
+    /// Provider kind (e.g. `anthropic`, `openai`, `google`).
     pub kind: String,
-    /// Override base URL (e.g. `http://192.168.1.240:11434`).
+    /// Override base URL (e.g. `http://192.168.1.240:9292/v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Default model for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Reference to an existing Secret holding this provider's API key. Keyless
-    /// providers (e.g. ollama) omit it. Prospero only *names* the Secret — it
+    /// providers (e.g. a local `openai` endpoint) omit it. Prospero only *names* the Secret — it
     /// never reads it (the operator validates existence).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_ref: Option<CredentialsRef>,
@@ -134,7 +134,7 @@ pub struct WorkspaceConfig {
 pub struct ProviderInfo {
     /// Provider name (what an agent binds by `providerRef`).
     pub name: String,
-    /// Provider kind (e.g. `ollama`, `anthropic`).
+    /// Provider kind (e.g. `openai`, `anthropic`).
     pub kind: String,
     /// Override base URL, if set.
     ///
@@ -148,7 +148,7 @@ pub struct ProviderInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Whether the provider references a credential Secret (keyless providers
-    /// like ollama are `false`). The Secret name/key is intentionally not
+    /// like a local `openai` endpoint are `false`). The Secret name/key is intentionally not
     /// surfaced on the read side.
     pub has_credentials: bool,
 }

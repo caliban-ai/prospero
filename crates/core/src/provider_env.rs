@@ -11,7 +11,6 @@ use crate::registry::RepoProviderConfig;
 /// provider-only backends (bedrock/vertex use ambient cloud credentials).
 fn provider_vars(provider: &str) -> (Option<&'static str>, Option<&'static str>) {
     match provider {
-        "ollama" => (Some("OLLAMA_BASE_URL"), None),
         "anthropic" => (Some("ANTHROPIC_BASE_URL"), Some("ANTHROPIC_API_KEY")),
         "openai" => (Some("OPENAI_BASE_URL"), Some("OPENAI_API_KEY")),
         "google" => (Some("GEMINI_BASE_URL"), Some("GEMINI_API_KEY")),
@@ -79,7 +78,14 @@ pub fn resolve_env(
 /// (rather than the raw config) means a key supplied through any layer —
 /// curated `api_key_from_env`, raw `cfg.env`, or the global `default_env` —
 /// counts, so there are no false positives. Providers without a key var
-/// (ollama, bedrock, vertex) and an unset provider always pass.
+/// (bedrock, vertex) and an unset provider always pass.
+///
+/// A provider with an overridden `base_url` also passes without a key: a
+/// self-hosted / proxied endpoint (a local `openai`-compatible server such as
+/// llama.cpp, mlx-lm, or llama-swap) supplies its own auth or none. This mirrors
+/// caliban#641, which makes the OpenAI adapter keyless for local `base_url`
+/// endpoints, and preserves the keyless local-inference path that the removed
+/// `ollama` provider used to offer.
 pub fn validate_provider_env(
     cfg: &RepoProviderConfig,
     resolved: &BTreeMap<String, String>,
@@ -91,6 +97,9 @@ pub fn validate_provider_env(
     let Some(key_var) = key_var else {
         return Ok(());
     };
+    if cfg.base_url.is_some() {
+        return Ok(());
+    }
     if resolved.get(key_var).is_some_and(|v| !v.is_empty()) {
         return Ok(());
     }
@@ -113,7 +122,7 @@ pub fn validate_provider_env(
 /// actionable message instead.
 ///
 /// Today this catches an `api_key_from_env` on a provider that has no api-key
-/// env var (ollama, bedrock, vertex, unknown): [`resolve_env`] only `warn!`s
+/// env var (bedrock, vertex, unknown): [`resolve_env`] only `warn!`s
 /// `"api_key_from_env set but provider has no api-key env var; ignored"` and
 /// proceeds, so the setting looks accepted but never takes effect. Surfacing it
 /// here lets the config-set path return a `400` (#120).
@@ -148,11 +157,11 @@ mod tests {
     #[test]
     fn provider_and_base_url_map_to_env_vars() {
         let mut c = cfg();
-        c.provider = Some("ollama".into());
-        c.base_url = Some("http://h:11434".into());
+        c.provider = Some("openai".into());
+        c.base_url = Some("http://h:9292/v1".into());
         let out = resolve_env(&BTreeMap::new(), &c, &no_env);
-        assert_eq!(out.get("CALIBAN_PROVIDER").unwrap(), "ollama");
-        assert_eq!(out.get("OLLAMA_BASE_URL").unwrap(), "http://h:11434");
+        assert_eq!(out.get("CALIBAN_PROVIDER").unwrap(), "openai");
+        assert_eq!(out.get("OPENAI_BASE_URL").unwrap(), "http://h:9292/v1");
     }
 
     #[test]
@@ -180,7 +189,7 @@ mod tests {
         default_env.insert("CALIBAN_PROVIDER".into(), "openai".into());
         default_env.insert("KEEP".into(), "from-global".into());
         let mut c = cfg();
-        c.provider = Some("ollama".into());
+        c.provider = Some("openai".into());
         c.env.insert("CALIBAN_PROVIDER".into(), "raw-wins".into());
         let out = resolve_env(&default_env, &c, &no_env);
         assert_eq!(out.get("CALIBAN_PROVIDER").unwrap(), "raw-wins");
@@ -269,7 +278,19 @@ mod tests {
     #[test]
     fn validate_accepts_keyless_provider() {
         let mut c = cfg();
-        c.provider = Some("ollama".into());
+        c.provider = Some("vertex".into());
+        let resolved = resolve_env(&BTreeMap::new(), &c, &no_env);
+        assert!(validate_provider_env(&c, &resolved).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_keyed_provider_when_base_url_is_set() {
+        // A local openai-compatible endpoint is keyless (mirrors caliban#641):
+        // a keyed provider with an overridden base_url validates without a key —
+        // this is the keyless local-inference path that replaced ollama.
+        let mut c = cfg();
+        c.provider = Some("openai".into());
+        c.base_url = Some("http://192.168.1.240:9292/v1".into());
         let resolved = resolve_env(&BTreeMap::new(), &c, &no_env);
         assert!(validate_provider_env(&c, &resolved).is_ok());
     }
@@ -291,10 +312,10 @@ mod tests {
     #[test]
     fn validate_config_rejects_api_key_on_keyless_provider() {
         let mut c = cfg();
-        c.provider = Some("ollama".into());
+        c.provider = Some("vertex".into());
         c.api_key_from_env = Some("SOME_VAR".into());
         let err = validate_provider_config(&c).unwrap_err();
-        assert!(err.contains("ollama"), "message names provider: {err}");
+        assert!(err.contains("vertex"), "message names provider: {err}");
         assert!(
             err.contains("api_key_from_env"),
             "message names the offending field: {err}"
@@ -320,7 +341,7 @@ mod tests {
     #[test]
     fn validate_config_accepts_keyless_provider_without_api_key() {
         let mut c = cfg();
-        c.provider = Some("ollama".into());
+        c.provider = Some("vertex".into());
         assert!(validate_provider_config(&c).is_ok());
     }
 

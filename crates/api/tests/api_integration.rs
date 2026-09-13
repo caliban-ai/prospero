@@ -284,7 +284,7 @@ async fn k8s_config_plane_creates_and_surfaces_workspace() {
         "sources":[{"name":"caliban","repo":"git@x:caliban","path":"/work/caliban"}],
         "providers":[
             {"name":"planner","kind":"anthropic","model":"claude-opus-4-8","credentials_ref":{"secret_name":"anthropic-key","key":"api-key"}},
-            {"name":"workers","kind":"ollama","base_url":"http://h:11434"}
+            {"name":"workers","kind":"openai","base_url":"http://h:9292/v1"}
         ],
         "default_provider":"planner"}}"#;
     let post = app
@@ -879,7 +879,7 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
                 .uri("/api/workspaces")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"name":"p","root":"/tmp/p","config":{"provider":"ollama","base_url":"http://h:11434"}}"#,
+                    r#"{"name":"p","root":"/tmp/p","config":{"provider":"openai","base_url":"http://h:9292/v1"}}"#,
                 ))
                 .unwrap(),
         )
@@ -922,8 +922,8 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
         .iter()
         .find(|r| r["name"] == "p")
         .expect("repo 'p' not found");
-    assert_eq!(p["config"]["provider"], "ollama");
-    assert_eq!(p["config"]["base_url"], "http://h:11434");
+    assert_eq!(p["config"]["provider"], "openai");
+    assert_eq!(p["config"]["base_url"], "http://h:9292/v1");
 
     // The fleet snapshot must surface the same config (#48).
     let fleet_resp = app
@@ -944,8 +944,8 @@ async fn add_repo_with_config_persists_and_get_repos_returns_it() {
         .iter()
         .find(|r| r["name"] == "p")
         .expect("repo 'p' not in fleet snapshot");
-    assert_eq!(fp["config"]["provider"], "ollama");
-    assert_eq!(fp["config"]["base_url"], "http://h:11434");
+    assert_eq!(fp["config"]["provider"], "openai");
+    assert_eq!(fp["config"]["base_url"], "http://h:9292/v1");
 }
 
 #[tokio::test]
@@ -963,7 +963,7 @@ async fn put_config_updates_and_returns_204() {
                 .uri("/api/workspaces/repo/config")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"provider":"ollama","base_url":"http://h:11434"}"#,
+                    r#"{"provider":"openai","base_url":"http://h:9292/v1"}"#,
                 ))
                 .unwrap(),
         )
@@ -989,8 +989,8 @@ async fn put_config_updates_and_returns_204() {
         .iter()
         .find(|r| r["name"] == "repo")
         .expect("repo not found");
-    assert_eq!(repo["config"]["provider"], "ollama");
-    assert_eq!(repo["config"]["base_url"], "http://h:11434");
+    assert_eq!(repo["config"]["provider"], "openai");
+    assert_eq!(repo["config"]["base_url"], "http://h:9292/v1");
 }
 
 #[tokio::test]
@@ -1004,7 +1004,7 @@ async fn put_config_unknown_repo_returns_404() {
                 .method("PUT")
                 .uri("/api/workspaces/nope/config")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"provider":"ollama"}"#))
+                .body(Body::from(r#"{"provider":"openai"}"#))
                 .unwrap(),
         )
         .await
@@ -1014,7 +1014,7 @@ async fn put_config_unknown_repo_returns_404() {
 
 #[tokio::test]
 async fn put_config_api_key_on_keyless_provider_returns_400() {
-    // #120: `api_key_from_env` on ollama (no api-key env var) would be silently
+    // #120: `api_key_from_env` on bedrock (no api-key env var) would be silently
     // ignored at spawn time. It must be rejected at config-set with a clear 400.
     let h = setup().await;
     let resp = h
@@ -1026,7 +1026,7 @@ async fn put_config_api_key_on_keyless_provider_returns_400() {
                 .uri("/api/workspaces/repo/config")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"provider":"ollama","api_key_from_env":"SOME_VAR"}"#,
+                    r#"{"provider":"bedrock","api_key_from_env":"SOME_VAR"}"#,
                 ))
                 .unwrap(),
         )

@@ -1747,7 +1747,7 @@ mod tests {
         // Let refresh get into list_repos, then set the config mid-flight.
         tokio::time::sleep(Duration::from_millis(30)).await;
         let cfg = crate::registry::RepoProviderConfig {
-            provider: Some("ollama".to_string()),
+            provider: Some("openai".to_string()),
             ..Default::default()
         };
         mgr.set_repo_config_registry_only("r", cfg).await.unwrap();
@@ -1758,7 +1758,7 @@ mod tests {
         let repo = snap.workspaces.iter().find(|w| w.name == "r").unwrap();
         assert_eq!(
             repo.config.provider.as_deref(),
-            Some("ollama"),
+            Some("openai"),
             "refresh clobbered a concurrent set_config back to durable; got {:?}",
             repo.config
         );
@@ -1998,7 +1998,10 @@ mod tests {
         mgr.set_repo_config_registry_only(
             "p",
             RepoProviderConfig {
-                provider: Some("ollama".into()),
+                provider: Some("openai".into()),
+                // A local openai-compatible endpoint: keyless (base_url set), the
+                // migration target for the removed ollama provider.
+                base_url: Some("http://h:9292/v1".into()),
                 ..Default::default()
             },
         )
@@ -2011,7 +2014,7 @@ mod tests {
         assert_eq!(specs.len(), 1, "exactly one spawn reached caliband");
         assert_eq!(
             specs[0].provider.as_deref(),
-            Some("ollama"),
+            Some("openai"),
             "the repo's configured provider must be carried in SpawnSpec.provider (#93)"
         );
     }
@@ -2027,8 +2030,8 @@ mod tests {
 
         mgr.add_repo("p", "/tmp/p").await.ok(); // discovery may fail; the registry write is what matters
         let cfg = RepoProviderConfig {
-            provider: Some("ollama".into()),
-            base_url: Some("http://h:11434".into()),
+            provider: Some("openai".into()),
+            base_url: Some("http://h:9292/v1".into()),
             env: [("EXTRA".to_string(), "1".to_string())]
                 .into_iter()
                 .collect(),
@@ -2038,8 +2041,8 @@ mod tests {
 
         let ec = mgr.ensure_config_for("p").await.unwrap();
         assert_eq!(ec.env.get("KEEP").unwrap(), "global");
-        assert_eq!(ec.env.get("CALIBAN_PROVIDER").unwrap(), "ollama");
-        assert_eq!(ec.env.get("OLLAMA_BASE_URL").unwrap(), "http://h:11434");
+        assert_eq!(ec.env.get("CALIBAN_PROVIDER").unwrap(), "openai");
+        assert_eq!(ec.env.get("OPENAI_BASE_URL").unwrap(), "http://h:9292/v1");
         assert_eq!(ec.env.get("EXTRA").unwrap(), "1");
     }
 

@@ -161,7 +161,7 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
 /// (#168). The spawn contract must carry them explicitly: the caliban worker
 /// selects its provider from `SpawnSpec.provider` and nothing else — it does
 /// **not** read `CALIBAN_PROVIDER` from its environment, which caliban#93
-/// verified directly ("setting `CALIBAN_PROVIDER=ollama` in the worker's
+/// verified directly ("setting `CALIBAN_PROVIDER=openai` in the worker's
 /// environment does not change the selection"). That gap is why #93 added
 /// `SpawnSpec.provider` in the first place. Leaving these `None` made every
 /// k8s-spawned worker fall back to caliban's default (anthropic) and die at
@@ -169,7 +169,7 @@ pub fn handle_from(task: &CalibanTask, repo: String) -> Result<Option<AgentHandl
 ///
 /// Note the distinction the old comment got right: `spec.provider_ref` is a
 /// *reference name* and would indeed be wrong to pass. The value the worker
-/// wants is the **resolved kind** (`ollama`, `anthropic`, …), which the
+/// wants is the **resolved kind** (`openai`, `anthropic`, …), which the
 /// operator pins into `status.resolvedWorkspace.provider.kind`. Before that
 /// status exists both fields stay `None`, so caliban applies its own defaults.
 ///
@@ -2675,8 +2675,8 @@ mod tests {
                     path: "/work/caliban".into(),
                 }],
                 providers: vec![Provider {
-                    name: "ollama".into(),
-                    kind: "ollama".into(),
+                    name: "openai".into(),
+                    kind: "openai".into(),
                     base_url: None,
                     model: None,
                     credentials_ref: None,
@@ -2862,7 +2862,7 @@ mod tests {
                 provider: crate::k8s::crd::ResolvedProvider {
                     name: "workers".to_string(),
                     kind: kind.to_string(),
-                    base_url: Some("http://ollama.example:11434".to_string()),
+                    base_url: Some("http://local.example:9292/v1".to_string()),
                     model: model.map(str::to_string),
                     credentials_ref: None,
                 },
@@ -2882,11 +2882,11 @@ mod tests {
     /// `status.resolvedWorkspace`; project it onto the spawn.
     #[test]
     fn spawn_spec_from_task_fills_provider_and_model_from_resolved_workspace() {
-        let ct = task_with_resolved_provider("ct-prov", "ollama", Some("qwen3.6:27b-mlx"));
+        let ct = task_with_resolved_provider("ct-prov", "openai", Some("qwen3.6:27b-mlx"));
         let s = spawn_spec_from_task(&ct);
         assert_eq!(
             s.provider.as_deref(),
-            Some("ollama"),
+            Some("openai"),
             "the resolved provider *kind* must reach caliband's SpawnSpec"
         );
         assert_eq!(

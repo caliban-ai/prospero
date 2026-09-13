@@ -905,7 +905,7 @@ pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigSto
         name: "p".into(),
         root: "/r".into(),
         config: RepoProviderConfig {
-            provider: Some("ollama".into()),
+            provider: Some("openai".into()),
             ..Default::default()
         },
     };
@@ -914,7 +914,7 @@ pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigSto
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].name, "p");
     assert_eq!(repos[0].root, std::path::PathBuf::from("/r"));
-    assert_eq!(repos[0].config.provider.as_deref(), Some("ollama"));
+    assert_eq!(repos[0].config.provider.as_deref(), Some("openai"));
 
     let mut r2 = r.clone();
     r2.config.provider = Some("anthropic".into());

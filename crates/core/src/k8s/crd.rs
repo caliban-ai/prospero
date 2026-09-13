@@ -171,7 +171,7 @@ pub struct ResolvedWorkspace {
 pub struct ResolvedProvider {
     /// Provider name.
     pub name: String,
-    /// Provider kind (e.g. `ollama`, `anthropic`).
+    /// Provider kind (e.g. `openai`, `anthropic`).
     pub kind: String,
     /// Base URL, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,16 +227,16 @@ pub struct WorkspaceSpec {
 pub struct Provider {
     /// Provider identifier, unique within the workspace (e.g. `planner`).
     pub name: String,
-    /// Provider kind (e.g. `ollama`, `anthropic`, `openai`).
+    /// Provider kind (e.g. `anthropic`, `openai`, `google`).
     pub kind: String,
-    /// Override base URL (e.g. `http://192.168.1.240:11434`).
+    /// Override base URL (e.g. `http://192.168.1.240:9292/v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Default model for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Reference to an existing Secret for this provider's API key. Keyless
-    /// providers (e.g. ollama) omit it.
+    /// providers (e.g. a local `openai` endpoint) omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_ref: Option<CredentialsRef>,
 }
@@ -337,12 +337,12 @@ mod tests {
                 .map(|c| (c.secret_name.as_str(), c.key.as_str())),
             Some(("anthropic-key", "api-key"))
         );
-        // Keyless provider (ollama) omits credentialsRef.
+        // Keyless provider (local openai endpoint) omits credentialsRef.
         assert_eq!(ws.spec.providers[1].name, "workers");
         assert!(ws.spec.providers[1].credentials_ref.is_none());
         assert_eq!(
             ws.spec.providers[1].base_url.as_deref(),
-            Some("http://192.168.1.240:11434")
+            Some("http://192.168.1.240:9292/v1")
         );
         assert_eq!(ws.spec.default_provider.as_deref(), Some("planner"));
 
@@ -390,7 +390,7 @@ status:
   resolvedWorkspace:
     sources:
       - { name: caliban, repo: "git@example:caliban", ref: main, path: /work/caliban }
-    provider: { name: workers, kind: ollama, baseUrl: "http://192.168.1.240:11434", model: qwen2.5-coder }
+    provider: { name: workers, kind: openai, baseUrl: "http://192.168.1.240:9292/v1", model: qwen2.5-coder }
 "#;
         let task: CalibanTask = serde_yaml::from_str(yaml).unwrap();
         let status = task.status.expect("status present");
@@ -402,7 +402,7 @@ status:
         assert_eq!(rw.sources.len(), 1);
         assert_eq!(rw.sources[0].name, "caliban");
         assert_eq!(rw.provider.name, "workers");
-        assert_eq!(rw.provider.kind, "ollama");
+        assert_eq!(rw.provider.kind, "openai");
     }
 
     #[test]
@@ -414,7 +414,7 @@ metadata: { name: w, namespace: n }
 spec:
   displayName: W
   sources: [ { name: only, repo: "git@x:only", path: /work/only } ]
-  providers: [ { name: p, kind: ollama } ]
+  providers: [ { name: p, kind: openai } ]
 status:
   phase: Failed
   observedGeneration: 3
