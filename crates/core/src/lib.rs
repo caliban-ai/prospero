@@ -5,6 +5,7 @@
 //! agents across repos and speaks caliban's NDJSON IPC protocol through a thin,
 //! self-contained client — the wire format is the only coupling to caliban.
 
+pub mod actor;
 pub mod auth;
 pub mod bus;
 pub mod caliband;

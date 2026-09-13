@@ -1376,6 +1376,25 @@ async fn dashboard_unknown_asset_is_404_not_a_panic() {
     assert_ne!(status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn spawn_inside_an_actor_scope_stamps_agent_spawned() {
+    let h = setup().await;
+    let id = prospero_core::actor::scope(Some("alice".into()), async {
+        h.manager
+            .spawn_agent("repo", prospero_core::SpawnRequest::new("do it"))
+            .await
+            .unwrap()
+    })
+    .await;
+    let key = prospero_core::event::stream_key_for("repo", &id);
+    let events = h.manager.store().replay(&key, 0).await.unwrap();
+    let spawned = events
+        .iter()
+        .find(|e| matches!(e.kind, prospero_core::EventKind::AgentSpawned))
+        .expect("AgentSpawned persisted");
+    assert_eq!(spawned.actor.as_deref(), Some("alice"));
+}
+
 /// Fetch `uri` and return its body as a string.
 async fn body_of(h: &Harness, uri: &str) -> String {
     let resp = h

@@ -276,7 +276,7 @@ impl Emitter {
             repo: repo.to_string(),
             agent_id: agent_id.to_string(),
             kind,
-            actor: None,
+            actor: crate::actor::current(),
         }
     }
 
