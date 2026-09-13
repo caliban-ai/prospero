@@ -647,6 +647,28 @@ pub async fn store_conformance(store: &dyn crate::store::Store) {
     assert_eq!(a_from2.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
     let b = store.replay("b", 0).await.unwrap();
     assert_eq!(b.len(), 1);
+
+    // #2: `actor` round-trips, and `None` stays `None`.
+    let attributed = FleetEvent {
+        seq: 1,
+        ts: "2026-09-13T00:00:00Z".into(),
+        repo: "actor-repo".into(),
+        agent_id: "actor-agent".into(),
+        kind: EventKind::AgentSpawned,
+        actor: Some("alice".into()),
+    };
+    let unattributed = FleetEvent {
+        seq: 2,
+        actor: None,
+        kind: EventKind::AgentGone,
+        ..attributed.clone()
+    };
+    store.append(&attributed).await.unwrap();
+    store.append(&unattributed).await.unwrap();
+    let back = store.replay(&attributed.stream_key(), 0).await.unwrap();
+    assert_eq!(back.len(), 2);
+    assert_eq!(back[0].actor.as_deref(), Some("alice"));
+    assert_eq!(back[1].actor, None);
 }
 
 /// Retention contract: `prune(before_ts)` deletes events with `ts < before_ts`

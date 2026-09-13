@@ -26,6 +26,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (\
     repo       TEXT NOT NULL,\
     agent_id   TEXT NOT NULL,\
     kind       TEXT NOT NULL,\
+    actor      TEXT,\
     UNIQUE(stream_key, seq)\
 )";
 
@@ -55,6 +56,20 @@ impl SqliteStore {
             .execute(&pool)
             .await
             .map_err(|e| CoreError::Store(format!("initializing sqlite schema: {e}")))?;
+        // #2: databases created before `actor` existed lack the column. SQLite
+        // has no `ADD COLUMN IF NOT EXISTS`, so probe the table first.
+        let has_actor: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = 'actor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("inspecting sqlite schema: {e}")))?;
+        if !has_actor {
+            sqlx::query("ALTER TABLE events ADD COLUMN actor TEXT")
+                .execute(&pool)
+                .await
+                .map_err(|e| CoreError::Store(format!("adding actor column: {e}")))?;
+        }
         Ok(Self { pool })
     }
 }
@@ -64,8 +79,8 @@ impl Store for SqliteStore {
     async fn append(&self, event: &FleetEvent) -> Result<()> {
         let kind = serde_json::to_string(&event.kind)?;
         sqlx::query(
-            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind, actor) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.stream_key())
         .bind(event.seq as i64)
@@ -73,6 +88,7 @@ impl Store for SqliteStore {
         .bind(&event.repo)
         .bind(&event.agent_id)
         .bind(kind)
+        .bind(&event.actor)
         .execute(&self.pool)
         .await
         .map_err(map_append_error)?;
@@ -81,7 +97,7 @@ impl Store for SqliteStore {
 
     async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         let rows = sqlx::query(
-            "SELECT seq, ts, repo, agent_id, kind FROM events \
+            "SELECT seq, ts, repo, agent_id, kind, actor FROM events \
              WHERE stream_key = ? AND seq >= ? ORDER BY seq",
         )
         .bind(stream_key)
@@ -98,13 +114,14 @@ impl Store for SqliteStore {
             let repo: String = row.try_get("repo").map_err(decode)?;
             let agent_id: String = row.try_get("agent_id").map_err(decode)?;
             let kind_json: String = row.try_get("kind").map_err(decode)?;
+            let actor: Option<String> = row.try_get("actor").map_err(decode)?;
             events.push(FleetEvent {
                 seq: seq as u64,
                 ts,
                 repo,
                 agent_id,
                 kind: serde_json::from_str(&kind_json)?,
-                actor: None,
+                actor,
             });
         }
         Ok(events)
@@ -252,5 +269,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(dir.path()).await.unwrap();
         crate::testkit::store_usage_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn opening_a_pre_actor_database_adds_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        // A database created by an older prosperod: no `actor` column.
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("events.db"))
+                .create_if_missing(true);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE events (global_ordinal INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 stream_key TEXT NOT NULL, seq INTEGER NOT NULL, ts TEXT NOT NULL, \
+                 repo TEXT NOT NULL, agent_id TEXT NOT NULL, kind TEXT NOT NULL, \
+                 UNIQUE(stream_key, seq))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = SqliteStore::open(dir.path()).await.unwrap();
+        // Opening twice must also be fine (idempotent migration).
+        drop(store);
+        let store = SqliteStore::open(dir.path()).await.unwrap();
+        crate::testkit::store_conformance(&store).await;
     }
 }
