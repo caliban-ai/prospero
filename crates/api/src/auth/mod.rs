@@ -18,6 +18,9 @@ use rand::RngCore as _;
 
 use crate::error::ApiError;
 
+pub mod handlers;
+pub mod session;
+
 /// HMAC key for dashboard session cookies. Never logged.
 pub struct SessionKey(Vec<u8>);
 
@@ -44,8 +47,6 @@ impl SessionKey {
         Ok(SessionKey(bytes))
     }
 
-    // Consumed by Task 6's cookie signing/verification.
-    #[allow(dead_code)]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -61,10 +62,7 @@ impl fmt::Debug for SessionKey {
 #[derive(Debug)]
 pub struct AuthState {
     tokens: Option<TokenSet>,
-    // Read by Task 6's session-cookie code (`session_key()`/`cookie_secure()` below).
-    #[allow(dead_code)]
     session_key: SessionKey,
-    #[allow(dead_code)]
     cookie_secure: bool,
 }
 
@@ -97,13 +95,10 @@ impl AuthState {
         self.tokens.as_ref()
     }
 
-    // Consumed by Task 6's cookie signing/verification.
-    #[allow(dead_code)]
     pub(crate) fn session_key(&self) -> &SessionKey {
         &self.session_key
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cookie_secure(&self) -> bool {
         self.cookie_secure
     }
@@ -197,7 +192,14 @@ pub(crate) fn resolve_principal(auth: &AuthState, headers: &HeaderMap) -> Option
             expires_unix: None,
         });
     }
-    None
+    let value = session::cookie_value(headers)?;
+    let now = chrono::Utc::now().timestamp();
+    session::verify(auth.session_key(), tokens, value, now).map(|(e, expires)| Principal {
+        token_name: e.name.clone(),
+        scope: e.scope,
+        via: Via::Cookie,
+        expires_unix: Some(expires),
+    })
 }
 
 /// The auth middleware (installed with `route_layer`, so `MatchedPath` is set).
@@ -228,6 +230,13 @@ pub async fn middleware(
             have = principal.scope.as_str(), need = need.as_str(), "rejected: insufficient scope"
         );
         return ApiError::Forbidden(format!("requires scope {}", need.as_str())).into_response();
+    }
+    if principal.via == Via::Cookie
+        && !matches!(*req.method(), Method::GET | Method::HEAD)
+        && !session::same_origin(req.headers())
+    {
+        tracing::debug!(target: "prospero_auth", %route, token = %principal.token_name, "rejected: cross-origin cookie mutation");
+        return ApiError::Forbidden("cross-origin request".into()).into_response();
     }
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         tracing::info!(

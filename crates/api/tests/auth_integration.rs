@@ -240,3 +240,194 @@ async fn spawn_over_http_records_the_token_name_as_actor() {
         .unwrap();
     assert_eq!(spawned.actor.as_deref(), Some("ops"));
 }
+
+fn cookie_from(resp: &axum::response::Response) -> String {
+    let set = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    set.split(';').next().unwrap().to_string() // "prospero_session=<value>"
+}
+
+async fn json(resp: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn sign_in_cookie_reads_streams_and_signs_out() {
+    let h = setup().await;
+    let body = format!(r#"{{"token":"{}"}}"#, h.admin);
+    let resp = h
+        .app
+        .clone()
+        .oneshot(request("POST", "/api/session", None, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict") && !set.contains("Secure"));
+    let cookie = cookie_from(&resp);
+    let info = json(resp).await;
+    assert_eq!(info["auth"], "token");
+    assert_eq!(info["token_name"], "root");
+    assert_eq!(info["scope"], "admin");
+    assert!(info["expires_at"].is_string());
+
+    let with_cookie = |method: &str, uri: &str| {
+        let mut r = request(method, uri, None, "");
+        r.headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        r
+    };
+    assert_eq!(
+        status(&h.app, with_cookie("GET", "/api/fleet")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&h.app, with_cookie("GET", "/api/agents/nope/stream")).await,
+        StatusCode::OK
+    );
+    let who = json(
+        h.app
+            .clone()
+            .oneshot(with_cookie("GET", "/api/session"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(who["token_name"], "root");
+
+    let out = h
+        .app
+        .clone()
+        .oneshot(with_cookie("DELETE", "/api/session"))
+        .await
+        .unwrap();
+    assert_eq!(out.status(), StatusCode::NO_CONTENT);
+    assert!(
+        out.headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+}
+
+#[tokio::test]
+async fn bad_sign_in_is_401_and_https_proxy_sets_secure() {
+    let h = setup().await;
+    assert_eq!(
+        status(
+            &h.app,
+            request("POST", "/api/session", None, r#"{"token":"pspo_nope"}"#)
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    let mut r = request(
+        "POST",
+        "/api/session",
+        None,
+        &format!(r#"{{"token":"{}"}}"#, h.read),
+    );
+    r.headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    let resp = h.app.clone().oneshot(r).await.unwrap();
+    assert!(
+        resp.headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("; Secure")
+    );
+}
+
+#[tokio::test]
+async fn cookie_mutations_must_be_same_origin_but_bearer_need_not_be() {
+    let h = setup().await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/session",
+            None,
+            &format!(r#"{{"token":"{}"}}"#, h.operate),
+        ))
+        .await
+        .unwrap();
+    let cookie = cookie_from(&resp);
+
+    let mut cross = request("POST", "/api/agents/nope/kill", None, "");
+    cross
+        .headers_mut()
+        .insert(header::COOKIE, cookie.parse().unwrap());
+    cross
+        .headers_mut()
+        .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+    cross
+        .headers_mut()
+        .insert(header::HOST, "prospero.example".parse().unwrap());
+    let resp = h.app.clone().oneshot(cross).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json(resp).await["error"], "cross-origin request");
+
+    let mut same = request("POST", "/api/agents/nope/kill", None, "");
+    same.headers_mut()
+        .insert(header::COOKIE, cookie.parse().unwrap());
+    same.headers_mut()
+        .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    let s = status(&h.app, same).await;
+    assert!(
+        s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+        "{s}"
+    );
+
+    let s = status(
+        &h.app,
+        request("POST", "/api/agents/nope/kill", Some(&h.operate), ""),
+    )
+    .await;
+    assert!(
+        s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+        "{s}"
+    );
+}
+
+#[tokio::test]
+async fn session_endpoints_when_auth_is_disabled() {
+    let h = setup().await;
+    let local = LocalFleet::new(h.manager.clone());
+    let open = prospero_api::router(
+        Arc::new(local.clone()),
+        Some(Arc::new(local)),
+        h.manager.store(),
+        h.manager.bus(),
+    );
+    let v = json(
+        open.clone()
+            .oneshot(request("GET", "/api/session", None, ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v, serde_json::json!({"auth": "disabled"}));
+    assert_eq!(
+        status(
+            &open,
+            request("POST", "/api/session", None, r#"{"token":"x"}"#)
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+}

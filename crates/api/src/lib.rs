@@ -70,6 +70,12 @@ pub fn router_with_auth(
         .route("/assets/{*path}", get(dashboard::asset))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
+        .route(
+            "/api/session",
+            get(auth::handlers::get_session)
+                .post(auth::handlers::post_session)
+                .delete(auth::handlers::delete_session),
+        )
         .route("/api/metrics", get(handlers::get_metrics))
         .route("/api/capabilities", get(handlers::get_capabilities))
         // Fleet + workspaces.
