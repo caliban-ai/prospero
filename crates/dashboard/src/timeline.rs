@@ -309,6 +309,7 @@ mod tests {
             repo: "r".into(),
             agent_id: "a".into(),
             kind,
+            actor: None,
         }))
     }
 

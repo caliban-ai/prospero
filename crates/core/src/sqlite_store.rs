@@ -104,6 +104,7 @@ impl Store for SqliteStore {
                 repo,
                 agent_id,
                 kind: serde_json::from_str(&kind_json)?,
+                actor: None,
             });
         }
         Ok(events)
@@ -209,6 +210,7 @@ mod tests {
             repo: "r".into(),
             agent_id: agent.into(),
             kind: crate::event::EventKind::AgentSpawned,
+            actor: None,
         }
     }
 

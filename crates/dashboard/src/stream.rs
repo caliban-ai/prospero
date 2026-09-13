@@ -193,6 +193,7 @@ mod tests {
                 stream: OutputStream::Stdout,
                 chunk: format!("line {seq}"),
             },
+            actor: None,
         }
     }
 
@@ -207,6 +208,7 @@ mod tests {
                 turns: 3,
                 cost_usd: 0.12,
             },
+            actor: None,
         }
     }
 

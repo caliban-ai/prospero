@@ -133,6 +133,11 @@ pub struct FleetEvent {
     pub agent_id: String,
     /// The event payload.
     pub kind: EventKind,
+    /// The API token name that caused this event, when a request did so
+    /// directly (local-fleet spawn / rm). `None` for poll- or watch-derived
+    /// events and when auth is disabled. Additive and optional on the wire (#2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 impl FleetEvent {
@@ -171,6 +176,7 @@ mod tests {
                 stream: OutputStream::Stdout,
                 chunk: "hi".into(),
             },
+            actor: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: FleetEvent = serde_json::from_str(&s).unwrap();
@@ -195,7 +201,34 @@ mod tests {
             repo: "prospero".into(),
             agent_id: "".into(),
             kind: EventKind::AgentGone,
+            actor: None,
         };
         assert_eq!(e.stream_key(), "repo:prospero");
+    }
+
+    #[test]
+    fn actor_is_optional_and_omitted_when_none() {
+        let mut e = FleetEvent {
+            seq: 1,
+            ts: "2026-09-13T00:00:00Z".into(),
+            repo: "r".into(),
+            agent_id: "a".into(),
+            kind: EventKind::AgentSpawned,
+            actor: None,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("actor").is_none(), "None must not serialize: {v}");
+        // Old payloads without the field still deserialize.
+        let old = serde_json::json!({
+            "seq": 1, "ts": "t", "repo": "r", "agent_id": "a",
+            "kind": {"kind": "agent_spawned"}
+        });
+        assert_eq!(
+            serde_json::from_value::<FleetEvent>(old).unwrap().actor,
+            None
+        );
+        e.actor = Some("alice".into());
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["actor"], "alice");
     }
 }

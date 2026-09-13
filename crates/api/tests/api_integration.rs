@@ -578,6 +578,7 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
         repo: "repo".to_string(),
         agent_id: "agent001".to_string(),
         kind,
+        actor: None,
     };
     store
         .append(&ev(
@@ -660,6 +661,7 @@ async fn usage_endpoint_aggregates_cost_and_outcomes_by_workspace() {
         repo: "repo".to_string(),
         agent_id: agent.to_string(),
         kind,
+        actor: None,
     };
 
     store

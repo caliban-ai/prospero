@@ -7,6 +7,7 @@
 //! re-exports each type here from its original path for source compatibility.
 
 mod api;
+mod auth;
 mod event;
 mod model;
 
@@ -15,6 +16,7 @@ pub use api::{
     SetConfigBody, SpawnBody, SpawnedResponse, UsageBucket, UsageGroup, UsageReport,
     WorkspaceSummary,
 };
+pub use auth::{Scope, SessionInfo, SignInBody};
 pub use event::{EventKind, FleetEvent, OutputStream, stream_key_for};
 pub use model::{
     Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, ProviderInfo,

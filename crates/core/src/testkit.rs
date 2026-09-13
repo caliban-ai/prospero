@@ -626,6 +626,7 @@ pub async fn store_conformance(store: &dyn crate::store::Store) {
                 stream: OutputStream::Stdout,
                 chunk: chunk.into(),
             },
+            actor: None,
         }
     }
 
@@ -661,6 +662,7 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
             repo: "r".into(),
             agent_id: "a".into(),
             kind: EventKind::AgentSpawned,
+            actor: None,
         }
     }
 
@@ -714,6 +716,7 @@ pub async fn store_usage_conformance(store: &dyn crate::store::Store) {
             repo: repo.into(),
             agent_id: agent.into(),
             kind,
+            actor: None,
         }
     }
 

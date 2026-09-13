@@ -140,6 +140,7 @@ mod tests {
                 stream: prospero_core::OutputStream::Stdout,
                 chunk: format!("c{seq}"),
             },
+            actor: None,
         }
     }
 
@@ -154,6 +155,7 @@ mod tests {
                 cost_usd: 0.0,
                 turns: 1,
             },
+            actor: None,
         }
     }
 

@@ -119,6 +119,7 @@ mod tests {
             repo: "r".into(),
             agent_id: agent.into(),
             kind: EventKind::AgentSpawned,
+            actor: None,
         }
     }
 

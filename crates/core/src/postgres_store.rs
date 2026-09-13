@@ -92,6 +92,7 @@ impl Store for PostgresStore {
                 repo,
                 agent_id,
                 kind: serde_json::from_str(&kind_json)?,
+                actor: None,
             });
         }
         Ok(events)
