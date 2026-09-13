@@ -478,13 +478,22 @@ async fn main() -> anyhow::Result<()> {
             // No FleetManager under k8s: K8sFleet serves directly over the
             // shared store/bus (#83), with the ownership lease gating the
             // session plane (#108).
+            // #212: opt-in surfacing of model reasoning in the stream (off by
+            // default for volume/privacy). When on, the dashboard shows a
+            // collapsible Thinking segment — useful for reasoning models whose
+            // reply is mostly thinking.
+            let include_thinking = std::env::var("PROSPERO_INCLUDE_THINKING")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
             let k8s = prospero_core::K8sFleet::new(api, bus.clone(), store.clone())
                 .with_network(tls.clone(), token.clone())
                 .with_ownership(ownership)
-                .with_workspaces(workspace_api);
+                .with_workspaces(workspace_api)
+                .with_include_thinking(include_thinking);
             tracing::info!(
                 target: "prosperod", backend = "k8s", namespace = %ns,
                 session_tls = tls.is_some(), session_token = token.is_some(),
+                include_thinking,
                 "serving via K8sFleet (no FleetManager)"
             );
             (

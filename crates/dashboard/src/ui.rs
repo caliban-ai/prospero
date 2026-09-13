@@ -1814,6 +1814,15 @@ fn TimelineSegment(segment: Segment) -> Element {
         Segment::Output { text } => rsx! {
             pre { class: "ev-out", "{text}" }
         },
+        // #212: reasoning, collapsed by default (native <details>) and visually
+        // secondary — click to expand. Only appears when the daemon streams
+        // thinking (PROSPERO_INCLUDE_THINKING).
+        Segment::Thinking { text } => rsx! {
+            details { class: "ev-thinking",
+                summary { class: "ev-thinking-summary", "Thinking" }
+                pre { class: "ev-thinking-body", "{text}" }
+            }
+        },
         Segment::Tool(call) => rsx! {
             ToolEntry { call }
         },

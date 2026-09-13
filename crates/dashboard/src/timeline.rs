@@ -13,7 +13,7 @@
 //! stuck "running" in v1 (#106). Pre-#106 stored events carry no id at all, so
 //! an id-less finish falls back to the oldest still-open call.
 
-use prospero_types::{AgentStatus, EventKind};
+use prospero_types::{AgentStatus, EventKind, OutputStream};
 
 use crate::stream::Entry;
 
@@ -82,6 +82,13 @@ pub enum Segment {
         /// The concatenated text.
         text: String,
     },
+    /// A run of coalesced model reasoning/thinking (#212). Rendered collapsibly
+    /// and distinctly from assistant-visible `Output`. Only present when the
+    /// daemon streams thinking (`PROSPERO_INCLUDE_THINKING`).
+    Thinking {
+        /// The concatenated reasoning text.
+        text: String,
+    },
     /// A tool call.
     Tool(ToolCall),
     /// A lifecycle transition.
@@ -126,6 +133,9 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
     let mut segs: Vec<Segment> = Vec::new();
     // Index into `segs` of the output block still accepting chunks, if any.
     let mut open_output: Option<usize> = None;
+    // Same, for the thinking block (#212). Kept separate so text and reasoning
+    // never coalesce into one block; each closes the other.
+    let mut open_thinking: Option<usize> = None;
     // Indices into `segs` of tool calls awaiting a finish, in start order.
     let mut open_tools: Vec<usize> = Vec::new();
     // Start timestamps, parallel to `open_tools`, for the duration.
@@ -135,11 +145,13 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
         let event = match entry {
             Entry::Gap { skipped } => {
                 open_output = None;
+                open_thinking = None;
                 segs.push(Segment::Gap { skipped: *skipped });
                 continue;
             }
             Entry::Undecodable { why } => {
                 open_output = None;
+                open_thinking = None;
                 segs.push(Segment::Undecodable { why: why.clone() });
                 continue;
             }
@@ -147,7 +159,13 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
         };
 
         match &event.kind {
-            EventKind::Output { chunk, .. } => {
+            EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk,
+            } => {
+                // A text chunk closes any open thinking block, so they render in
+                // order rather than merging.
+                open_thinking = None;
                 match open_output {
                     Some(i) => {
                         if let Segment::Output { text } = &mut segs[i] {
@@ -159,6 +177,28 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
                             text: chunk.clone(),
                         });
                         open_output = Some(segs.len() - 1);
+                    }
+                }
+                continue;
+            }
+            EventKind::Output {
+                stream: OutputStream::Thinking,
+                chunk,
+            } => {
+                // #212: coalesce reasoning into its own block; a thinking chunk
+                // closes any open text block.
+                open_output = None;
+                match open_thinking {
+                    Some(i) => {
+                        if let Segment::Thinking { text } = &mut segs[i] {
+                            text.push_str(chunk);
+                        }
+                    }
+                    None => {
+                        segs.push(Segment::Thinking {
+                            text: chunk.clone(),
+                        });
+                        open_thinking = Some(segs.len() - 1);
                     }
                 }
                 continue;
@@ -242,6 +282,7 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
         }
         // Everything that fell through opened a non-output segment.
         open_output = None;
+        open_thinking = None;
     }
 
     segs
@@ -284,6 +325,39 @@ mod tests {
             stream: OutputStream::Stdout,
             chunk: chunk.into(),
         }
+    }
+
+    fn think(chunk: &str) -> EventKind {
+        EventKind::Output {
+            stream: OutputStream::Thinking,
+            chunk: chunk.into(),
+        }
+    }
+
+    /// #212: thinking coalesces into its own block, and text/thinking never
+    /// merge — each closes the other, preserving order.
+    #[test]
+    fn thinking_coalesces_and_splits_from_text() {
+        let segs = group(&[
+            ev(1, "t", think("let me ")),
+            ev(2, "t", think("reason")),
+            ev(3, "t", out("the answer")),
+            ev(4, "t", think("second thought")),
+        ]);
+        assert_eq!(
+            segs,
+            vec![
+                Segment::Thinking {
+                    text: "let me reason".into()
+                },
+                Segment::Output {
+                    text: "the answer".into()
+                },
+                Segment::Thinking {
+                    text: "second thought".into()
+                },
+            ]
+        );
     }
 
     fn tool(segs: &[Segment]) -> ToolCall {
