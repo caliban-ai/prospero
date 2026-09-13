@@ -5,6 +5,7 @@
 //! agents across repos and speaks caliban's NDJSON IPC protocol through a thin,
 //! self-contained client — the wire format is the only coupling to caliban.
 
+pub mod auth;
 pub mod bus;
 pub mod caliband;
 pub mod config_store;
@@ -50,6 +51,7 @@ pub use model::{Agent, AgentStatus, FleetSnapshot, Readiness, Workspace, Workspa
 pub use ownership::{Lease, Ownership, SelfOwnsAll};
 pub use postgres_config_store::PostgresConfigStore;
 pub use postgres_store::PostgresStore;
+pub use prospero_types::Scope;
 pub use registry::{RegisteredWorkspace, Registry, RepoProviderConfig};
 pub use sqlite_store::SqliteStore;
 pub use store::{JsonlStore, Store};
