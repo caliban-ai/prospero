@@ -248,8 +248,9 @@ mod tests {
         let set = TokenSet::parse(&tokens_file_line("a", Scope::Read, &tok)).unwrap();
         assert!(set.authenticate("pspo_nope").is_none());
         let mut near = tok.clone();
-        near.pop();
-        near.push('A');
+        let last = near.pop().unwrap();
+        near.push(if last == 'A' { 'B' } else { 'A' });
+        assert_ne!(near, tok);
         assert!(set.authenticate(&near).is_none());
         assert!(set.authenticate("").is_none());
     }
