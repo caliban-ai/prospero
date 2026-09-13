@@ -1480,7 +1480,7 @@ fn LocalFields(form: Signal<LocalForm>, env: Signal<Vec<(String, String)>>) -> E
             span { class: "field-label", "Base URL" }
             input {
                 class: "input",
-                placeholder: "http://host:11434",
+                placeholder: "http://host:9292/v1",
                 value: "{form.read().base_url}",
                 oninput: move |e| form.write().base_url = e.value(),
             }
@@ -1596,7 +1596,7 @@ fn K8sFields(form: Signal<K8sForm>, env: Signal<Vec<(String, String)>>) -> Eleme
                         oninput: move |e| form.write().providers[i].model = e.value(),
                     }
                     // Without this a self-hosted provider falls back to the
-                    // in-pod default (localhost:11434) and every agent dies at
+                    // in-pod default (localhost) and every agent dies at
                     // preflight with ProviderError (#188). The field existed in
                     // `ProviderRow` and mapped through `to_config`; only the
                     // input was missing.

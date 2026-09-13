@@ -16,15 +16,9 @@ use prospero_types::{
     WorkspaceSourceSpec,
 };
 
-/// Provider kinds offered in the pickers. Mirrors v1's list.
-pub const PROVIDER_KINDS: [&str; 6] = [
-    "ollama",
-    "anthropic",
-    "openai",
-    "google",
-    "bedrock",
-    "vertex",
-];
+/// Provider kinds offered in the pickers. For local inference, pick `openai`
+/// and set a base URL (llama.cpp / mlx-lm / llama-swap `/v1`).
+pub const PROVIDER_KINDS: [&str; 5] = ["anthropic", "openai", "google", "bedrock", "vertex"];
 
 /// Trim, and treat blank as absent.
 fn some_trimmed(s: &str) -> Option<String> {
@@ -53,7 +47,7 @@ fn env_map(rows: &[(String, String)]) -> BTreeMap<String, String> {
 /// The local backend's single-provider form.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalForm {
-    /// Provider identifier (`ollama`, `anthropic`, …). Blank ⇒ backend default.
+    /// Provider identifier (`openai`, `anthropic`, …). Blank ⇒ backend default.
     pub provider: String,
     /// Provider base URL.
     pub base_url: String,
@@ -97,11 +91,12 @@ impl LocalForm {
     pub fn validate(&self) -> Result<(), String> {
         // #120: an api_key_from_env on a keyless provider is silently ignored
         // server-side, which looks like the credential was accepted. Say so.
-        if !self.api_key_from_env.trim().is_empty() && self.provider.trim() == "ollama" {
-            return Err(
-                "ollama takes no API key — clear the env-var field, or pick another provider."
-                    .into(),
-            );
+        // bedrock/vertex use ambient cloud credentials, not an API-key env var.
+        let provider = self.provider.trim();
+        if !self.api_key_from_env.trim().is_empty() && matches!(provider, "bedrock" | "vertex") {
+            return Err(format!(
+                "{provider} takes no API key — clear the env-var field, or pick another provider."
+            ));
         }
         Ok(())
     }
@@ -472,8 +467,8 @@ mod tests {
     fn local_rejects_an_api_key_on_a_keyless_provider() {
         // #120: the server accepts then ignores this, which reads as success.
         let form = LocalForm {
-            provider: "ollama".into(),
-            api_key_from_env: "OLLAMA_KEY".into(),
+            provider: "bedrock".into(),
+            api_key_from_env: "AWS_KEY".into(),
             ..Default::default()
         };
         assert!(form.validate().is_err());
@@ -499,12 +494,12 @@ mod tests {
     #[test]
     fn k8s_provider_base_url_round_trips() {
         let mut form = valid_form();
-        form.providers[0].base_url = " http://192.168.1.240:11434 ".into();
+        form.providers[0].base_url = " http://192.168.1.240:9292/v1 ".into();
 
         let cfg = form.to_config();
         assert_eq!(
             cfg.providers[0].base_url.as_deref(),
-            Some("http://192.168.1.240:11434"),
+            Some("http://192.168.1.240:9292/v1"),
             "base URL must reach the CR, trimmed"
         );
 
@@ -528,12 +523,12 @@ mod tests {
             cfg.default_provider.as_deref(),
         );
         assert_eq!(
-            reopened.providers[0].base_url, "http://192.168.1.240:11434",
+            reopened.providers[0].base_url, "http://192.168.1.240:9292/v1",
             "the editor must show the saved base URL, not a blank box"
         );
         assert_eq!(
             reopened.to_config().providers[0].base_url.as_deref(),
-            Some("http://192.168.1.240:11434"),
+            Some("http://192.168.1.240:9292/v1"),
             "and saving again must not drop it"
         );
     }

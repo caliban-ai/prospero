@@ -85,7 +85,7 @@ pub struct SpawnSpec {
     /// Optional model override.
     #[serde(default)]
     pub model: Option<String>,
-    /// Optional provider override (e.g. `"anthropic"`, `"ollama"`, `"openai"`,
+    /// Optional provider override (e.g. `"anthropic"`, `"openai"`,
     /// `"google"`). The caliban worker parses this to select the provider
     /// before model resolution; without it the worker uses caliban's default
     /// (anthropic). Mirrors caliban `SpawnSpec.provider` (#93). Prospero fills
@@ -334,9 +334,9 @@ mod tests {
         // A provider set on our side must serialize into caliban's wire form,
         // and caliban's serialized provider must deserialize back. Guards the
         // #93 contract end-to-end at the wire boundary.
-        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"ollama","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false}"#;
+        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"openai","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false}"#;
         let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
-        assert_eq!(spec.provider.as_deref(), Some("ollama"));
+        assert_eq!(spec.provider.as_deref(), Some("openai"));
         assert_eq!(
             serde_json::to_string(&spec).unwrap(),
             golden,

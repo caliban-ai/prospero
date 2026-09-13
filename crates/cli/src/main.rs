@@ -70,7 +70,7 @@ enum WorkspaceCmd {
 struct WorkspaceConfigArgs {
     /// Workspace name (registry key).
     name: String,
-    /// Provider id (e.g. anthropic, openai, google, ollama). Omit to clear.
+    /// Provider id (e.g. anthropic, openai, google). Omit to clear.
     #[arg(long)]
     provider: Option<String>,
     /// Provider base URL / host.
@@ -430,20 +430,20 @@ mod tests {
             "config",
             "myrepo",
             "--provider",
-            "ollama",
+            "openai",
             "--base-url",
-            "http://h:11434",
+            "http://h:9292/v1",
             "--api-key-env",
-            "OLLAMA_KEY",
+            "OPENAI_API_KEY",
             "--env",
             "FOO=bar",
         ]);
         match cli.command {
             Command::Workspace(WorkspaceCmd::Config(a)) => {
                 assert_eq!(a.name, "myrepo");
-                assert_eq!(a.provider.as_deref(), Some("ollama"));
-                assert_eq!(a.base_url.as_deref(), Some("http://h:11434"));
-                assert_eq!(a.api_key_env.as_deref(), Some("OLLAMA_KEY"));
+                assert_eq!(a.provider.as_deref(), Some("openai"));
+                assert_eq!(a.base_url.as_deref(), Some("http://h:9292/v1"));
+                assert_eq!(a.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
                 assert_eq!(a.env, vec![("FOO".to_string(), "bar".to_string())]);
             }
             other => panic!("expected repo config, got {other:?}"),

@@ -157,9 +157,9 @@ async fn cli_drives_the_full_stack() {
             "config",
             "repo",
             "--provider",
-            "ollama",
+            "openai",
             "--base-url",
-            "http://h:11434",
+            "http://h:9292/v1",
         ],
     );
     assert!(ok, "repo config failed: {out}");
@@ -185,7 +185,7 @@ async fn cli_drives_the_full_stack() {
                 .unwrap()
                 .unwrap();
         let cfg = repos.as_array().unwrap()[0]["config"].clone();
-        if cfg["provider"].as_str() == Some("ollama") {
+        if cfg["provider"].as_str() == Some("openai") {
             break cfg;
         }
         assert!(
@@ -194,8 +194,8 @@ async fn cli_drives_the_full_stack() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
-    assert_eq!(cfg["provider"].as_str(), Some("ollama"));
-    assert_eq!(cfg["base_url"].as_str(), Some("http://h:11434"));
+    assert_eq!(cfg["provider"].as_str(), Some("openai"));
+    assert_eq!(cfg["base_url"].as_str(), Some("http://h:9292/v1"));
 }
 
 async fn wait_for_health(base: &str) {

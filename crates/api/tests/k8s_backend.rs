@@ -105,8 +105,8 @@ async fn k8s_router_with_registry(ws_name: &str) -> Router {
                 display_name: format!("{ws_name} display"),
                 sources: Vec::new(),
                 providers: vec![Provider {
-                    name: "ollama".into(),
-                    kind: "ollama".into(),
+                    name: "openai".into(),
+                    kind: "openai".into(),
                     base_url: None,
                     model: None,
                     credentials_ref: None,
