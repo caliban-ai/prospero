@@ -711,6 +711,12 @@ struct SessionPlane {
     /// watch loop's `Gone` path clear it, so an explicit restart/respawn — or a
     /// recreated CR of the same name — re-checks the pod.
     terminal: Arc<Mutex<HashSet<String>>>,
+    /// Include the model's reasoning/thinking in the streamed output (#212).
+    /// Off by default (volume/privacy): thinking deltas are dropped in
+    /// normalization. The daemon flips it on via [`K8sFleet::with_include_thinking`]
+    /// (env `PROSPERO_INCLUDE_THINKING`) so the dashboard can show a Thinking
+    /// segment for reasoning models.
+    include_thinking: bool,
 }
 
 impl SessionPlane {
@@ -805,6 +811,7 @@ impl SessionPlane {
         let attached = Arc::clone(&self.attached);
         let ownership = Arc::clone(&self.ownership);
         let terminal = Arc::clone(&self.terminal);
+        let include_thinking = self.include_thinking;
 
         let handle = tokio::spawn(async move {
             // #159: resolve caliband's own agent id for this pod, spawning the
@@ -854,7 +861,7 @@ impl SessionPlane {
                     attach_id: &attach_id,
                 },
                 &emitter,
-                NormalizeOptions::default(),
+                NormalizeOptions { include_thinking },
                 AttachBackoff::default(),
                 &mut shutdown_rx,
             )
@@ -1321,6 +1328,7 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
             ownership: Arc::new(SelfOwnsAll),
             generation: Arc::new(AtomicU64::new(0)),
             terminal: Arc::new(Mutex::new(HashSet::new())),
+            include_thinking: false,
         };
         let poll_task = spawn_watch_loop(
             Arc::clone(&api),
@@ -1374,6 +1382,17 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
     pub fn with_network(mut self, tls: Option<TlsClient>, token: Option<String>) -> Self {
         self.session.tls = tls;
         self.session.token = token;
+        self.respawn_watch_loop();
+        self
+    }
+
+    /// Include model reasoning/thinking in the streamed output (#212). Off by
+    /// default (volume/privacy). The daemon enables it from
+    /// `PROSPERO_INCLUDE_THINKING` so the dashboard can render a Thinking segment
+    /// for reasoning models.
+    #[must_use]
+    pub fn with_include_thinking(mut self, include: bool) -> Self {
+        self.session.include_thinking = include;
         self.respawn_watch_loop();
         self
     }
@@ -3602,6 +3621,7 @@ mod tests {
             ownership: Arc::new(SelfOwnsAll),
             generation: Arc::new(AtomicU64::new(0)),
             terminal: Arc::new(Mutex::new(HashSet::new())),
+            include_thinking: false,
         };
         let tasks = [ct];
 
@@ -3891,6 +3911,7 @@ mod tests {
             ownership,
             generation: Arc::new(AtomicU64::new(0)),
             terminal: Arc::new(Mutex::new(HashSet::new())),
+            include_thinking: false,
         }
     }
 
@@ -3905,6 +3926,7 @@ mod tests {
             ownership: Arc::new(SelfOwnsAll),
             generation: Arc::new(AtomicU64::new(0)),
             terminal: Arc::new(Mutex::new(HashSet::new())),
+            include_thinking: false,
         }
     }
 
