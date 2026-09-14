@@ -52,8 +52,9 @@ crate ([ADR 0003](./adr/0003-couple-to-caliban-via-ndjson-wire-format.md)).
 conversation into chat. It uses Prospero only through the public HTTP + SSE API
 described in this guide, typically with an `operate`-scoped
 [API token](./api-auth.md). It does not depend on any Prospero crate. Ariel keeps
-its own identity, channel configuration and audit data in gonzalo. Its design is
-tracked in [prospero#67](https://github.com/caliban-ai/prospero/issues/67).
+its own identity, channel configuration and audit data in gonzalo. It is in early
+implementation, tracked in
+[prospero#67](https://github.com/caliban-ai/prospero/issues/67).
 
 ## Where to go next
 

@@ -57,7 +57,7 @@ client and does not depend on the caliban crates.
 - [ariel](https://github.com/caliban-ai/ariel) is a chat bridge for the fleet:
   Discord first, then Slack and Teams. It uses Prospero only through the public
   HTTP + SSE API (no crate dependency) and keeps identity, channel config and
-  audit data in gonzalo. Tracking issue:
+  audit data in gonzalo. It is in early implementation; tracking issue:
   [#67](https://github.com/caliban-ai/prospero/issues/67).
 
 ## Crates
