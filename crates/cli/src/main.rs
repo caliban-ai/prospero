@@ -17,6 +17,14 @@ struct Cli {
     #[arg(long, env = "PROSPERO_ADDR", default_value = "http://127.0.0.1:7878")]
     addr: String,
 
+    /// API token for an authenticated prosperod.
+    #[arg(long, env = "PROSPERO_TOKEN", hide_env_values = true, global = true)]
+    token: Option<String>,
+
+    /// File containing the API token (trailing whitespace trimmed).
+    #[arg(long, env = "PROSPERO_TOKEN_FILE", global = true)]
+    token_file: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -44,6 +52,47 @@ enum Command {
     Send(SendArgs),
     /// Signal end-of-input to an interactive agent (it finishes after).
     EndInput(AgentRef),
+    /// Manage API tokens (offline).
+    #[command(subcommand)]
+    Token(TokenCmd),
+    /// Show which token this CLI is using and its scope.
+    Whoami,
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCmd {
+    /// Generate a new API token and its tokens-file line (does not contact prosperod).
+    New {
+        /// Token name (recorded as the actor on events).
+        name: String,
+        /// Scope: read, operate or admin.
+        #[arg(long, value_parser = parse_scope)]
+        scope: prospero_core::Scope,
+    },
+}
+
+fn parse_scope(s: &str) -> std::result::Result<prospero_core::Scope, String> {
+    prospero_core::Scope::parse(s)
+        .ok_or_else(|| format!("unknown scope '{s}' (read|operate|admin)"))
+}
+
+/// The token to send: `--token-file` wins over `--token`; blank values mean none.
+fn resolve_token(
+    token: Option<String>,
+    token_file: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    if let Some(path) = token_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading token file {}", path.display()))?;
+        let t = raw.trim();
+        if t.is_empty() {
+            anyhow::bail!("token file {} is empty", path.display());
+        }
+        return Ok(Some(t.to_string()));
+    }
+    Ok(token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty()))
 }
 
 #[derive(Debug, Subcommand)]
@@ -144,7 +193,8 @@ struct SendArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = DaemonClient::new(&cli.addr);
+    let token = resolve_token(cli.token.clone(), cli.token_file.as_deref())?;
+    let client = DaemonClient::new(&cli.addr, token);
 
     match cli.command {
         Command::Workspace(WorkspaceCmd::Add { name, root }) => {
@@ -269,6 +319,27 @@ fn main() -> Result<()> {
                 serde_json::Value::Null,
             )?;
             println!("end-input sent to {}", a.id);
+        }
+        Command::Token(TokenCmd::New { name, scope }) => {
+            prospero_core::auth::validate_token_name(&name).map_err(anyhow::Error::msg)?;
+            let token = prospero_core::auth::generate_token();
+            println!("token (shown once): {token}");
+            println!(
+                "tokens-file line:  {}",
+                prospero_core::auth::tokens_file_line(&name, scope, &token)
+            );
+        }
+        Command::Whoami => {
+            let v = client.get_json("/api/session")?;
+            if v["auth"].as_str() == Some("disabled") {
+                println!("authentication is disabled on this prosperod");
+            } else {
+                println!(
+                    "{} ({})",
+                    v["token_name"].as_str().unwrap_or("?"),
+                    v["scope"].as_str().unwrap_or("?")
+                );
+            }
         }
     }
     Ok(())
@@ -554,5 +625,42 @@ mod tests {
             Command::EndInput(a) => assert_eq!(a.id, "ag1"),
             other => panic!("expected end-input, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_new_parses_scope_and_rejects_unknown() {
+        let cli = Cli::parse_from(["prospero", "token", "new", "ci", "--scope", "operate"]);
+        match cli.command {
+            Command::Token(TokenCmd::New { name, scope }) => {
+                assert_eq!(name, "ci");
+                assert_eq!(scope, prospero_core::Scope::Operate);
+            }
+            other => panic!("expected token new, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["prospero", "token", "new", "ci", "--scope", "root"]).is_err()
+        );
+    }
+
+    #[test]
+    fn token_flag_is_global() {
+        let cli = Cli::parse_from(["prospero", "ls", "--token", "pspo_x"]);
+        assert_eq!(cli.token.as_deref(), Some("pspo_x"));
+    }
+
+    #[test]
+    fn resolve_token_prefers_file_and_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t");
+        std::fs::write(&f, "pspo_from_file\n").unwrap();
+        assert_eq!(
+            resolve_token(Some("pspo_flag".into()), Some(&f))
+                .unwrap()
+                .as_deref(),
+            Some("pspo_from_file")
+        );
+        std::fs::write(&f, "  \n").unwrap();
+        assert!(resolve_token(None, Some(&f)).is_err());
+        assert_eq!(resolve_token(Some("  ".into()), None).unwrap(), None);
     }
 }

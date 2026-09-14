@@ -198,6 +198,101 @@ async fn cli_drives_the_full_stack() {
     assert_eq!(cfg["base_url"].as_str(), Some("http://h:9292/v1"));
 }
 
+fn run_cli_env(base: &str, env: &[(&str, &str)], args: &[&str]) -> (bool, String) {
+    let mut cmd = Command::new(PROSPERO_BIN);
+    cmd.env_remove("PROSPERO_TOKEN")
+        .env_remove("PROSPERO_TOKEN_FILE");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd
+        .arg("--addr")
+        .arg(base)
+        .args(args)
+        .output()
+        .expect("running prospero binary");
+    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), combined)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_authenticates_against_an_auth_enabled_daemon() {
+    use prospero_api::auth::{AuthState, SessionKey};
+    use prospero_core::Scope;
+    use prospero_core::auth::{TokenSet, generate_token, tokens_file_line};
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let repo_root = repo_dir.path().canonicalize().unwrap();
+    let env = DiscoveryEnv {
+        caliban_daemon_runtime_dir: Some(runtime_dir.path().to_path_buf()),
+        xdg_runtime_dir: None,
+        tmpdir: None,
+    };
+    let _fake = FakeCaliband::start_at(&control_socket_path(&repo_root, &env))
+        .await
+        .unwrap();
+    let mut config = FleetConfig::new("e2e-auth", data_dir.path());
+    config.discovery_env = env;
+    config.ensure = EnsureConfig {
+        autostart: false,
+        ..EnsureConfig::default()
+    };
+    config.poll_interval = Duration::from_millis(100);
+    let store = Arc::new(JsonlStore::open(data_dir.path()).unwrap());
+    let manager = FleetManager::new(config, store).await.unwrap();
+    manager.add_repo("repo", repo_root).await.unwrap();
+    tokio::spawn(manager.clone().run());
+
+    let ops = generate_token();
+    let tokens = TokenSet::parse(&tokens_file_line("ops", Scope::Operate, &ops)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let local = LocalFleet::new(manager.clone());
+    let app = prospero_api::router_with_auth(
+        Arc::new(local.clone()),
+        Some(Arc::new(local)),
+        manager.store(),
+        manager.bus(),
+        AuthState::enabled(tokens, SessionKey::random(), false),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_health(&base).await;
+
+    let (ok, out) = run_cli_env(&base, &[], &["ls"]);
+    assert!(!ok, "ls without a token must fail: {out}");
+    assert!(out.contains("PROSPERO_TOKEN"), "401 message: {out}");
+
+    let with_token = [("PROSPERO_TOKEN", ops.as_str())];
+    let (ok, out) = run_cli_env(&base, &with_token, &["ls"]);
+    assert!(ok && out.contains("repo"), "ls with token: {out}");
+
+    let (ok, out) = run_cli_env(&base, &with_token, &["whoami"]);
+    assert!(ok && out.contains("ops (operate)"), "whoami: {out}");
+
+    let (ok, out) = run_cli_env(&base, &with_token, &["workspace", "rm", "repo"]);
+    assert!(!ok && out.contains("requires scope admin"), "403: {out}");
+
+    let (ok, out) = run_cli_env(&base, &[], &["token", "new", "ci", "--scope", "read"]);
+    assert!(ok, "token new: {out}");
+    let token = out
+        .lines()
+        .find_map(|l| l.strip_prefix("token (shown once): "))
+        .expect("token line")
+        .trim()
+        .to_string();
+    let line = out
+        .lines()
+        .find_map(|l| l.strip_prefix("tokens-file line:  "))
+        .expect("tokens-file line");
+    let parsed = TokenSet::parse(line).unwrap();
+    assert_eq!(parsed.authenticate(&token).unwrap().name, "ci");
+}
+
 async fn wait_for_health(base: &str) {
     let url = format!("{base}/healthz");
     for _ in 0..100 {
