@@ -2,7 +2,7 @@
 
 - **Ticket:** caliban-ai/prospero#2
 - **Date:** 2026-09-13
-- **Status:** approved design, pending implementation plan
+- **Status:** implemented (plan docs/superpowers/plans/2026-09-13-api-auth.md; see "Amendments during implementation planning")
 - **Decision record:** ADR-0010 (`docs/adr/0010-inbound-api-authentication.md`)
 
 ## Problem

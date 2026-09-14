@@ -25,8 +25,8 @@ count and granularity, so compare the gap themes more than the percentages.
 |---|---|---|---|---|---|---|
 | [OpenClaw](competitors/openclaw/parity-gap-matrix.md) | self-hosted assistant gateway | 23 | 9 | 3 | 8 | 66% |
 | [GitHub Agent HQ](competitors/github-agent-hq/parity-gap-matrix.md) | hosted multi-vendor fleet | 18 | 10 | 8 | 11 | 50% |
-| [Vibe Kanban](competitors/vibe-kanban/parity-gap-matrix.md) | OSS local orchestrator | 10 | 5 | 6 | 5 | 48% |
 | [OpenHands](competitors/openhands/parity-gap-matrix.md) | OSS self-hostable platform | 16 | 6 | 13 | 7 | 46% |
+| [Vibe Kanban](competitors/vibe-kanban/parity-gap-matrix.md) | OSS local orchestrator | 9 | 6 | 6 | 5 | 43% |
 | [Coder](competitors/coder/parity-gap-matrix.md) | self-hosted k8s/HA control plane | 16 | 9 | 13 | 8 | 42% |
 
 **Gaps that recur across competitors** (the strongest prioritization signal):

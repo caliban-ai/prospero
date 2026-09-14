@@ -84,7 +84,7 @@ ADR-0010.
 |---|---|---|
 | Register repos | ✅ | `prospero workspace add <name> <root>` / `POST /api/workspaces` / dashboard `add_workspace` |
 | Heterogeneous agent CLIs (10+: Claude Code, Codex, Gemini CLI, Copilot, …) | 🟡 | Prospero drives **caliban** agents only (ADR-0003 wire coupling), across any model caliban supports. Non-caliban backends 🔴 |
-| Remote access (reverse proxy / SSH / tunnel) | ✅ | `PROSPERO_ADDR` binds any address and the container binds `0.0.0.0` (`docs/container.md`); inbound requests now require a bearer token or session cookie (`crates/api/src/auth/`, ADR-0010, #2), so remote exposure no longer depends solely on a fronting proxy |
+| Remote access (reverse proxy / SSH / tunnel) | 🟡 | `PROSPERO_ADDR` binds any address and the container binds `0.0.0.0` (`docs/container.md`), but Prospero ships no reverse-proxy, SSH, or tunnel mechanism of its own — that's left to the operator's fronting infrastructure. Since #2, an exposed bind at least requires a token (`crates/api/src/auth/`, ADR-0010) |
 
 ## G. Model / provider handling
 
