@@ -216,6 +216,25 @@ fn run_cli_env(base: &str, env: &[(&str, &str)], args: &[&str]) -> (bool, String
     (output.status.success(), combined)
 }
 
+// `token new` is fully offline: it must succeed even when PROSPERO_TOKEN_FILE names
+// a path that doesn't exist (e.g. a stale env var), and it must not touch the
+// network at all — the base URL below is never actually dialed (#2 review finding,
+// round 1: `main` used to resolve --token/--token-file before dispatch, so a bad
+// token file broke this offline command too).
+#[test]
+fn token_new_ignores_an_unreadable_token_file() {
+    let (ok, out) = run_cli_env(
+        "http://127.0.0.1:1",
+        &[("PROSPERO_TOKEN_FILE", "/nonexistent/prospero-token")],
+        &["token", "new", "ci", "--scope", "read"],
+    );
+    assert!(ok, "token new must stay offline: {out}");
+    assert!(
+        out.contains("token (shown once): "),
+        "token line missing: {out}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_authenticates_against_an_auth_enabled_daemon() {
     use prospero_api::auth::{AuthState, SessionKey};

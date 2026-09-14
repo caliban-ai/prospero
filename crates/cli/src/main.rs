@@ -193,6 +193,23 @@ struct SendArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // `token new` is fully offline and needs no credential at all, so it must run
+    // before --token/--token-file are resolved: a stale or unreadable
+    // PROSPERO_TOKEN_FILE must never block it (#2 review finding, round 1).
+    if let Command::Token(TokenCmd::New { name, scope }) = &cli.command {
+        prospero_core::auth::validate_token_name(name).map_err(anyhow::Error::msg)?;
+        let token = prospero_core::auth::generate_token();
+        // These two output prefixes are matched exactly by the e2e test in
+        // tests/e2e_smoke.rs — keep them stable.
+        println!("token (shown once): {token}");
+        println!(
+            "tokens-file line:  {}",
+            prospero_core::auth::tokens_file_line(name, *scope, &token)
+        );
+        return Ok(());
+    }
+
     let token = resolve_token(cli.token.clone(), cli.token_file.as_deref())?;
     let client = DaemonClient::new(&cli.addr, token);
 
@@ -320,15 +337,9 @@ fn main() -> Result<()> {
             )?;
             println!("end-input sent to {}", a.id);
         }
-        Command::Token(TokenCmd::New { name, scope }) => {
-            prospero_core::auth::validate_token_name(&name).map_err(anyhow::Error::msg)?;
-            let token = prospero_core::auth::generate_token();
-            println!("token (shown once): {token}");
-            println!(
-                "tokens-file line:  {}",
-                prospero_core::auth::tokens_file_line(&name, scope, &token)
-            );
-        }
+        // Handled above, before --token/--token-file resolution, so it stays fully
+        // offline regardless of a stale or unreadable token file.
+        Command::Token(_) => unreachable!("token new is handled before client construction"),
         Command::Whoami => {
             let v = client.get_json("/api/session")?;
             if v["auth"].as_str() == Some("disabled") {
