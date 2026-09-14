@@ -65,6 +65,23 @@ impl Ui {
     pub fn request_refresh(&mut self) {
         self.refresh += 1;
     }
+
+    /// Route an API error: a 401 ends the session (back to sign-in); anything
+    /// else is returned for the caller to display.
+    ///
+    /// Central so every control — not just the fleet poll — reacts to an
+    /// expired or revoked session by returning to the sign-in form instead of
+    /// showing the raw `"signed out"` sentinel in a banner or form error.
+    pub fn take_error(&mut self, e: String) -> Option<String> {
+        if e == api::SIGNED_OUT {
+            self.session.set(SessionState::SignedOut(Some(
+                "Your session ended — sign in again.".into(),
+            )));
+            None
+        } else {
+            Some(e)
+        }
+    }
 }
 
 /// Which dialog is open.
@@ -866,7 +883,11 @@ async fn run_action(mut ui: Ui, action: Action) {
             ui.banner.set(None);
             ui.request_refresh();
         }
-        Err(e) => ui.banner.set(Some(e)),
+        Err(e) => {
+            if let Some(msg) = ui.take_error(e) {
+                ui.banner.set(Some(msg));
+            }
+        }
     }
 }
 
@@ -1038,7 +1059,11 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
                     ui.request_refresh();
                     ui.modal.set(Modal::Closed);
                 }
-                Err(e) => error.set(Some(e)),
+                Err(e) => {
+                    if let Some(msg) = ui.take_error(e) {
+                        error.set(Some(msg));
+                    }
+                }
             }
             busy.set(false);
         });
@@ -1214,7 +1239,11 @@ fn AgentInput(agent: Agent) -> Element {
                     ui.banner.set(None);
                     ui.request_refresh();
                 }
-                Err(e) => ui.banner.set(Some(e)),
+                Err(e) => {
+                    if let Some(msg) = ui.take_error(e) {
+                        ui.banner.set(Some(msg));
+                    }
+                }
             }
             busy.set(false);
         });
@@ -1472,7 +1501,11 @@ fn WorkspaceModal(existing: Option<String>) -> Element {
                     ui.request_refresh();
                     ui.modal.set(Modal::Closed);
                 }
-                Err(e) => error.set(Some(e)),
+                Err(e) => {
+                    if let Some(msg) = ui.take_error(e) {
+                        error.set(Some(msg));
+                    }
+                }
             }
             busy.set(false);
         });

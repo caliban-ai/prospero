@@ -143,9 +143,11 @@ fn App() -> Element {
                         });
                     }
                     Err(e) if e == api::SIGNED_OUT => {
-                        ui.session.set(SessionState::SignedOut(Some(
-                            "Your session ended — sign in again.".into(),
-                        )));
+                        // `take_error` sets `SignedOut` with the shared notice
+                        // and returns `None` here (the error is confirmed
+                        // `SIGNED_OUT` by the guard above) — the single place
+                        // that string lives.
+                        ui.take_error(e);
                         load.set(Load::Loading);
                         continue;
                     }
