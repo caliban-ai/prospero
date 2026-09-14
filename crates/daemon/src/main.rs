@@ -131,12 +131,29 @@ struct Args {
     session_key_file: Option<PathBuf>,
 
     /// Serve without authentication on a non-loopback address. Logged loudly.
-    #[arg(long, env = "PROSPERO_INSECURE_NO_AUTH")]
+    ///
+    /// A bare `--insecure-no-auth` flag is still `true` with no value needed;
+    /// the env var also accepts `1`/`0` (not just `true`/`false`) since that's
+    /// what's documented in docs/container.md and the spec.
+    #[arg(
+        long,
+        env = "PROSPERO_INSECURE_NO_AUTH",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     insecure_no_auth: bool,
 
     /// Always mark the session cookie `Secure` (otherwise only when
     /// `X-Forwarded-Proto: https`).
-    #[arg(long, env = "PROSPERO_COOKIE_SECURE")]
+    ///
+    /// Same env-value leniency as `--insecure-no-auth`: `1`/`0` work, not just
+    /// `true`/`false`.
+    #[arg(
+        long,
+        env = "PROSPERO_COOKIE_SECURE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     cookie_secure: bool,
 }
 
@@ -791,6 +808,98 @@ mod tests {
         );
         assert!(parse_key_val("noequals").is_err());
         assert!(parse_key_val("=val").is_err()); // empty key rejected
+    }
+
+    /// clap's `env` support reads real process env at parse time — there's no
+    /// builder-level way to inject a fake environment into `try_parse_from`,
+    /// so these tests mutate `PROSPERO_INSECURE_NO_AUTH` / `PROSPERO_COOKIE_SECURE`
+    /// on the real process. That's racy against any other test touching the
+    /// same vars (in this crate, nothing else does) and across parallel test
+    /// binaries in general, so every test here holds `ENV_LOCK` for the
+    /// duration and an RAII guard restores whatever value (or absence) was
+    /// there before, even on panic.
+    mod bool_env_args {
+        use super::super::Args;
+        use clap::Parser;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        /// Sets (or clears) an env var for the life of the guard, restoring
+        /// whatever was there before on drop.
+        struct EnvVarGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prev = std::env::var(key).ok();
+                // SAFETY: serialized by `ENV_LOCK`, which every test in this
+                // module holds for its whole body.
+                unsafe { std::env::set_var(key, value) };
+                Self { key, prev }
+            }
+
+            fn unset(key: &'static str) -> Self {
+                let prev = std::env::var(key).ok();
+                // SAFETY: see `set`.
+                unsafe { std::env::remove_var(key) };
+                Self { key, prev }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                // SAFETY: see `EnvVarGuard::set`.
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn flag_alone_sets_true_with_no_value() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::unset("PROSPERO_INSECURE_NO_AUTH");
+            let _g2 = EnvVarGuard::unset("PROSPERO_COOKIE_SECURE");
+            let args = Args::try_parse_from(["prosperod", "--insecure-no-auth"]).unwrap();
+            assert!(args.insecure_no_auth);
+            assert!(!args.cookie_secure);
+        }
+
+        #[test]
+        fn absent_flag_and_env_defaults_to_false() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::unset("PROSPERO_INSECURE_NO_AUTH");
+            let _g2 = EnvVarGuard::unset("PROSPERO_COOKIE_SECURE");
+            let args = Args::try_parse_from(["prosperod"]).unwrap();
+            assert!(!args.insecure_no_auth);
+            assert!(!args.cookie_secure);
+        }
+
+        #[test]
+        fn env_var_equal_1_is_true() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::set("PROSPERO_INSECURE_NO_AUTH", "1");
+            let _g2 = EnvVarGuard::set("PROSPERO_COOKIE_SECURE", "1");
+            let args = Args::try_parse_from(["prosperod"]).unwrap();
+            assert!(args.insecure_no_auth);
+            assert!(args.cookie_secure);
+        }
+
+        #[test]
+        fn env_var_equal_0_or_false_is_false() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::set("PROSPERO_INSECURE_NO_AUTH", "0");
+            let _g2 = EnvVarGuard::set("PROSPERO_COOKIE_SECURE", "false");
+            let args = Args::try_parse_from(["prosperod"]).unwrap();
+            assert!(!args.insecure_no_auth);
+            assert!(!args.cookie_secure);
+        }
     }
 
     mod auth {
