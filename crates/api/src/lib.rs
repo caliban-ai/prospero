@@ -5,6 +5,7 @@
 //! (replay-then-tail); and a static dashboard. The CLI and the browser both
 //! talk to this one surface.
 
+pub mod auth;
 pub mod dashboard;
 pub mod dto;
 pub mod error;
@@ -34,21 +35,26 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     /// Shared event bus — SSE subscribe routes here.
     pub bus: Arc<dyn EventBus>,
+    /// Inbound auth configuration (#2).
+    pub auth: Arc<auth::AuthState>,
 }
 
 /// Build the application router over the backend seams (constructed once, at the
 /// daemon's composition edge — see `prospero-daemon`'s `main.rs`).
-pub fn router(
+pub fn router_with_auth(
     fleet: Arc<dyn FleetProvider>,
     admin: Option<Arc<dyn FleetAdmin>>,
     store: Arc<dyn Store>,
     bus: Arc<dyn EventBus>,
+    auth: auth::AuthState,
 ) -> Router {
+    let auth = Arc::new(auth);
     let state = AppState {
         fleet,
         admin,
         store,
         bus,
+        auth: auth.clone(),
     };
     Router::new()
         // The dashboard (Dioxus/WASM, #97) is the only UI: the document at
@@ -64,6 +70,12 @@ pub fn router(
         .route("/assets/{*path}", get(dashboard::asset))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
+        .route(
+            "/api/session",
+            get(auth::handlers::get_session)
+                .post(auth::handlers::post_session)
+                .delete(auth::handlers::delete_session),
+        )
         .route("/api/metrics", get(handlers::get_metrics))
         .route("/api/capabilities", get(handlers::get_capabilities))
         // Fleet + workspaces.
@@ -96,5 +108,16 @@ pub fn router(
             "/api/agents/{id}/end-input",
             post(handlers::agent_end_input),
         )
+        .route_layer(axum::middleware::from_fn_with_state(auth, auth::middleware))
         .with_state(state)
+}
+
+/// Build the router with authentication disabled (tests, loopback dev).
+pub fn router(
+    fleet: Arc<dyn FleetProvider>,
+    admin: Option<Arc<dyn FleetAdmin>>,
+    store: Arc<dyn Store>,
+    bus: Arc<dyn EventBus>,
+) -> Router {
+    router_with_auth(fleet, admin, store, bus, auth::AuthState::disabled())
 }

@@ -181,3 +181,59 @@ async fn add_workspace_with_empty_config_is_400_not_422() {
     let status = status_of(app, "POST", "/api/workspaces", r#"{"name":"empty"}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn k8s_backend_enforces_auth_and_scopes() {
+    use prospero_api::auth::{AuthState, SessionKey};
+    use prospero_api::router_with_auth;
+    use prospero_core::Scope;
+    use prospero_core::auth::{TokenSet, generate_token, tokens_file_line};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(JsonlStore::open(dir.path()).unwrap());
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessBus::new(64));
+    let fleet: Arc<dyn FleetProvider> =
+        Arc::new(K8sFleet::new(FakeK8s::new(), bus.clone(), store.clone()));
+    let viewer = generate_token();
+    let tokens = TokenSet::parse(&tokens_file_line("viewer", Scope::Read, &viewer)).unwrap();
+    let app = router_with_auth(
+        fleet,
+        None,
+        store,
+        bus,
+        AuthState::enabled(tokens, SessionKey::random(), false),
+    );
+
+    let get = |token: Option<&str>| {
+        let mut b = Request::builder().uri("/api/fleet");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(get(None)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(Some(&viewer)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let spawn = Request::builder()
+        .method("POST")
+        .uri("/api/workspaces/k8s/agents")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {viewer}"))
+        .body(Body::from(r#"{"prompt":"p"}"#))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(spawn).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    drop(dir);
+}

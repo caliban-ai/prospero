@@ -299,6 +299,7 @@ mod tests {
             ts: "t".into(),
             repo: "r".into(),
             agent_id: agent.into(),
+            actor: None,
             kind: EventKind::Output {
                 stream: OutputStream::Stdout,
                 chunk: chunk.into(),

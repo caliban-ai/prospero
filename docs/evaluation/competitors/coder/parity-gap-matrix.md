@@ -27,7 +27,9 @@ only when a production call path reaches the capability.
 
 **Last refreshed:** 2026-09-13 (initial capture. Coder surface from
 [`capability-inventory.md`](capability-inventory.md) snapshot 2026-09-13,
-v2.37.0; Prospero state verified against the code on the same date).
+v2.37.0; Prospero state verified against the code on the same date). Auth row
+refreshed 2026-09-13 for #2 — token auth shipped, `crates/api/src/auth/`,
+ADR-0010.
 
 > **Caveat:** rows tagged **⚠** depend on a Coder fact flagged uncertain in the
 > inventory (Premium gating, hooks, cost reporting) or a Prospero detail inferred
@@ -116,7 +118,7 @@ v2.37.0; Prospero state verified against the code on the same date).
 
 | Capability (Coder) | Prospero | Notes |
 |---|---|---|
-| Authenticated API | 🔴 | no authn/authz on REST/SSE (`crates/api/src`; #2) |
+| Authenticated API | 🟡 | named bearer tokens with `read`/`operate`/`admin` scopes guard every inbound route (`crates/api/src/auth/`, ADR-0010, #2); still no per-user identity or RBAC — see the rows below |
 | User identity on every agent action | 🔴 | no user model; agents are owned by workspaces, not people |
 | RBAC / per-template access control | 🔴 | none |
 | Multi-replica HA on shared Postgres | ✅ | clustered mode: N `prosperod` replicas, Postgres store + LISTEN/NOTIFY bus + leased single-writer ownership (`crates/core/src/leased_ownership.rs`); soak/failover test still open (#65) |
@@ -136,9 +138,10 @@ v2.37.0; Prospero state verified against the code on the same date).
 ## Read: same deployment shape, opposite agent placement
 
 - **Coder is a multi-user platform; Prospero is a single-operator control
-  plane.** The widest gap is not orchestration at all — it is identity: auth,
-  per-user ownership, RBAC, and a credential boundary. Coder attaches a user to
-  every agent action; Prospero has no user and no API auth.
+  plane.** The widest remaining gap is identity: per-user ownership, RBAC, and
+  a credential boundary. Coder attaches a user to every agent action; Prospero
+  now authenticates callers with named tokens (#2) but still has no per-user
+  identity.
 - **Coder moved the agent into the control plane; Prospero keeps it in the
   worker.** Coder's loop runs in `coderd` so credentials never reach a
   workspace. Prospero's wire-only coupling to caliban (ADR-0003) is what lets it
@@ -152,8 +155,9 @@ v2.37.0; Prospero state verified against the code on the same date).
 
 ## Prospero-distinctive gaps worth a ticket
 
-1. **API auth + a user identity on agent actions** (I) — the prerequisite for
-   everything multi-user; #2 covers the auth half.
+1. **User identity + RBAC on agent actions** (I) — #2 shipped token auth; the
+   remaining prerequisite for multi-user is attaching a person (not just a
+   token) to every action, plus RBAC/per-template access control.
 2. **Fleet-wide watch stream** (D) — one SSE stream of status changes across the
    fleet, replacing snapshot polling in the dashboard and future Ariel
    notifications.

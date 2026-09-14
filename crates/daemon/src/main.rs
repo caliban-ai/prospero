@@ -119,6 +119,42 @@ struct Args {
     /// of the lease TTL.
     #[arg(long)]
     heartbeat_interval_ms: Option<u64>,
+
+    /// Tokens file (`<name> <scope> sha256:<hex>` per line). When set, every
+    /// non-probe request needs a token (#2, ADR-0010).
+    #[arg(long, env = "PROSPERO_API_TOKENS_FILE")]
+    api_tokens_file: Option<PathBuf>,
+
+    /// Session-cookie HMAC key file (≥ 32 bytes). Required when clustered with
+    /// tokens; standalone generates a random key per process.
+    #[arg(long, env = "PROSPERO_SESSION_KEY_FILE")]
+    session_key_file: Option<PathBuf>,
+
+    /// Serve without authentication on a non-loopback address. Logged loudly.
+    ///
+    /// A bare `--insecure-no-auth` flag is still `true` with no value needed;
+    /// the env var also accepts `1`/`0` (not just `true`/`false`) since that's
+    /// what's documented in docs/container.md and the spec.
+    #[arg(
+        long,
+        env = "PROSPERO_INSECURE_NO_AUTH",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    insecure_no_auth: bool,
+
+    /// Always mark the session cookie `Secure` (otherwise only when
+    /// `X-Forwarded-Proto: https`).
+    ///
+    /// Same env-value leniency as `--insecure-no-auth`: `1`/`0` work, not just
+    /// `true`/`false`.
+    #[arg(
+        long,
+        env = "PROSPERO_COOKIE_SECURE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    cookie_secure: bool,
 }
 
 /// Parse a `KEY=VALUE` pair (value may contain further `=`).
@@ -160,6 +196,49 @@ fn read_token_file(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading session-plane token file {}", path.display()))?;
     Ok(raw.trim_end().to_string())
+}
+
+/// Decide the API authentication mode, refusing unsafe combinations before any
+/// side effects (#2, ADR-0010).
+fn resolve_auth(
+    addr: SocketAddr,
+    clustered: bool,
+    tokens_file: Option<&Path>,
+    session_key_file: Option<&Path>,
+    insecure_no_auth: bool,
+    cookie_secure: bool,
+) -> anyhow::Result<prospero_api::auth::AuthState> {
+    use prospero_api::auth::{AuthState, SessionKey};
+
+    let Some(tokens_path) = tokens_file else {
+        if !addr.ip().is_loopback() && !insecure_no_auth {
+            anyhow::bail!(
+                "refusing to bind {addr} without authentication: set --api-tokens-file / \
+                 PROSPERO_API_TOKENS_FILE, or pass --insecure-no-auth to run unauthenticated"
+            );
+        }
+        return Ok(AuthState::disabled());
+    };
+    if insecure_no_auth {
+        anyhow::bail!("--insecure-no-auth cannot be combined with --api-tokens-file");
+    }
+    let tokens = prospero_core::auth::TokenSet::load(tokens_path)?;
+    let session_key = match session_key_file {
+        Some(path) => {
+            let raw = std::fs::read(path)
+                .with_context(|| format!("reading session key file {}", path.display()))?;
+            let trimmed = raw.trim_ascii_end().to_vec();
+            SessionKey::from_bytes(trimmed)
+                .map_err(|e| anyhow::anyhow!("session key file {}: {e}", path.display()))?
+        }
+        None if clustered => anyhow::bail!(
+            "clustered prosperod (PROSPERO_DATABASE_URL) with API tokens needs \
+             --session-key-file / PROSPERO_SESSION_KEY_FILE so every replica signs \
+             sessions with the same key"
+        ),
+        None => SessionKey::random(),
+    };
+    Ok(AuthState::enabled(tokens, session_key, cookie_secure))
 }
 
 /// Build client-side session-plane TLS from a CA file, when one is configured.
@@ -260,6 +339,34 @@ async fn main() -> anyhow::Result<()> {
              (`cargo build -p prospero-daemon --features k8s`)."
         );
     }
+
+    let auth = resolve_auth(
+        args.addr,
+        args.database_url.is_some(),
+        args.api_tokens_file.as_deref(),
+        args.session_key_file.as_deref(),
+        args.insecure_no_auth,
+        args.cookie_secure,
+    )?;
+    if args.insecure_no_auth {
+        let addr = args.addr;
+        let warn = move || {
+            tracing::warn!(
+                target: "prosperod", %addr,
+                "authentication DISABLED (--insecure-no-auth): anyone who can reach this address controls the fleet"
+            )
+        };
+        warn();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                warn();
+            }
+        });
+    }
+    let auth_enabled = auth.is_enabled();
 
     let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)
@@ -533,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = prospero_api::router(fleet, admin, store.clone(), bus.clone());
+    let app = prospero_api::router_with_auth(fleet, admin, store.clone(), bus.clone(), auth);
     let listener = tokio::net::TcpListener::bind(args.addr)
         .await
         .with_context(|| format!("binding {}", args.addr))?;
@@ -541,6 +648,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         addr = %args.addr,
         data_dir = %data_dir.display(),
+        auth = auth_enabled,
         "prosperod listening"
     );
 
@@ -700,5 +808,204 @@ mod tests {
         );
         assert!(parse_key_val("noequals").is_err());
         assert!(parse_key_val("=val").is_err()); // empty key rejected
+    }
+
+    /// clap's `env` support reads real process env at parse time — there's no
+    /// builder-level way to inject a fake environment into `try_parse_from`,
+    /// so these tests mutate `PROSPERO_INSECURE_NO_AUTH` / `PROSPERO_COOKIE_SECURE`
+    /// on the real process. That's racy against any other test touching the
+    /// same vars (in this crate, nothing else does) and across parallel test
+    /// binaries in general, so every test here holds `ENV_LOCK` for the
+    /// duration and an RAII guard restores whatever value (or absence) was
+    /// there before, even on panic.
+    mod bool_env_args {
+        use super::super::Args;
+        use clap::Parser;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        /// Sets (or clears) an env var for the life of the guard, restoring
+        /// whatever was there before on drop.
+        struct EnvVarGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prev = std::env::var(key).ok();
+                // SAFETY: serialized by `ENV_LOCK`, which every test in this
+                // module holds for its whole body.
+                unsafe { std::env::set_var(key, value) };
+                Self { key, prev }
+            }
+
+            fn unset(key: &'static str) -> Self {
+                let prev = std::env::var(key).ok();
+                // SAFETY: see `set`.
+                unsafe { std::env::remove_var(key) };
+                Self { key, prev }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                // SAFETY: see `EnvVarGuard::set`.
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn flag_alone_sets_true_with_no_value() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::unset("PROSPERO_INSECURE_NO_AUTH");
+            let _g2 = EnvVarGuard::unset("PROSPERO_COOKIE_SECURE");
+            let args = Args::try_parse_from(["prosperod", "--insecure-no-auth"]).unwrap();
+            assert!(args.insecure_no_auth);
+            assert!(!args.cookie_secure);
+        }
+
+        #[test]
+        fn absent_flag_and_env_defaults_to_false() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::unset("PROSPERO_INSECURE_NO_AUTH");
+            let _g2 = EnvVarGuard::unset("PROSPERO_COOKIE_SECURE");
+            let args = Args::try_parse_from(["prosperod"]).unwrap();
+            assert!(!args.insecure_no_auth);
+            assert!(!args.cookie_secure);
+        }
+
+        #[test]
+        fn env_var_equal_1_is_true() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::set("PROSPERO_INSECURE_NO_AUTH", "1");
+            let _g2 = EnvVarGuard::set("PROSPERO_COOKIE_SECURE", "1");
+            let args = Args::try_parse_from(["prosperod"]).unwrap();
+            assert!(args.insecure_no_auth);
+            assert!(args.cookie_secure);
+        }
+
+        #[test]
+        fn env_var_equal_0_or_false_is_false() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _g1 = EnvVarGuard::set("PROSPERO_INSECURE_NO_AUTH", "0");
+            let _g2 = EnvVarGuard::set("PROSPERO_COOKIE_SECURE", "false");
+            let args = Args::try_parse_from(["prosperod"]).unwrap();
+            assert!(!args.insecure_no_auth);
+            assert!(!args.cookie_secure);
+        }
+    }
+
+    mod auth {
+        use super::super::resolve_auth;
+        use prospero_core::Scope;
+        use prospero_core::auth::{generate_token, tokens_file_line};
+        use std::net::SocketAddr;
+        use std::path::PathBuf;
+
+        fn loopback() -> SocketAddr {
+            "127.0.0.1:7878".parse().unwrap()
+        }
+        fn public() -> SocketAddr {
+            "0.0.0.0:7878".parse().unwrap()
+        }
+        fn write(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, contents).unwrap();
+            p
+        }
+        fn tokens(dir: &std::path::Path) -> PathBuf {
+            write(
+                dir,
+                "tokens",
+                &tokens_file_line("root", Scope::Admin, &generate_token()),
+            )
+        }
+        fn msg(e: anyhow::Error) -> String {
+            format!("{e:#}")
+        }
+
+        #[test]
+        fn loopback_without_tokens_runs_with_auth_disabled() {
+            let a = resolve_auth(loopback(), false, None, None, false, false).unwrap();
+            assert!(!a.is_enabled());
+        }
+
+        #[test]
+        fn public_bind_without_tokens_is_refused_unless_insecure() {
+            let e = msg(resolve_auth(public(), false, None, None, false, false).unwrap_err());
+            assert!(
+                e.contains("--api-tokens-file") && e.contains("--insecure-no-auth"),
+                "{e}"
+            );
+            let a = resolve_auth(public(), false, None, None, true, false).unwrap();
+            assert!(!a.is_enabled());
+        }
+
+        #[test]
+        fn tokens_enable_auth_and_standalone_needs_no_key_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let a = resolve_auth(
+                public(),
+                false,
+                Some(&tokens(dir.path())),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(a.is_enabled());
+        }
+
+        #[test]
+        fn clustered_tokens_require_a_session_key_of_32_bytes() {
+            let dir = tempfile::tempdir().unwrap();
+            let t = tokens(dir.path());
+            let e = msg(resolve_auth(public(), true, Some(&t), None, false, false).unwrap_err());
+            assert!(e.contains("--session-key-file"), "{e}");
+            let short = write(dir.path(), "short", "too-short\n");
+            let e = msg(
+                resolve_auth(public(), true, Some(&t), Some(&short), false, false).unwrap_err(),
+            );
+            assert!(e.contains("at least 32 bytes"), "{e}");
+            let good = write(dir.path(), "key", &format!("{}\n", "k".repeat(48)));
+            assert!(
+                resolve_auth(public(), true, Some(&t), Some(&good), false, false)
+                    .unwrap()
+                    .is_enabled()
+            );
+        }
+
+        #[test]
+        fn malformed_or_missing_tokens_file_is_fatal() {
+            let dir = tempfile::tempdir().unwrap();
+            let bad = write(dir.path(), "bad", "root admin sha256:nothex\n");
+            let e =
+                msg(resolve_auth(loopback(), false, Some(&bad), None, false, false).unwrap_err());
+            assert!(e.contains("line 1"), "{e}");
+            let missing = dir.path().join("nope");
+            assert!(resolve_auth(loopback(), false, Some(&missing), None, false, false).is_err());
+        }
+
+        #[test]
+        fn insecure_flag_conflicts_with_tokens() {
+            let dir = tempfile::tempdir().unwrap();
+            let e = msg(resolve_auth(
+                public(),
+                false,
+                Some(&tokens(dir.path())),
+                None,
+                true,
+                false,
+            )
+            .unwrap_err());
+            assert!(e.contains("cannot be combined"), "{e}");
+        }
     }
 }

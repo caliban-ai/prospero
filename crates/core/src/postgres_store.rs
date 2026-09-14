@@ -20,6 +20,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (\
     repo       TEXT NOT NULL,\
     agent_id   TEXT NOT NULL,\
     kind       TEXT NOT NULL,\
+    actor      TEXT,\
     UNIQUE(stream_key, seq)\
 )";
 
@@ -33,6 +34,26 @@ impl PostgresStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = crate::pg::connect(url).await?;
         crate::pg::ensure_schema(&pool, SCHEMA, "events table").await?;
+        // `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an ACCESS EXCLUSIVE
+        // lock even when the column already exists (the common case on every
+        // boot after the first), so probe first and only run the ALTER when
+        // it's actually missing. Mirrors SqliteStore::open's probe-then-ALTER.
+        let has_actor: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'events' AND column_name = 'actor' \
+             AND table_schema = current_schema())",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("inspecting postgres schema: {e}")))?;
+        if !has_actor {
+            crate::pg::ensure_schema(
+                &pool,
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS actor TEXT",
+                "events.actor column",
+            )
+            .await?;
+        }
         Ok(Self { pool })
     }
 
@@ -52,8 +73,8 @@ impl Store for PostgresStore {
     async fn append(&self, event: &FleetEvent) -> Result<()> {
         let kind = serde_json::to_string(&event.kind)?;
         sqlx::query(
-            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind, actor) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(event.stream_key())
         .bind(event.seq as i64)
@@ -61,6 +82,7 @@ impl Store for PostgresStore {
         .bind(&event.repo)
         .bind(&event.agent_id)
         .bind(kind)
+        .bind(&event.actor)
         .execute(&self.pool)
         .await
         .map_err(map_append_error)?;
@@ -69,7 +91,7 @@ impl Store for PostgresStore {
 
     async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         let rows = sqlx::query(
-            "SELECT seq, ts, repo, agent_id, kind FROM events \
+            "SELECT seq, ts, repo, agent_id, kind, actor FROM events \
              WHERE stream_key = $1 AND seq >= $2 ORDER BY seq",
         )
         .bind(stream_key)
@@ -86,12 +108,14 @@ impl Store for PostgresStore {
             let repo: String = row.try_get("repo").map_err(decode)?;
             let agent_id: String = row.try_get("agent_id").map_err(decode)?;
             let kind_json: String = row.try_get("kind").map_err(decode)?;
+            let actor: Option<String> = row.try_get("actor").map_err(decode)?;
             events.push(FleetEvent {
                 seq: seq as u64,
                 ts,
                 repo,
                 agent_id,
                 kind: serde_json::from_str(&kind_json)?,
+                actor,
             });
         }
         Ok(events)

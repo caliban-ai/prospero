@@ -7,7 +7,9 @@
 //! what keeps the parts where bugs actually hide under test without a headless
 //! browser.
 
-use prospero_types::{Agent, AgentStatus, FleetSnapshot, Workspace, WorkspaceHealth};
+use prospero_types::{
+    Agent, AgentStatus, FleetSnapshot, Scope, SessionInfo, Workspace, WorkspaceHealth,
+};
 
 /// How a set of agents is distributed across lifecycle states.
 ///
@@ -293,10 +295,77 @@ pub fn basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Where the dashboard is in the sign-in flow (#2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionState {
+    /// `GET /api/session` in flight.
+    Checking,
+    /// No valid session; the optional notice explains why (e.g. expiry).
+    SignedOut(Option<String>),
+    /// Signed in, or auth disabled on the server.
+    SignedIn(SessionInfo),
+}
+
+/// Whether the current session may perform an action needing `need`. The
+/// server enforces scopes; this only hides controls that would 403.
+pub fn permits(state: &SessionState, need: Scope) -> bool {
+    match state {
+        SessionState::SignedIn(SessionInfo::Disabled) => true,
+        SessionState::SignedIn(SessionInfo::Token { scope, .. }) => *scope >= need,
+        SessionState::Checking | SessionState::SignedOut(_) => false,
+    }
+}
+
+/// Header label for a token session, e.g. `"alice · admin"`.
+pub fn session_label(state: &SessionState) -> Option<String> {
+    match state {
+        SessionState::SignedIn(SessionInfo::Token {
+            token_name, scope, ..
+        }) => Some(format!("{token_name} · {}", scope.as_str())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use prospero_types::{Agent, AgentStatus, FleetSnapshot, Workspace, WorkspaceHealth};
+    use prospero_types::{Scope, SessionInfo};
+
+    fn signed_in(scope: Scope) -> SessionState {
+        SessionState::SignedIn(SessionInfo::Token {
+            token_name: "t".into(),
+            scope,
+            expires_at: None,
+        })
+    }
+
+    #[test]
+    fn permits_follows_scope_and_disabled_auth() {
+        assert!(permits(
+            &SessionState::SignedIn(SessionInfo::Disabled),
+            Scope::Admin
+        ));
+        assert!(permits(&signed_in(Scope::Operate), Scope::Read));
+        assert!(permits(&signed_in(Scope::Operate), Scope::Operate));
+        assert!(!permits(&signed_in(Scope::Operate), Scope::Admin));
+        assert!(!permits(&signed_in(Scope::Read), Scope::Operate));
+        assert!(!permits(&SessionState::SignedOut(None), Scope::Read));
+        assert!(!permits(&SessionState::Checking, Scope::Read));
+    }
+
+    #[test]
+    fn session_label_names_token_and_scope_only_when_signed_in_with_a_token() {
+        assert_eq!(
+            session_label(&signed_in(Scope::Admin)).as_deref(),
+            Some("t · admin")
+        );
+        assert_eq!(
+            session_label(&SessionState::SignedIn(SessionInfo::Disabled)),
+            None
+        );
+        assert_eq!(session_label(&SessionState::Checking), None);
+    }
 
     fn agent(id: &str, status: AgentStatus) -> Agent {
         Agent {

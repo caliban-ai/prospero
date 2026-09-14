@@ -578,6 +578,7 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
         repo: "repo".to_string(),
         agent_id: "agent001".to_string(),
         kind,
+        actor: None,
     };
     store
         .append(&ev(
@@ -660,6 +661,7 @@ async fn usage_endpoint_aggregates_cost_and_outcomes_by_workspace() {
         repo: "repo".to_string(),
         agent_id: agent.to_string(),
         kind,
+        actor: None,
     };
 
     store
@@ -1372,6 +1374,25 @@ async fn dashboard_unknown_asset_is_404_not_a_panic() {
     // Path traversal cannot escape a static table, but prove it 404s.
     let (status, _, _) = head_of(&h, "/assets/../Cargo.toml").await;
     assert_ne!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn spawn_inside_an_actor_scope_stamps_agent_spawned() {
+    let h = setup().await;
+    let id = prospero_core::actor::scope(Some("alice".into()), async {
+        h.manager
+            .spawn_agent("repo", prospero_core::SpawnRequest::new("do it"))
+            .await
+            .unwrap()
+    })
+    .await;
+    let key = prospero_core::event::stream_key_for("repo", &id);
+    let events = h.manager.store().replay(&key, 0).await.unwrap();
+    let spawned = events
+        .iter()
+        .find(|e| matches!(e.kind, prospero_core::EventKind::AgentSpawned))
+        .expect("AgentSpawned persisted");
+    assert_eq!(spawned.actor.as_deref(), Some("alice"));
 }
 
 /// Fetch `uri` and return its body as a string.

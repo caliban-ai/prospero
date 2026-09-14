@@ -25,14 +25,16 @@ pub(crate) async fn connect(url: &str) -> Result<PgPool> {
 /// codes — a duplicate-key error on a `pg_*` catalog index (e.g.
 /// `pg_type_typname_nsp_index`, SQLSTATE `23505` unique_violation), `42P07`
 /// duplicate_table, or `42710` duplicate_object for the table's implicit
-/// row-type. All three mean the object now exists, which is exactly what we
-/// wanted, so treat them as success and fail only on a genuine error.
+/// row-type. `42701` (duplicate_column) is the concurrent-boot race on
+/// `ADD COLUMN IF NOT EXISTS`. All four mean the object now exists, which is
+/// exactly what we wanted, so treat them as success and fail only on a
+/// genuine error.
 pub(crate) async fn ensure_schema(pool: &PgPool, ddl: &str, what: &str) -> Result<()> {
     if let Err(e) = sqlx::query(ddl).execute(pool).await {
         let benign = e
             .as_database_error()
             .and_then(|db| db.code())
-            .map(|code| matches!(code.as_ref(), "23505" | "42P07" | "42710"))
+            .map(|code| matches!(code.as_ref(), "23505" | "42P07" | "42710" | "42701"))
             .unwrap_or(false);
         if !benign {
             return Err(CoreError::Store(format!("creating {what}: {e}")));

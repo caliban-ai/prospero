@@ -29,7 +29,9 @@ capability.
 
 **Last refreshed:** 2026-09-13 (initial capture. OpenHands surface from
 [`capability-inventory.md`](capability-inventory.md) snapshot 2026-09-13,
-v1.18.0; Prospero state verified against the code on the same date).
+v1.18.0; Prospero state verified against the code on the same date). Auth row
+refreshed 2026-09-13 for #2 — token auth shipped, `crates/api/src/auth/`,
+ADR-0010.
 
 > **Caveat:** rows tagged **⚠** depend on an OpenHands fact still flagged
 > uncertain in the inventory or a Prospero detail not re-verified against the
@@ -115,7 +117,7 @@ v1.18.0; Prospero state verified against the code on the same date).
 
 | Capability (OpenHands) | Prospero | Notes |
 |---|---|---|
-| API-key auth on the execution server, with rotation | 🔴 | no authn/authz on the REST/SSE API (`crates/api/src`; #2). Prospero → caliband traffic carries TLS + a bearer token (`crates/core/src/caliband/transport.rs`), but inbound clients are unguarded |
+| API-key auth on the execution server, with rotation | ✅ | named bearer tokens, hashed at rest and checked by axum middleware on every inbound route (`crates/api/src/auth/`, ADR-0010, #2); rotation is edit-the-tokens-file-and-restart, not a live API. Prospero → caliband traffic separately carries TLS + a bearer token (`crates/core/src/caliband/transport.rs`) |
 | Encrypted secrets at rest | 🟡 | k8s providers reference Kubernetes Secrets rather than holding keys (`crates/types/src/model.rs`). ⚠ local-fleet provider env storage is not encrypted by Prospero |
 | SSO / RBAC / audit logs (Enterprise) | 🔴 | none; identity and audit records are planned in gonzalo (#277 / #278), not shipped |
 | Budget controls (Enterprise) | 🔴 | usage is reported (`/api/usage`) but not enforced |
@@ -141,10 +143,10 @@ v1.18.0; Prospero state verified against the code on the same date).
   leased ownership, age-based retention, and a Kubernetes fleet provider.
   OpenHands documents none of retention, HA, or self-hosted Kubernetes outside
   Enterprise (all ⚠ in the inventory).
-- **Governance is paywalled on their side and missing on ours.** SSO, RBAC,
-  audit, and budgets are OpenHands Enterprise features; Prospero has none of
-  them, and even the open-source OpenHands server has API keys where Prospero
-  has nothing.
+- **Governance is paywalled on their side and partial on ours.** SSO, RBAC,
+  audit, and budgets are OpenHands Enterprise features; Prospero now has
+  named-token auth of its own (#2), but no per-user identity, SSO, RBAC, or
+  budget enforcement.
 
 ## Prospero-distinctive gaps worth a ticket
 
@@ -154,13 +156,11 @@ control plane:
 1. **Heterogeneous worker backends** (F) — ACP is now a real, documented way to
    drive Claude Code, Codex, and Gemini CLI. An ACP adapter behind Prospero's
    fleet model would close the biggest category gap.
-2. **Control-plane API auth** (I) — #2. OpenHands' session API keys with
-   rotation are a small, concrete reference design.
-3. **Automations** (B) — scheduled and webhook-triggered spawns with tracked
+2. **Automations** (B) — scheduled and webhook-triggered spawns with tracked
    run states.
-4. **Multi-host aggregation** (F) — #1; OpenHands does it client-side with a
+3. **Multi-host aggregation** (F) — #1; OpenHands does it client-side with a
    backend switcher, a cheaper model than a server-side relay.
-5. **OpenAPI spec** (E) — low effort, and it makes the API usable by
+4. **OpenAPI spec** (E) — low effort, and it makes the API usable by
    third-party clients (including Ariel).
 
 ---

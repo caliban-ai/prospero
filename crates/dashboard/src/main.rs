@@ -24,7 +24,10 @@ mod timeline;
 mod ui;
 mod view_model;
 
-use ui::{Banner, ErrorState, Freshness, LoadingState, Modal, ModalHost, Overview, Shell, Ui};
+use ui::{
+    Banner, ErrorState, Freshness, LoadingState, Modal, ModalHost, Overview, Shell, SignIn, Ui,
+};
+use view_model::SessionState;
 
 /// How often to re-poll `/api/fleet`. Per-agent SSE arrives with the stream
 /// viewer in a follow-on ticket; the overview only needs coarse freshness.
@@ -83,16 +86,22 @@ fn App() -> Element {
         selected: Signal::new(None),
         now_ms: Signal::new(now_ms()),
         activity: Signal::new(0),
+        session: Signal::new(SessionState::Checking),
     });
 
-    // Capabilities are fixed for the process lifetime — fetch once. A failure
-    // is deliberately not surfaced: the conservative default already hides the
-    // controls, and a banner here would be noise on a page that otherwise works.
+    // Resolve the sign-in state once on mount. Capabilities load once signed
+    // in, from the fleet poll loop below, so the admin plane is never probed
+    // for an operator who is not (yet) authenticated.
     use_future(move || {
         let mut ui = ui;
         async move {
-            if let Ok(caps) = api::fetch_capabilities().await {
-                ui.caps.set(caps);
+            match api::fetch_session().await {
+                Ok(info) => ui.session.set(SessionState::SignedIn(info)),
+                Err(e) if e == api::SIGNED_OUT => ui.session.set(SessionState::SignedOut(None)),
+                // Unreachable server: let the fleet poll surface the error.
+                Err(_) => ui.session.set(SessionState::SignedIn(
+                    prospero_types::SessionInfo::Disabled,
+                )),
             }
         }
     });
@@ -111,7 +120,16 @@ fn App() -> Element {
             // changes state).
             let mut last_key: Option<u64> = None;
             let mut ticks: u32 = 0;
+            let mut caps_loaded = false;
             loop {
+                if !matches!(*ui.session.peek(), SessionState::SignedIn(_)) {
+                    gloo_timers::future::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+                if !caps_loaded && let Ok(caps) = api::fetch_capabilities().await {
+                    ui.caps.set(caps);
+                    caps_loaded = true;
+                }
                 match api::fetch_fleet().await {
                     Ok(snapshot) => {
                         let key = view_model::activity_key(&snapshot);
@@ -123,6 +141,15 @@ fn App() -> Element {
                             snapshot: Box::new(snapshot),
                             error: None,
                         });
+                    }
+                    Err(e) if e == api::SIGNED_OUT => {
+                        // `take_error` sets `SignedOut` with the shared notice
+                        // and returns `None` here (the error is confirmed
+                        // `SIGNED_OUT` by the guard above) — the single place
+                        // that string lives.
+                        ui.take_error(e);
+                        load.set(Load::Loading);
+                        continue;
                     }
                     Err(e) => {
                         let next = match load.peek().clone() {
@@ -154,6 +181,20 @@ fn App() -> Element {
             }
         }
     });
+
+    match ui.session.read().clone() {
+        SessionState::Checking => {
+            return rsx! {
+                Shell { host: "connecting…".to_string(), freshness: Freshness::Live, LoadingState {} }
+            };
+        }
+        SessionState::SignedOut(notice) => {
+            return rsx! {
+                Shell { host: "signed out".to_string(), freshness: Freshness::Live, SignIn { notice } }
+            };
+        }
+        SessionState::SignedIn(_) => {}
+    }
 
     let current = load.read().clone();
     match current {

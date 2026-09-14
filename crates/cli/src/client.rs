@@ -10,31 +10,45 @@ use anyhow::{Context, Result, anyhow};
 /// A client bound to a prosperod base URL (e.g. `http://127.0.0.1:7878`).
 pub struct DaemonClient {
     base: String,
+    token: Option<String>,
 }
 
 impl DaemonClient {
-    /// Create a client for `base` (trailing slash trimmed).
-    pub fn new(base: impl Into<String>) -> Self {
+    /// Create a client for `base` (trailing slash trimmed), optionally
+    /// authenticating every request with `token` as a bearer credential.
+    pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
         let mut base = base.into();
         while base.ends_with('/') {
             base.pop();
         }
-        Self { base }
+        Self { base, token }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
 
+    /// Attach `Authorization: Bearer` when a token is configured.
+    fn authed(&self, request: ureq::Request) -> ureq::Request {
+        match &self.token {
+            Some(token) => request.set("Authorization", &format!("Bearer {token}")),
+            None => request,
+        }
+    }
+
     /// GET `path`, returning the parsed JSON body.
     pub fn get_json(&self, path: &str) -> Result<serde_json::Value> {
-        let resp = ureq::get(&self.url(path)).call().map_err(map_err)?;
+        let resp = self
+            .authed(ureq::get(&self.url(path)))
+            .call()
+            .map_err(map_err)?;
         resp.into_json().with_context(|| "parsing JSON response")
     }
 
     /// POST `path` with a JSON body, returning the parsed JSON body (or Null).
     pub fn post_json(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
-        let resp = ureq::post(&self.url(path))
+        let resp = self
+            .authed(ureq::post(&self.url(path)))
             .send_json(body)
             .map_err(map_err)?;
         // Some endpoints reply with an empty body (201/202/204).
@@ -49,7 +63,7 @@ impl DaemonClient {
 
     /// PUT `path` with a JSON body (response body ignored; endpoint replies 204).
     pub fn put_json(&self, path: &str, body: serde_json::Value) -> Result<()> {
-        ureq::put(&self.url(path))
+        self.authed(ureq::put(&self.url(path)))
             .send_json(body)
             .map_err(map_err)?;
         Ok(())
@@ -57,7 +71,9 @@ impl DaemonClient {
 
     /// DELETE `path`.
     pub fn delete(&self, path: &str) -> Result<()> {
-        ureq::delete(&self.url(path)).call().map_err(map_err)?;
+        self.authed(ureq::delete(&self.url(path)))
+            .call()
+            .map_err(map_err)?;
         Ok(())
     }
 
@@ -70,7 +86,10 @@ impl DaemonClient {
         path: &str,
         mut on_event: impl FnMut(&str, serde_json::Value),
     ) -> Result<()> {
-        let resp = ureq::get(&self.url(path)).call().map_err(map_err)?;
+        let resp = self
+            .authed(ureq::get(&self.url(path)))
+            .call()
+            .map_err(map_err)?;
         let reader = BufReader::new(resp.into_reader());
         let mut event_name = String::new();
         for line in reader.lines() {
@@ -98,6 +117,9 @@ impl DaemonClient {
 /// error body when present.
 fn map_err(err: ureq::Error) -> anyhow::Error {
     match err {
+        ureq::Error::Status(401, _) => anyhow!(
+            "prosperod requires a token; set PROSPERO_TOKEN or pass --token (server returned 401 unauthorized)"
+        ),
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
