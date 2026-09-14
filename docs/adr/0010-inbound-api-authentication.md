@@ -48,8 +48,8 @@ enforced by a middleware layer in `prospero-api` against a per-route scope table
   session-key Secret and bound to the token's current hash. Cookie-authenticated
   mutations must be same-origin.
 - Every mutation is attributed to the **token name as `actor`**: on the
-  `FleetEvent` envelope where the mutation records an event (local-fleet spawn,
-  respawn and remove), otherwise in an `info` log line.
+  `FleetEvent` envelope where the mutation records an event (local-fleet spawn
+  and remove), otherwise in an `info` log line.
 
 Per-person identity, SSO and inbound TLS are out of scope.
 

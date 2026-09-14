@@ -27,10 +27,11 @@ equivalent thing," not byte-identical. Rows are scored by the caliban
 evaluation tree's rule: ✅ only when a production call path reaches the
 capability.
 
-**Last refreshed:** 2026-09-13 (auth row refreshed 2026-09-13 for #2 — token
-auth shipped, `crates/api/src/auth/`, ADR-0010. Initial capture. OpenHands surface from
+**Last refreshed:** 2026-09-13 (initial capture. OpenHands surface from
 [`capability-inventory.md`](capability-inventory.md) snapshot 2026-09-13,
-v1.18.0; Prospero state verified against the code on the same date).
+v1.18.0; Prospero state verified against the code on the same date). Auth row
+refreshed 2026-09-13 for #2 — token auth shipped, `crates/api/src/auth/`,
+ADR-0010.
 
 > **Caveat:** rows tagged **⚠** depend on an OpenHands fact still flagged
 > uncertain in the inventory or a Prospero detail not re-verified against the

@@ -371,7 +371,14 @@ hidden. Browser E2E coverage remains with #9.
   so respawn is attributed by the audit log line only. The actor reaches the
   emitter through a tokio task-local set by the middleware
   (`prospero_core::actor`), so no `FleetProvider` signature changed.
-- **Route table:** unlisted routes fail closed to `admin`; the integration test
-  walks the table against the live router.
+- **Route table:** unlisted routes fail closed to `admin`; `PROTECTED` (in
+  `crates/api/tests/auth_integration.rs`) is a hand-maintained list of every
+  protected route, exercised against the live router — a newly added route
+  would silently default to `admin` if forgotten there. Adding a route means
+  adding it to both `required_access` and `PROTECTED`.
 - **`SessionInfo` shape:** internally tagged — `{"auth":"disabled"}` or
   `{"auth":"token","token_name":…,"scope":…,"expires_at":…}`.
+- **Derived `Debug` outside `prospero-types`:** the CLI's clap-derived `Cli`
+  struct and core's `TokenEntry`/`TokenSet` derive `Debug` (the CLI struct
+  holds the raw `--token` value; token entries hold SHA-256 hashes); nothing
+  logs them, and they are not wrapped in `SecretString`.
