@@ -28,7 +28,9 @@ only when a production call path reaches the capability.
 
 **Last refreshed:** 2026-09-13 (initial capture. Vibe Kanban surface from
 [`capability-inventory.md`](capability-inventory.md) snapshot 2026-09-13;
-Prospero state verified against the code on the same date).
+Prospero state verified against the code on the same date). Auth-adjacent rows
+refreshed 2026-09-13 for #2 — token auth shipped, `crates/api/src/auth/`,
+ADR-0010.
 
 > **Caveat:** rows tagged **⚠** depend on a Vibe Kanban fact still flagged
 > uncertain in the inventory, or a Prospero detail not re-verified against the
@@ -82,7 +84,7 @@ Prospero state verified against the code on the same date).
 |---|---|---|
 | Register repos | ✅ | `prospero workspace add <name> <root>` / `POST /api/workspaces` / dashboard `add_workspace` |
 | Heterogeneous agent CLIs (10+: Claude Code, Codex, Gemini CLI, Copilot, …) | 🟡 | Prospero drives **caliban** agents only (ADR-0003 wire coupling), across any model caliban supports. Non-caliban backends 🔴 |
-| Remote access (reverse proxy / SSH / tunnel) | 🟡 | `PROSPERO_ADDR` binds any address and the container binds `0.0.0.0` (`docs/container.md`), but the API has no inbound auth (#2), so remote exposure is unsafe without a fronting proxy |
+| Remote access (reverse proxy / SSH / tunnel) | ✅ | `PROSPERO_ADDR` binds any address and the container binds `0.0.0.0` (`docs/container.md`); inbound requests now require a bearer token or session cookie (`crates/api/src/auth/`, ADR-0010, #2), so remote exposure no longer depends solely on a fronting proxy |
 
 ## G. Model / provider handling
 
@@ -102,7 +104,7 @@ Prospero state verified against the code on the same date).
 
 | Capability (Vibe Kanban) | Prospero | Notes |
 |---|---|---|
-| Configurable origins allowlist | 🟡 | the dashboard page ships a strict same-origin CSP (`crates/api/src/dashboard.rs`), but there is no configurable origin allowlist and no inbound API auth (#2) |
+| Configurable origins allowlist | 🟡 | the dashboard page ships a strict same-origin CSP (`crates/api/src/dashboard.rs`) and inbound requests now require auth (`crates/api/src/auth/`, ADR-0010, #2), but there is still no configurable origin allowlist |
 | Analytics toggle | n/a | Prospero ships no product analytics to toggle ⚠ |
 
 ## J. Out of scope for Prospero (Vibe Kanban-distinctive)

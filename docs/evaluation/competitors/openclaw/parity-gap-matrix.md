@@ -33,7 +33,9 @@ capability.
 store backends, retention, usage reporting, service supervision, provider
 list; chat surface re-pointed at Ariel. OpenClaw surface unchanged from the
 [`capability-inventory.md`](capability-inventory.md) snapshot 2026-07-18.
-Initial capture 2026-07-19, re-homed from the caliban repo's OpenClaw area.)
+Initial capture 2026-07-19, re-homed from the caliban repo's OpenClaw area.
+Auth row refreshed 2026-09-13 for #2 — token auth shipped, `crates/api/src/auth/`,
+ADR-0010.)
 
 > **Caveat:** rows tagged **⚠** depend on an OpenClaw fact still flagged
 > uncertain in the inventory or a Prospero detail inferred from the README/ADRs
@@ -119,7 +121,7 @@ Initial capture 2026-07-19, re-homed from the caliban repo's OpenClaw area.)
 | Capability (OpenClaw) | Prospero | Notes |
 |---|---|---|
 | Local-first bind | ✅ | binds `127.0.0.1:7878` by default (`crates/daemon/src/main.rs`); the container image binds `0.0.0.0` (`docs/container.md`) |
-| Control-plane auth (tokens / device pairing / Tailscale) | 🔴 | no authn/authz on the REST/SSE API (`crates/api/src`; #2). Prospero → caliband traffic does carry TLS + a bearer token (`crates/core/src/caliband/transport.rs`), but nothing guards inbound clients — sharper now that prosperod runs in-cluster. OpenClaw has device pairing + shared-secret + Tailscale identity |
+| Control-plane auth (tokens / device pairing / Tailscale) | 🟡 | named bearer tokens with `read`/`operate`/`admin` scopes now guard every inbound route (`crates/api/src/auth/`, ADR-0010, #2). Prospero → caliband traffic separately carries TLS + a bearer token (`crates/core/src/caliband/transport.rs`). No device pairing or Tailscale-style network identity — OpenClaw's device pairing + shared-secret + Tailscale identity has no Prospero analogue |
 | Durable-log retention / rotation | 🟡 | age-based retention shipped (`--retention-days` prune loop in `crates/daemon/src/main.rs`, #43); JSONL rotation / compaction / per-agent sharding still open (#4). OpenClaw persists transcripts |
 | Pluggable store backend | ✅ | `Store` trait (ADR-0004) with JSONL, SQLite (standalone) and Postgres (clustered) backends, selected in `crates/daemon/src/main.rs` (#43) |
 | Supervised service (launchd/systemd) | 🟡 | no launchd/systemd units shipped; `prosperod` runs as a container with `/healthz` + `/readyz` (`docs/container.md`) under Docker / Kubernetes supervision. OpenClaw installs a launchd/systemd daemon |
@@ -168,8 +170,9 @@ control plane (the assistant/channel surface is deliberately excluded):
 1. **Heterogeneous worker backends** (F) — drive non-caliban agents behind the
    same fleet model. Prospero's wire-only coupling (ADR-0003) makes this a
    natural extension.
-2. **Control-plane API auth** (I) — already a known deferred non-goal; OpenClaw's
-   token/device/Tailscale model is a reference.
+2. **Control-plane auth: device pairing / Tailscale identity** (I) — token auth
+   shipped (#2); the remaining gap is OpenClaw's device pairing + shared-secret
+   + Tailscale network identity, which has no Prospero analogue.
 3. **MCP-server exposure of the fleet** (E) — let other tools drive Prospero over
    MCP, not just REST/SSE.
 4. **JSONL rotation / compaction** (I) — age-based retention and the SQLite /

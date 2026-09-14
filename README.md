@@ -130,8 +130,19 @@ cd crates/dashboard && cargo test    # view-model + meter logic, host target
 - Architecture Decision Records: [`docs/adr/`](docs/adr/) — the *why* behind significant
   decisions (control-plane role, caliban coupling, observability model, crate boundaries, …)
 
+## Securing the API
+
+On loopback prosperod runs without auth. Anywhere else, give it a tokens file:
+
+    prospero token new alice --scope admin   # read | operate | admin
+    prosperod --addr 0.0.0.0:7878 --api-tokens-file ./tokens
+    PROSPERO_TOKEN=pspo_… prospero ls
+
+The dashboard asks for a token and keeps a 12-hour session cookie. Details:
+`docs/guide/src/api-auth.md`, ADR-0010.
+
 ## Status
 
 First-stab framework: complete and tested. Deferred (see the spec's non-goals):
-multi-host fleets, API auth, log retention/rotation, a sqlite `Store` backend,
+multi-host fleets, log retention/rotation, a sqlite `Store` backend,
 and automated tests against a real caliban binary + live model.

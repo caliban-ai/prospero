@@ -9,6 +9,7 @@
 # Design
 
 - [Guiding Principles & Invariants](./principles.md)
+- [Securing the API](./api-auth.md)
 
 # Architecture Decisions
 

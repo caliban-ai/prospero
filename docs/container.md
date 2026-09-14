@@ -28,9 +28,27 @@ image).
 | `PROSPERO_REPLICA_ID` | unique per replica | `HOSTNAME` |
 | `PROSPERO_HOST` | fleet identity | `local` |
 | `RUST_LOG` | log filter | `info` |
+| `PROSPERO_API_TOKENS_FILE` | tokens file (`<name> <scope> sha256:<hex>`); set ⇒ every non-probe request needs a token | unset |
+| `PROSPERO_SESSION_KEY_FILE` | ≥ 32-byte dashboard session key; **required** when clustered with tokens | unset ⇒ random per process |
+| `PROSPERO_INSECURE_NO_AUTH` | `1` ⇒ serve without auth on a non-loopback bind (logged every minute) | unset |
+| `PROSPERO_COOKIE_SECURE` | `1` ⇒ always mark the session cookie `Secure` | unset (Secure when `X-Forwarded-Proto: https`) |
 
 Schema is created in-process on boot (no migration step). prosperod handles
 SIGTERM for graceful shutdown.
+
+## Authentication
+
+The image binds `0.0.0.0`, so prosperod **refuses to start** unless you either
+mount a tokens file or pass `PROSPERO_INSECURE_NO_AUTH=1`:
+
+    prospero token new admin --scope admin      # prints the token once + a tokens-file line
+    docker run --rm -p 7878:7878 -v prospero-data:/data \
+      -v "$PWD/tokens:/etc/prospero/tokens:ro" \
+      -e PROSPERO_API_TOKENS_FILE=/etc/prospero/tokens \
+      ghcr.io/caliban-ai/prospero
+
+`/healthz` and `/readyz` stay open for probes. See ADR-0010 and the guide's
+"Securing the API" page.
 
 ## Fleet backends
 

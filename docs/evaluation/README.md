@@ -23,15 +23,19 @@ count and granularity, so compare the gap themes more than the percentages.
 
 | Competitor | Shape | ✅ | 🟡 | 🔴 | n/a | In-scope ✅ |
 |---|---|---|---|---|---|---|
-| [OpenClaw](competitors/openclaw/parity-gap-matrix.md) | self-hosted assistant gateway | 23 | 8 | 4 | 8 | 66% |
-| [GitHub Agent HQ](competitors/github-agent-hq/parity-gap-matrix.md) | hosted multi-vendor fleet | 17 | 10 | 9 | 11 | 47% |
-| [Vibe Kanban](competitors/vibe-kanban/parity-gap-matrix.md) | OSS local orchestrator | 9 | 6 | 6 | 5 | 43% |
-| [OpenHands](competitors/openhands/parity-gap-matrix.md) | OSS self-hostable platform | 15 | 6 | 14 | 7 | 43% |
-| [Coder](competitors/coder/parity-gap-matrix.md) | self-hosted k8s/HA control plane | 16 | 8 | 14 | 8 | 42% |
+| [OpenClaw](competitors/openclaw/parity-gap-matrix.md) | self-hosted assistant gateway | 23 | 9 | 3 | 8 | 66% |
+| [GitHub Agent HQ](competitors/github-agent-hq/parity-gap-matrix.md) | hosted multi-vendor fleet | 18 | 10 | 8 | 11 | 50% |
+| [Vibe Kanban](competitors/vibe-kanban/parity-gap-matrix.md) | OSS local orchestrator | 10 | 5 | 6 | 5 | 48% |
+| [OpenHands](competitors/openhands/parity-gap-matrix.md) | OSS self-hostable platform | 16 | 6 | 13 | 7 | 46% |
+| [Coder](competitors/coder/parity-gap-matrix.md) | self-hosted k8s/HA control plane | 16 | 9 | 13 | 8 | 42% |
 
 **Gaps that recur across competitors** (the strongest prioritization signal):
 
-- **Control-plane API auth / identity** — 🔴 against OpenClaw, OpenHands, Coder and Agent HQ (#2); Vibe Kanban documents none either, which is part of why it stays single-host.
+- **Control-plane API auth / identity** — token auth shipped (#2): ✅ against
+  GitHub Agent HQ and OpenHands (comparable token/API-key granularity); 🟡
+  against OpenClaw (no device pairing / Tailscale identity) and Coder (no
+  per-user identity or RBAC); Vibe Kanban documents no auth story of its own
+  either. Per-user identity, SSO and RBAC remain open (gonzalo#277).
 - **Heterogeneous worker backends** — OpenClaw, OpenHands (ACP), Agent HQ and Vibe Kanban all drive several agent products; Prospero drives only caliban (ADR-0003 makes this a wire-adapter extension).
 - **MCP-server exposure of the fleet** — OpenClaw and Vibe Kanban.
 - **Automations** — scheduled / webhook / event-triggered spawns (OpenHands, Agent HQ).

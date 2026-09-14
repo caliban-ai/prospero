@@ -363,3 +363,15 @@ hidden. Browser E2E coverage remains with #9.
 - `caliban-ai/helm-charts` `apiAuth` values and `johnford2002/helm-charts`
   SealedSecret + pin (rollout steps 2–3).
 - #218 fleet MCP server consumes the `Principal`.
+
+## Amendments during implementation planning
+
+- **Actor on events:** only local-fleet spawn (`AgentSpawned`) and rm (`AgentGone`)
+  emit an event inside the request; respawn's new agent is discovered by the poll,
+  so respawn is attributed by the audit log line only. The actor reaches the
+  emitter through a tokio task-local set by the middleware
+  (`prospero_core::actor`), so no `FleetProvider` signature changed.
+- **Route table:** unlisted routes fail closed to `admin`; the integration test
+  walks the table against the live router.
+- **`SessionInfo` shape:** internally tagged — `{"auth":"disabled"}` or
+  `{"auth":"token","token_name":…,"scope":…,"expires_at":…}`.

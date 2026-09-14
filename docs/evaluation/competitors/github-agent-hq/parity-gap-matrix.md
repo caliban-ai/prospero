@@ -32,7 +32,8 @@ capability.
 [`capability-inventory.md`](capability-inventory.md) snapshot 2026-09-13;
 Prospero state verified against `crates/` — API routes in
 `crates/api/src/lib.rs`, spawn fields in `crates/types/src/api.rs`, CLI in
-`crates/cli/src/main.rs`).
+`crates/cli/src/main.rs`). Auth row refreshed 2026-09-13 for #2 (token auth
+shipped, `crates/api/src/auth/`, ADR-0010).
 
 > **Caveat:** rows tagged **⚠** depend on an Agent HQ fact flagged public
 > preview / uncertain in the inventory, or a Prospero detail not re-verified end
@@ -121,7 +122,7 @@ Prospero state verified against `crates/` — API routes in
 
 | Capability (Agent HQ) | Prospero | Notes |
 |---|---|---|
-| Token auth on the control-plane API | 🔴 | no inbound authn/authz on REST/SSE (#2); Agent HQ requires a fine-grained PAT / GitHub App token with "Agent tasks" permission |
+| Token auth on the control-plane API | ✅ | named bearer tokens with `read`/`operate`/`admin` scopes, checked by axum middleware on every inbound route (`crates/api/src/auth/`, ADR-0010, #2) — comparable granularity to Agent HQ's fine-grained PAT / GitHub App token with "Agent tasks" permission |
 | Audit of agent activity | 🟡 | durable event log is replayable over the API; no dedicated audit surface. Agent HQ's own audit coverage is ⚠ unverified |
 | Usage-based billing / quotas | n/a | self-hosted; cost is reported (`/api/usage`), not billed |
 | Scale-out / HA | ✅ | clustered mode — N `prosperod` replicas on Postgres with leased ownership (`crates/core/src/leased_ownership.rs`); Agent HQ scales as SaaS |
@@ -155,9 +156,9 @@ the boundary.
   your control. Its REST/SSE API can already stream, steer, stop and respawn
   sessions, which Agent HQ's preview API can't. And it has no session time
   ceiling.
-- **The API gap runs the other way.** Agent HQ's public API is the thinner one,
-  but its token auth is real. Prospero's API is richer and entirely
-  unauthenticated (#2).
+- **The auth gap has closed.** Agent HQ's public API is the thinner one;
+  Prospero's is richer and, since #2, token-authenticated too
+  (`crates/api/src/auth/`, ADR-0010).
 
 ## Prospero-distinctive gaps worth a ticket
 
@@ -165,16 +166,14 @@ Capabilities Agent HQ has that Prospero lacks and that are *in scope* for a
 self-hosted control plane (the forge-native and chat surface is deliberately
 excluded):
 
-1. **Control-plane API auth** (I) — #2. Agent HQ scopes every task call to a
-   token permission. Prospero's API has none, and prosperod now runs in-cluster.
-2. **Multiple agent backends** (F) — drive non-caliban agents (Claude Code,
+1. **Multiple agent backends** (F) — drive non-caliban agents (Claude Code,
    Codex) behind the same fleet model. This is the headline capability of Agent
    HQ, and ADR-0003's wire-only coupling makes it an adapter problem.
-3. **Scheduled / event-triggered spawns** (B) — a cron + inbound-webhook trigger
+2. **Scheduled / event-triggered spawns** (B) — a cron + inbound-webhook trigger
    surface, the forge-agnostic answer to "assign an issue to an agent".
-4. **Session guardrails: time/turn limits** (B) — a per-spawn wall-clock or turn
+3. **Session guardrails: time/turn limits** (B) — a per-spawn wall-clock or turn
    cap, so a runaway agent is stopped by policy rather than an operator.
-5. **Session search + commit ↔ session linkage** (A, D) — find a past session
+4. **Session search + commit ↔ session linkage** (A, D) — find a past session
    and trace a commit back to the run that wrote it, over the durable store
    Prospero already has.
 
