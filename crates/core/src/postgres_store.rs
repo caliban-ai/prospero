@@ -34,12 +34,26 @@ impl PostgresStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = crate::pg::connect(url).await?;
         crate::pg::ensure_schema(&pool, SCHEMA, "events table").await?;
-        crate::pg::ensure_schema(
-            &pool,
-            "ALTER TABLE events ADD COLUMN IF NOT EXISTS actor TEXT",
-            "events.actor column",
+        // `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an ACCESS EXCLUSIVE
+        // lock even when the column already exists (the common case on every
+        // boot after the first), so probe first and only run the ALTER when
+        // it's actually missing. Mirrors SqliteStore::open's probe-then-ALTER.
+        let has_actor: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'events' AND column_name = 'actor' \
+             AND table_schema = current_schema())",
         )
-        .await?;
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("inspecting postgres schema: {e}")))?;
+        if !has_actor {
+            crate::pg::ensure_schema(
+                &pool,
+                "ALTER TABLE events ADD COLUMN IF NOT EXISTS actor TEXT",
+                "events.actor column",
+            )
+            .await?;
+        }
         Ok(Self { pool })
     }
 
