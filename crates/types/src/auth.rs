@@ -57,10 +57,20 @@ pub enum SessionInfo {
 }
 
 /// `POST /api/session` body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignInBody {
     /// The raw `pspo_…` token pasted by the operator.
     pub token: String,
+}
+
+/// Manual `Debug`: `token` is the raw, still-usable credential (spec §3 —
+/// tokens are never in unredacted `Debug`), so it's never printed.
+impl std::fmt::Debug for SignInBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignInBody")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +109,15 @@ mod tests {
         );
         let back: SessionInfo = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn sign_in_body_debug_redacts_the_token() {
+        let body = SignInBody {
+            token: "pspo_supersecretvalue".to_string(),
+        };
+        let debug = format!("{body:?}");
+        assert!(!debug.contains("pspo_supersecretvalue"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 }
