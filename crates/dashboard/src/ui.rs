@@ -4,19 +4,21 @@
 
 use dioxus::prelude::*;
 use prospero_types::{
-    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetSnapshot, SpawnBody, Workspace,
+    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetSnapshot, Scope, SpawnBody, Workspace,
     WorkspaceSummary,
 };
 
 use crate::actions::Action;
+use crate::api;
 use crate::charts::{Measure, Point, Window};
 use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
 use crate::stream::{StreamSession, StreamState};
 use crate::theme::{STORAGE_KEY, Theme};
 use crate::timeline::{Segment, ToolCall};
 use crate::view_model::{
-    AgentControls, FleetTotals, StatusCounts, awaits_input, basename, controls_for, count_statuses,
-    elapsed, health_reason, is_healthy, is_launchable, short_id, status_label, status_tone, totals,
+    AgentControls, FleetTotals, SessionState, StatusCounts, awaits_input, basename, controls_for,
+    count_statuses, elapsed, health_reason, is_healthy, is_launchable, permits, session_label,
+    short_id, status_label, status_tone, totals,
 };
 
 /// Shared UI state, provided once by `App` and read by any component that needs
@@ -54,6 +56,8 @@ pub struct Ui {
     /// without riding the 5-second poll, which is the trade #181 deliberately
     /// made and then landed on the wrong side of: it never refetched at all.
     pub activity: Signal<u32>,
+    /// Sign-in state; gates every control by scope (#2).
+    pub session: Signal<SessionState>,
 }
 
 impl Ui {
@@ -111,6 +115,7 @@ pub fn Shell(host: String, freshness: Freshness, children: Element) -> Element {
                     span { class: "topbar-host", "{host}" }
                 }
                 div { class: "topbar-right",
+                    SessionBadge {}
                     ConnectionState { freshness }
                     ThemeToggle {}
                 }
@@ -217,11 +222,96 @@ fn ConnectionState(freshness: Freshness) -> Element {
     }
 }
 
+/// Token name + scope and a sign-out control, shown for token sessions only.
+#[component]
+fn SessionBadge() -> Element {
+    let mut ui = use_context::<Ui>();
+    let Some(label) = session_label(&ui.session.read()) else {
+        return rsx! {};
+    };
+    rsx! {
+        span { class: "topbar-label", title: "Signed in with this API token", "{label}" }
+        button {
+            class: "btn btn-sm",
+            onclick: move |_| {
+                spawn(async move {
+                    let _ = api::sign_out().await;
+                    ui.session.set(SessionState::SignedOut(None));
+                });
+            },
+            "Sign out"
+        }
+    }
+}
+
+/// Sign-in form: paste a token, receive a session cookie.
+#[component]
+pub fn SignIn(notice: Option<String>) -> Element {
+    let mut ui = use_context::<Ui>();
+    let mut token = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let mut submit = move || {
+        let value = token.read().trim().to_string();
+        if value.is_empty() || busy() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        spawn(async move {
+            match api::sign_in(&value).await {
+                Ok(info) => {
+                    token.set(String::new());
+                    ui.session.set(SessionState::SignedIn(info));
+                    ui.request_refresh();
+                }
+                Err(e) if e == api::SIGNED_OUT => {
+                    error.set(Some("That token was not accepted.".into()));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+    rsx! {
+        div { class: "state",
+            h2 { class: "state-title", "Sign in to Prospero" }
+            if let Some(n) = notice {
+                p { class: "state-detail", "{n}" }
+            }
+            p { class: "state-detail",
+                "Paste an API token. Create one with "
+                code { "prospero token new <name> --scope admin" }
+                "."
+            }
+            form {
+                onsubmit: move |e: FormEvent| {
+                    e.prevent_default();
+                    submit();
+                },
+                input {
+                    class: "input",
+                    r#type: "password",
+                    autocomplete: "off",
+                    placeholder: "pspo_…",
+                    value: "{token}",
+                    disabled: busy(),
+                    oninput: move |e| token.set(e.value()),
+                }
+                button { class: "btn btn-primary", r#type: "submit", disabled: busy(), "Sign in" }
+            }
+            if let Some(e) = error() {
+                p { class: "state-detail", "{e}" }
+            }
+        }
+    }
+}
+
 /// The whole overview: stat row plus a card per workspace.
 #[component]
 pub fn Overview(snapshot: FleetSnapshot) -> Element {
     let mut ui = use_context::<Ui>();
-    let admin = ui.caps.read().admin;
+    let admin = ui.caps.read().admin && permits(&ui.session.read(), Scope::Admin);
     let t = totals(&snapshot);
     rsx! {
         StatRow { totals: t }
@@ -300,7 +390,8 @@ fn WorkspaceCard(workspace: Workspace) -> Element {
     let mut ui = use_context::<Ui>();
     let healthy = is_healthy(&workspace.health);
     let launchable = is_launchable(&workspace);
-    let admin = ui.caps.read().admin;
+    let admin = ui.caps.read().admin && permits(&ui.session.read(), Scope::Admin);
+    let can_operate = permits(&ui.session.read(), Scope::Operate);
     let name = workspace.name.clone();
     let remove_name = workspace.name.clone();
     let counts = count_statuses(&workspace.agents);
@@ -362,7 +453,7 @@ fn WorkspaceCard(workspace: Workspace) -> Element {
                 }
             }
             div { class: "card-controls",
-                if launchable {
+                if launchable && can_operate {
                     button {
                         class: "btn btn-sm btn-primary",
                         onclick: move |_| ui.modal.set(Modal::Launch { workspace: name.clone() }),
@@ -460,6 +551,7 @@ fn AgentRow(agent: Agent) -> Element {
     let age = elapsed(&agent.started_at, *ui.now_ms.read());
     let controls = controls_for(agent.status);
     let wants_input = awaits_input(&agent);
+    let can_operate = permits(&ui.session.read(), Scope::Operate);
 
     let open = agent.clone();
     rsx! {
@@ -485,39 +577,41 @@ fn AgentRow(agent: Agent) -> Element {
                     }
                 }
                 div { class: "acts",
-                    match controls {
-                        AgentControls::Killable => rsx! {
-                            ControlButton {
-                                action: Action::KillAgent {
-                                    id: agent.id.clone(),
-                                    name: agent.name.clone(),
-                                },
-                                label: "Kill".to_string(),
-                                danger: true,
-                            }
-                        },
-                        AgentControls::Finished => rsx! {
-                            ControlButton {
-                                action: Action::RespawnAgent {
-                                    id: agent.id.clone(),
-                                    name: agent.name.clone(),
-                                },
-                                label: "Respawn".to_string(),
-                                danger: false,
-                            }
-                            ControlButton {
-                                action: Action::RemoveAgent {
-                                    id: agent.id.clone(),
-                                    name: agent.name.clone(),
-                                },
-                                label: "Remove".to_string(),
-                                danger: true,
-                            }
-                        },
+                    if can_operate {
+                        match controls {
+                            AgentControls::Killable => rsx! {
+                                ControlButton {
+                                    action: Action::KillAgent {
+                                        id: agent.id.clone(),
+                                        name: agent.name.clone(),
+                                    },
+                                    label: "Kill".to_string(),
+                                    danger: true,
+                                }
+                            },
+                            AgentControls::Finished => rsx! {
+                                ControlButton {
+                                    action: Action::RespawnAgent {
+                                        id: agent.id.clone(),
+                                        name: agent.name.clone(),
+                                    },
+                                    label: "Respawn".to_string(),
+                                    danger: false,
+                                }
+                                ControlButton {
+                                    action: Action::RemoveAgent {
+                                        id: agent.id.clone(),
+                                        name: agent.name.clone(),
+                                    },
+                                    label: "Remove".to_string(),
+                                    danger: true,
+                                }
+                            },
+                        }
                     }
                 }
             }
-            if wants_input {
+            if wants_input && can_operate {
                 AgentInput { agent: agent.clone() }
             }
         }
@@ -854,6 +948,7 @@ fn Scrim(children: Element) -> Element {
 #[component]
 fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
     let mut ui = use_context::<Ui>();
+    let can_operate = permits(&ui.session.read(), Scope::Operate);
 
     let launchable: Vec<String> = snapshot
         .workspaces
@@ -1071,11 +1166,13 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
                         onclick: move |_| ui.modal.set(Modal::Closed),
                         "Cancel"
                     }
-                    button {
-                        class: "btn btn-primary",
-                        disabled: busy(),
-                        onclick: submit,
-                        if busy() { "Launching…" } else { "Launch" }
+                    if can_operate {
+                        button {
+                            class: "btn btn-primary",
+                            disabled: busy(),
+                            onclick: submit,
+                            if busy() { "Launching…" } else { "Launch" }
+                        }
                     }
                 }
             }

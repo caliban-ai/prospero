@@ -12,10 +12,14 @@
 
 use gloo_net::http::{Request, Response};
 use prospero_types::{
-    AddWorkspaceBody, AgentInputBody, Capabilities, FleetSnapshot, SetConfigBody, SpawnBody,
-    SpawnedResponse, UsageReport, WorkspaceConfig, WorkspaceSummary,
+    AddWorkspaceBody, AgentInputBody, Capabilities, FleetSnapshot, SessionInfo, SetConfigBody,
+    SignInBody, SpawnBody, SpawnedResponse, UsageReport, WorkspaceConfig, WorkspaceSummary,
 };
 use serde::Serialize;
+
+/// The error string every call returns on 401, so the app can drop back to the
+/// sign-in form instead of showing a banner.
+pub const SIGNED_OUT: &str = "signed out";
 
 /// Turn a non-2xx response into the best message available.
 ///
@@ -23,6 +27,9 @@ use serde::Serialize;
 /// far more useful to an operator than "409 Conflict", so prefer it and fall
 /// back to the status line only when the body is missing or unparseable.
 async fn failure(what: &str, response: Response) -> String {
+    if response.status() == 401 {
+        return SIGNED_OUT.to_string();
+    }
     let status = response.status();
     let status_text = response.status_text();
     match response.text().await {
@@ -162,6 +169,31 @@ pub async fn fetch_workspaces() -> Result<Vec<WorkspaceSummary>, String> {
 /// off, and a client-computed bound would silently clip or pad the window.
 pub async fn fetch_usage(days: i64) -> Result<UsageReport, String> {
     get_json(&format!("/api/usage?days={days}"), "usage").await
+}
+
+// --- Session ------------------------------------------------------------
+
+/// `GET /api/session` — the current credential, `{"auth":"disabled"}`, or
+/// `Err(SIGNED_OUT)`.
+pub async fn fetch_session() -> Result<SessionInfo, String> {
+    get_json("/api/session", "session").await
+}
+
+/// `POST /api/session` — exchange a pasted token for a session cookie.
+pub async fn sign_in(token: &str) -> Result<SessionInfo, String> {
+    post_json(
+        "/api/session",
+        &SignInBody {
+            token: token.into(),
+        },
+        "sign in",
+    )
+    .await
+}
+
+/// `DELETE /api/session` — clear the session cookie.
+pub async fn sign_out() -> Result<(), String> {
+    mutate(Method::Delete, "/api/session", "sign out").await
 }
 
 // --- Agent control ----------------------------------------------------------
