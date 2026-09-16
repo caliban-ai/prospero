@@ -155,7 +155,10 @@ mod tests {
         // one simply never appears here — and must not be written at all.
         super::report_agents_settled(&api, &[], NOW).await;
 
-        assert!(api.status_condition("silent-task", AGENTS_SETTLED).is_none());
+        assert!(
+            api.status_condition("silent-task", AGENTS_SETTLED)
+                .is_none()
+        );
     }
 
     #[test]
