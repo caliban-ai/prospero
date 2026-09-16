@@ -33,7 +33,9 @@ use crate::error::{CoreError, Result};
 use crate::event::EventKind;
 use crate::fleet::{AttachBackoff, AttachTarget, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
-use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, TaskSpec as CrdTaskSpec, WorkspaceRef};
+use crate::k8s::crd::{
+    CalibanTask, CalibanTaskSpec, Condition, TaskSpec as CrdTaskSpec, WorkspaceRef,
+};
 use crate::k8s::workspace_api::WorkspaceApi;
 use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
 use crate::ownership::{Ownership, SelfOwnsAll};
@@ -457,6 +459,9 @@ pub trait CalibanTaskApi: Send + Sync {
     async fn delete(&self, name: &str) -> Result<()>;
     /// List all `CalibanTask`s this API is scoped to (its namespace).
     async fn list(&self) -> Result<Vec<CalibanTask>>;
+    /// Server-side-apply one condition onto `name`'s status subresource under
+    /// prospero's own field manager, touching nothing else (#228).
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()>;
 }
 
 /// Real `CalibanTaskApi` backed by a `kube::Api<CalibanTask>`.
@@ -547,6 +552,20 @@ impl CalibanTaskApi for KubeTaskApi {
             .get_opt(name)
             .await
             .map_err(|e| map_kube_err("get CalibanTask", e))
+    }
+
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()> {
+        // No `.force()`: the operator owns phase/endpoint/sandboxRef and its own
+        // conditions, and this apply must never take those fields from it. A
+        // conflict here means someone else claimed `AgentsSettled`, which is a
+        // real error worth surfacing rather than stealing (caliban-operator#64).
+        let params = kube::api::PatchParams::apply("prospero");
+        let body = crate::k8s::status::status_condition_patch(name, condition);
+        self.api
+            .patch_status(name, &params, &kube::api::Patch::Apply(&body))
+            .await
+            .map_err(|e| map_kube_err("apply CalibanTask status condition", e))?;
+        Ok(())
     }
 
     async fn delete(&self, name: &str) -> Result<()> {
@@ -1934,6 +1953,7 @@ impl MemTaskApi {
             caliband_endpoint: endpoint.map(str::to_string),
             sandbox_ref: None,
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
     }
 }
@@ -1980,6 +2000,17 @@ impl CalibanTaskApi for MemTaskApi {
 
     async fn list(&self) -> Result<Vec<CalibanTask>> {
         Ok(self.store.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()> {
+        let mut store = self.store.lock().unwrap();
+        let task = store
+            .get_mut(name)
+            .ok_or_else(|| CoreError::Fleet(format!("CalibanTask {name} not found")))?;
+        let status = task.status.get_or_insert_with(Default::default);
+        status.conditions.retain(|c| c.r#type != condition.r#type);
+        status.conditions.push(condition.clone());
+        Ok(())
     }
 }
 
@@ -2307,6 +2338,7 @@ mod tests {
                 caliband_endpoint: Some(endpoint.to_string()),
                 sandbox_ref: None,
                 resolved_workspace: None,
+            conditions: Vec::new(),
             });
             ct
         };
@@ -2381,6 +2413,7 @@ mod tests {
             caliband_endpoint: Some("10.0.0.5:9443".to_string()),
             sandbox_ref: None,
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
 
         let agent = agent_from_task(&ct);
@@ -2956,6 +2989,7 @@ mod tests {
                 env: Vec::new(),
                 isolation: None,
             }),
+            conditions: Vec::new(),
         });
         ct
     }
@@ -3606,6 +3640,7 @@ mod tests {
             caliband_endpoint: Some(tls.addr.clone()),
             sandbox_ref: None,
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
 
         let client_tls =

@@ -40,6 +40,30 @@ pub fn agents_settled_condition(agents: &[AgentStatus], now: &str) -> Condition 
     }
 }
 
+/// Report each observed task's agent lifecycle into its `CalibanTask` status.
+///
+/// `observed` carries one entry per task whose pod caliband actually answered
+/// this pass — a task whose caliband is unreachable is simply absent, and its
+/// condition is left exactly as it was rather than flipped on a transient
+/// error.
+pub async fn report_agents_settled<A: super::fleet::CalibanTaskApi + ?Sized>(
+    api: &A,
+    observed: &[(String, Vec<AgentStatus>)],
+    now: &str,
+) {
+    for (name, agents) in observed {
+        let condition = agents_settled_condition(agents, now);
+        if let Err(e) = api.apply_status_condition(name, &condition).await {
+            // Reporting is best-effort: the next poll re-derives and re-applies,
+            // so a failed write must not take down the observation loop.
+            tracing::warn!(
+                target: "prospero_k8s_fleet", task = %name, error = %e,
+                "reporting AgentsSettled to CalibanTask status failed"
+            );
+        }
+    }
+}
+
 /// The server-side-apply body that reports `condition` on `name`'s status.
 ///
 /// Deliberately minimal: apply semantics mean a field manager owns exactly what
@@ -98,6 +122,40 @@ mod tests {
         let c = agents_settled_condition(&[], NOW);
         assert_eq!(c.status, "False");
         assert_eq!(c.reason, "AgentsActive");
+    }
+
+    #[tokio::test]
+    async fn reports_the_condition_for_each_task_that_answered() {
+        let api = crate::k8s::fake::FakeK8s::new();
+        let observed = vec![
+            ("done-task".to_string(), vec![AgentStatus::Done]),
+            ("busy-task".to_string(), vec![AgentStatus::Running]),
+        ];
+
+        super::report_agents_settled(&api, &observed, NOW).await;
+
+        let done = api
+            .status_condition("done-task", AGENTS_SETTLED)
+            .expect("condition applied to done-task");
+        assert_eq!(done.status, "True");
+        assert_eq!(done.reason, "Succeeded");
+
+        let busy = api
+            .status_condition("busy-task", AGENTS_SETTLED)
+            .expect("condition applied to busy-task");
+        assert_eq!(busy.status, "False");
+        assert_eq!(busy.reason, "AgentsActive");
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_caliband_is_unreachable_keeps_its_condition() {
+        let api = crate::k8s::fake::FakeK8s::new();
+
+        // The caller only reports tasks whose pod answered, so an unreachable
+        // one simply never appears here — and must not be written at all.
+        super::report_agents_settled(&api, &[], NOW).await;
+
+        assert!(api.status_condition("silent-task", AGENTS_SETTLED).is_none());
     }
 
     #[test]

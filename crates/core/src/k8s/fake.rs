@@ -35,7 +35,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{CoreError, Result};
-use crate::k8s::crd::{CalibanTask, CalibanTaskStatus, NamedRef, Workspace, WorkspaceStatus};
+use crate::k8s::crd::{
+    CalibanTask, CalibanTaskStatus, Condition, NamedRef, Workspace, WorkspaceStatus,
+};
 use crate::k8s::fleet::CalibanTaskApi;
 use crate::k8s::workspace_api::WorkspaceApi;
 use crate::testkit::FakeBackend;
@@ -68,6 +70,11 @@ async fn simulate_write_latency() {
 pub struct FakeK8s {
     store: Arc<Mutex<HashMap<String, CalibanTask>>>,
     applied_any: Arc<AtomicBool>,
+    /// Conditions server-side-applied to `<name>`'s status (#228), keyed by
+    /// `(task name, condition type)`. Kept beside the store rather than inside
+    /// it because prospero applies a condition to a CR the operator owns — the
+    /// apply is recorded whether or not this fake happens to hold that CR.
+    status_conditions: Arc<Mutex<HashMap<(String, String), Condition>>>,
 }
 
 impl Default for FakeK8s {
@@ -83,7 +90,18 @@ impl FakeK8s {
         Self {
             store: Arc::new(Mutex::new(HashMap::new())),
             applied_any: Arc::new(AtomicBool::new(false)),
+            status_conditions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The condition of type `cond_type` last applied to `name`'s status, if any.
+    #[must_use]
+    pub fn status_condition(&self, name: &str, cond_type: &str) -> Option<Condition> {
+        self.status_conditions
+            .lock()
+            .unwrap()
+            .get(&(name.to_string(), cond_type.to_string()))
+            .cloned()
     }
 }
 
@@ -108,6 +126,7 @@ impl CalibanTaskApi for FakeK8s {
             // the pinned resolvedWorkspace unset. `agent_from_task` falls back to
             // `spec.workspaceRef.name` for the workspace label, which suffices.
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
 
         self.store.lock().unwrap().insert(name, reconciled);
@@ -127,6 +146,22 @@ impl CalibanTaskApi for FakeK8s {
         // delete must stay `Ok(())`, matching `KubeTaskApi::delete`'s
         // documented contract.
         self.store.lock().unwrap().remove(name);
+        Ok(())
+    }
+
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()> {
+        simulate_write_latency().await;
+        self.status_conditions.lock().unwrap().insert(
+            (name.to_string(), condition.r#type.clone()),
+            condition.clone(),
+        );
+        // Mirror it into the stored CR too, when this fake happens to hold one,
+        // so a reader sees what a real apiserver would return.
+        if let Some(task) = self.store.lock().unwrap().get_mut(name) {
+            let status = task.status.get_or_insert_with(Default::default);
+            status.conditions.retain(|c| c.r#type != condition.r#type);
+            status.conditions.push(condition.clone());
+        }
         Ok(())
     }
 
