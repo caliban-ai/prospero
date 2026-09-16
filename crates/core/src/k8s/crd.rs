@@ -262,6 +262,27 @@ pub struct EnvEntry {
     pub value: String,
 }
 
+/// One entry of `CalibanTask.status.conditions`.
+///
+/// The operator declares `conditions` as a map-list keyed by `type`
+/// (caliban-operator#64), so each field manager owns its own entries: the
+/// operator owns `Ready`, prospero owns `AgentsSettled` (#228).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// Condition type, e.g. `AgentsSettled`. The map-list key.
+    pub r#type: String,
+    /// `"True"`, `"False"` or `"Unknown"`.
+    pub status: String,
+    /// Machine-readable reason, e.g. `Succeeded`, `Failed`, `AgentsActive`.
+    pub reason: String,
+    /// Human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// RFC-3339 timestamp of the last status change.
+    pub last_transition_time: String,
+}
+
 /// Observed state of a `Workspace` — the subset `K8sFleet` reads to surface
 /// reconciliation status on the dashboard. `phase` is a plain `String` (like
 /// [`CalibanTaskStatus::phase`]) so an unknown operator phase still deserializes.
