@@ -10,4 +10,5 @@ pub mod crd;
 #[cfg(any(test, feature = "testkit"))]
 pub mod fake;
 pub mod fleet;
+pub mod status;
 pub mod workspace_api;

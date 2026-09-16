@@ -136,6 +136,10 @@ pub struct CalibanTaskStatus {
     /// workspace label; absent until the operator reconciles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_workspace: Option<ResolvedWorkspace>,
+    /// Status conditions, a map-list keyed by `type` (caliban-operator#64).
+    /// The operator owns `Ready`; prospero owns `AgentsSettled` (#228).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
 }
 
 /// A by-name reference to another object in the same namespace.
@@ -262,6 +266,34 @@ pub struct EnvEntry {
     pub value: String,
 }
 
+/// One entry of `CalibanTask.status.conditions`.
+///
+/// The operator declares `conditions` as a map-list keyed by `type`
+/// (caliban-operator#64), so each field manager owns its own entries: the
+/// operator owns `Ready`, prospero owns `AgentsSettled` (#228).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// Condition type, e.g. `AgentsSettled`. The map-list key.
+    pub r#type: String,
+    /// `"True"`, `"False"` or `"Unknown"`.
+    pub status: String,
+    /// Machine-readable reason, e.g. `Succeeded`, `Failed`, `AgentsActive`.
+    ///
+    /// Defaulted on read like [`CalibanTaskStatus::phase`]: this mirror must
+    /// deserialize whatever the operator (or another manager) wrote, including
+    /// a condition that omits it. Prospero's own writer always sets it.
+    #[serde(default)]
+    pub reason: String,
+    /// Human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// RFC-3339 timestamp of the last status change. Defaulted on read for the
+    /// same reason as `reason`.
+    #[serde(default)]
+    pub last_transition_time: String,
+}
+
 /// Observed state of a `Workspace` — the subset `K8sFleet` reads to surface
 /// reconciliation status on the dashboard. `phase` is a plain `String` (like
 /// [`CalibanTaskStatus::phase`]) so an unknown operator phase still deserializes.
@@ -372,8 +404,10 @@ spec:
 
     #[test]
     fn status_reads_resolved_workspace_and_tolerates_unknown_fields() {
-        // A fuller operator-produced status: pinned resolvedWorkspace plus a
-        // `conditions` field this mirror omits (must not fail to deserialize).
+        // A fuller operator-produced status: pinned resolvedWorkspace plus the
+        // operator's own `Ready` condition, written with only `type`/`status`
+        // (a manager may omit `reason`/`lastTransitionTime`, so reading one
+        // must not fail).
         let yaml = r#"
 apiVersion: caliban.caliban-ai.dev/v1alpha1
 kind: CalibanTask

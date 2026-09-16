@@ -33,7 +33,9 @@ use crate::error::{CoreError, Result};
 use crate::event::EventKind;
 use crate::fleet::{AttachBackoff, AttachTarget, Emitter, attach_loop};
 use crate::fleet_provider::FleetProvider;
-use crate::k8s::crd::{CalibanTask, CalibanTaskSpec, TaskSpec as CrdTaskSpec, WorkspaceRef};
+use crate::k8s::crd::{
+    CalibanTask, CalibanTaskSpec, Condition, TaskSpec as CrdTaskSpec, WorkspaceRef,
+};
 use crate::k8s::workspace_api::WorkspaceApi;
 use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
 use crate::ownership::{Ownership, SelfOwnsAll};
@@ -457,6 +459,9 @@ pub trait CalibanTaskApi: Send + Sync {
     async fn delete(&self, name: &str) -> Result<()>;
     /// List all `CalibanTask`s this API is scoped to (its namespace).
     async fn list(&self) -> Result<Vec<CalibanTask>>;
+    /// Server-side-apply one condition onto `name`'s status subresource under
+    /// prospero's own field manager, touching nothing else (#228).
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()>;
 }
 
 /// Real `CalibanTaskApi` backed by a `kube::Api<CalibanTask>`.
@@ -547,6 +552,20 @@ impl CalibanTaskApi for KubeTaskApi {
             .get_opt(name)
             .await
             .map_err(|e| map_kube_err("get CalibanTask", e))
+    }
+
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()> {
+        // No `.force()`: the operator owns phase/endpoint/sandboxRef and its own
+        // conditions, and this apply must never take those fields from it. A
+        // conflict here means someone else claimed `AgentsSettled`, which is a
+        // real error worth surfacing rather than stealing (caliban-operator#64).
+        let params = kube::api::PatchParams::apply("prospero");
+        let body = crate::k8s::status::status_condition_patch(name, condition);
+        self.api
+            .patch_status(name, &params, &kube::api::Patch::Apply(&body))
+            .await
+            .map_err(|e| map_kube_err("apply CalibanTask status condition", e))?;
+        Ok(())
     }
 
     async fn delete(&self, name: &str) -> Result<()> {
@@ -1106,7 +1125,7 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                     })
                     .collect()
             };
-            overlay_pod_status(&session, &tasks, &mut overlaid, |name| {
+            let refreshed = overlay_pod_status(&session, &tasks, &mut overlaid, |name| {
                 !settled.contains_key(name)
             })
             .await;
@@ -1234,6 +1253,20 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                 .await
                 .is_some()
             {
+                // #228: report agent lifecycle back into each CR whose pod
+                // answered this pass. The operator is infrastructure-only
+                // (caliban-operator ADR 0005) and cannot tell a finished agent
+                // from a live one, so its phase never leaves `Running` until it
+                // sees this condition (caliban-operator#37). Gated by the same
+                // observer lease as the emits below, so clustered replicas do
+                // not fight over one CR's status.
+                let now = chrono::Utc::now().to_rfc3339();
+                let observed: Vec<(String, Vec<AgentStatus>)> = refreshed
+                    .iter()
+                    .map(|(name, status)| (name.clone(), vec![*status]))
+                    .collect();
+                crate::k8s::status::report_agents_settled(api.as_ref(), &observed, &now).await;
+
                 for change in &changes {
                     if let FleetChange::StatusChanged {
                         id,
@@ -1437,12 +1470,15 @@ impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
 /// loop and `snapshot` disagreed about an agent's status was the whole defect:
 /// the loop emitted events from the CR phase while the dashboard displayed pod
 /// truth, and on a real cluster the CR phase never leaves `Running`.
+/// Returns the live status of every agent whose pod actually answered this
+/// pass, keyed by CR name — the caller reports exactly those into their CR
+/// status (#228), leaving an unreachable pod's condition untouched.
 async fn overlay_pod_status(
     session: &SessionPlane,
     tasks: &[CalibanTask],
     agents: &mut [Agent],
     include: impl Fn(&str) -> bool,
-) {
+) -> HashMap<String, AgentStatus> {
     // CR name -> its pod endpoint, plus the distinct endpoints to query
     // (dedup: one List per pod).
     let mut agent_endpoint: HashMap<String, String> = HashMap::new();
@@ -1467,7 +1503,7 @@ async fn overlay_pod_status(
         }
     }
     if endpoints.is_empty() {
-        return;
+        return HashMap::new();
     }
 
     // endpoint -> that pod's live record. Keyed by *endpoint*, not agent id:
@@ -1516,12 +1552,15 @@ async fn overlay_pod_status(
             .flatten()
             .collect();
 
+    let mut refreshed = HashMap::new();
     for agent in agents.iter_mut() {
         if let Some(rec) = agent_endpoint.get(&agent.id).and_then(|a| records.get(a)) {
             agent.interactive = rec.spec.interactive;
             agent.status = rec.status;
+            refreshed.insert(agent.id.clone(), rec.status);
         }
     }
+    refreshed
 }
 
 impl<A: CalibanTaskApi + 'static> K8sFleet<A> {
@@ -1934,6 +1973,7 @@ impl MemTaskApi {
             caliband_endpoint: endpoint.map(str::to_string),
             sandbox_ref: None,
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
     }
 }
@@ -1980,6 +2020,17 @@ impl CalibanTaskApi for MemTaskApi {
 
     async fn list(&self) -> Result<Vec<CalibanTask>> {
         Ok(self.store.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn apply_status_condition(&self, name: &str, condition: &Condition) -> Result<()> {
+        let mut store = self.store.lock().unwrap();
+        let task = store
+            .get_mut(name)
+            .ok_or_else(|| CoreError::Fleet(format!("CalibanTask {name} not found")))?;
+        let status = task.status.get_or_insert_with(Default::default);
+        status.conditions.retain(|c| c.r#type != condition.r#type);
+        status.conditions.push(condition.clone());
+        Ok(())
     }
 }
 
@@ -2307,6 +2358,7 @@ mod tests {
                 caliband_endpoint: Some(endpoint.to_string()),
                 sandbox_ref: None,
                 resolved_workspace: None,
+                conditions: Vec::new(),
             });
             ct
         };
@@ -2381,6 +2433,7 @@ mod tests {
             caliband_endpoint: Some("10.0.0.5:9443".to_string()),
             sandbox_ref: None,
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
 
         let agent = agent_from_task(&ct);
@@ -2956,6 +3009,7 @@ mod tests {
                 env: Vec::new(),
                 isolation: None,
             }),
+            conditions: Vec::new(),
         });
         ct
     }
@@ -3368,6 +3422,72 @@ mod tests {
         (events, store)
     }
 
+    /// #228: the operator cannot see a finished agent — the CR phase stays
+    /// `Running` forever — so prospero reports pod truth back into the CR as an
+    /// `AgentsSettled` condition for the operator to act on (caliban-operator#37).
+    #[tokio::test]
+    async fn the_watch_loop_reports_agents_settled_into_the_cr_status() {
+        let token = "agents-settled-token";
+        let (mut fake, tls) = FakeCaliband::start_tcp_tls(token)
+            .await
+            .expect("start fake caliband over tcp+tls");
+
+        let id = "ct-settled-report";
+        fake.add_agent_tcp(id, Vec::new()).await;
+        fake.set_status(id, AgentStatus::Running);
+
+        let api = MemTaskApi::new();
+        api.apply(&build_calibantask(&spec("repo-a", "p", None), id))
+            .await
+            .unwrap();
+        api.set_running(id, &tls.addr);
+
+        let (bus, store) = test_seams();
+        let client_tls =
+            crate::caliband::transport::tls_client_from_pem(&tls.ca_pem, "localhost").unwrap();
+        let fleet = K8sFleet::new(api.clone(), bus, store)
+            .with_network(Some(client_tls), Some(token.to_string()))
+            .with_watch_poll_interval(Duration::from_millis(20));
+
+        // While the agent is live the task is explicitly *not* settled.
+        eventually("an AgentsActive condition while the agent runs", || {
+            condition_of(&api, id).is_some_and(|c| c.reason == "AgentsActive")
+        })
+        .await;
+
+        fake.set_status(id, AgentStatus::Done);
+
+        eventually("a settled condition once the agent finishes", || {
+            condition_of(&api, id).is_some_and(|c| c.status == "True")
+        })
+        .await;
+        let settled = condition_of(&api, id).expect("condition present");
+        assert_eq!(settled.reason, "Succeeded");
+        assert_eq!(settled.r#type, crate::k8s::status::AGENTS_SETTLED);
+
+        // The operator's fields stay untouched: prospero only ever applies its
+        // own condition.
+        let task = api.get(id).await.unwrap().expect("CR present");
+        let status = task.status.expect("status");
+        assert_eq!(status.phase, "Running");
+        assert_eq!(status.caliband_endpoint.as_deref(), Some(tls.addr.as_str()));
+        drop(fleet);
+    }
+
+    /// The `AgentsSettled` condition currently on `name`'s CR, if any.
+    fn condition_of(api: &MemTaskApi, name: &str) -> Option<crate::k8s::crd::Condition> {
+        api.store
+            .lock()
+            .unwrap()
+            .get(name)?
+            .status
+            .as_ref()?
+            .conditions
+            .iter()
+            .find(|c| c.r#type == crate::k8s::status::AGENTS_SETTLED)
+            .cloned()
+    }
+
     /// #194: the cluster bug in a test. The CR phase never advances, so #190's
     /// CR-phase diff saw nothing; the watch loop must read the pod like
     /// `snapshot()` already does.
@@ -3606,6 +3726,7 @@ mod tests {
             caliband_endpoint: Some(tls.addr.clone()),
             sandbox_ref: None,
             resolved_workspace: None,
+            conditions: Vec::new(),
         });
 
         let client_tls =
