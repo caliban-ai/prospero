@@ -1260,12 +1260,11 @@ fn spawn_watch_loop<A: CalibanTaskApi + 'static>(
                 // sees this condition (caliban-operator#37). Gated by the same
                 // observer lease as the emits below, so clustered replicas do
                 // not fight over one CR's status.
-                let now = chrono::Utc::now().to_rfc3339();
                 let observed: Vec<(String, Vec<AgentStatus>)> = refreshed
                     .iter()
                     .map(|(name, status)| (name.clone(), vec![*status]))
                     .collect();
-                crate::k8s::status::report_agents_settled(api.as_ref(), &observed, &now).await;
+                crate::k8s::status::report_agents_settled(api.as_ref(), &observed).await;
 
                 for change in &changes {
                     if let FleetChange::StatusChanged {

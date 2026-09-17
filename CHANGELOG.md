@@ -9,6 +9,19 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-16
+
+### Fixed
+
+- **The `AgentsSettled` condition is written in a real cluster.** v0.8.0's
+  condition carried `lastTransitionTime`, which the `CalibanTask` CRD's
+  condition schema doesn't declare, so server-side apply rejected every write
+  with a 500 ("field not declared in schema"). No condition was ever written, a
+  finished task never reached `Completed`, and prosperod logged the failure on
+  every poll. prospero now sends only `type`, `status` and `reason`, matching
+  caliban-operator's `Condition`, and a test pins the apply body to those
+  fields. (#234)
+
 ## [0.8.0] - 2026-09-16
 
 prosperod now authenticates its API, and in Kubernetes it reports agent
@@ -635,7 +648,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/caliban-ai/prospero/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/caliban-ai/prospero/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/caliban-ai/prospero/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/caliban-ai/prospero/compare/v0.5.0...v0.6.0

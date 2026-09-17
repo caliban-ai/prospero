@@ -288,10 +288,9 @@ pub struct Condition {
     /// Human-readable detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// RFC-3339 timestamp of the last status change. Defaulted on read for the
-    /// same reason as `reason`.
-    #[serde(default)]
-    pub last_transition_time: String,
+    // No `lastTransitionTime`: the CalibanTask CRD's condition schema (owned by
+    // caliban-operator) doesn't declare it, and server-side apply rejects an
+    // undeclared field outright (#234). Mirror the schema field for field.
 }
 
 /// Observed state of a `Workspace` — the subset `K8sFleet` reads to surface
@@ -406,7 +405,7 @@ spec:
     fn status_reads_resolved_workspace_and_tolerates_unknown_fields() {
         // A fuller operator-produced status: pinned resolvedWorkspace plus the
         // operator's own `Ready` condition, written with only `type`/`status`
-        // (a manager may omit `reason`/`lastTransitionTime`, so reading one
+        // (a manager may omit `reason`, so reading one
         // must not fail).
         let yaml = r#"
 apiVersion: caliban.caliban-ai.dev/v1alpha1
