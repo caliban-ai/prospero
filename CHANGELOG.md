@@ -9,6 +9,69 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-16
+
+prosperod now authenticates its API, and in Kubernetes it reports agent
+lifecycle back to the operator. Named API tokens with one of three scopes guard
+every non-probe route; the dashboard signs in with a token and holds a signed
+session cookie; and the CLI carries a token. Separately, prosperod writes an
+`AgentsSettled` condition to each `CalibanTask`'s status, which caliban-operator
+v0.5.0 turns into a terminal `Completed` or `Failed` phase, so a finished task
+finally leaves `Running`.
+
+```admonish warning
+**Breaking for deployments:** with no tokens configured, prosperod now refuses a
+non-loopback `--addr` (such as `0.0.0.0` in a container) unless
+`--insecure-no-auth` / `PROSPERO_INSECURE_NO_AUTH=1` is set. Configure
+`--api-tokens-file` / `PROSPERO_API_TOKENS_FILE` before upgrading, or opt out
+explicitly. See the "Securing the API" guide page.
+```
+
+### Added
+
+- **Breaking: API authentication and authorization** (ADR-0010). Named tokens
+  (`pspo_…`) with scope `read`, `operate` or `admin`, stored as SHA-256 hashes in
+  a tokens file; a route-scope table that fails closed to `admin`; JSON 401/403;
+  and one `prospero_audit` log line per mutation. With tokens configured, every
+  request needs one, loopback included. `/healthz`, `/readyz`, the dashboard
+  shell and `/api/session` stay open. The dashboard signs in with a token for a
+  12-hour HMAC-signed `HttpOnly; SameSite=Strict` cookie bound to the token's
+  hash, and cookie-authenticated mutations must be same-origin. Clustered
+  prosperod with tokens needs `--session-key-file` so replicas share cookie
+  signing. The token name is recorded as `actor` on local-fleet spawn and remove
+  events and persisted in every store (nullable column migration). CLI:
+  `--token` / `PROSPERO_TOKEN`, `--token-file` / `PROSPERO_TOKEN_FILE`,
+  `prospero token new <name> --scope <scope>` and `prospero whoami`. (#2) (#227)
+
+- **`AgentsSettled` condition on `CalibanTask` status.** After each poll in
+  which a pod's caliband answers, prosperod server-side applies one condition
+  under field manager `prospero`: `True`/`Succeeded` when every agent finished,
+  `True`/`Failed` if any ended failed or crashed, otherwise `False`/`AgentsActive`
+  (an idle interactive task stays unsettled). The apply carries only that
+  condition, never forces, skips tasks whose caliband didn't answer, and runs
+  under the observer lease so clustered replicas don't race. Needs RBAC `patch`
+  on `calibantasks/status` (caliban-ai/helm-charts prospero chart 0.2.9); without
+  it prosperod logs a warning per poll and carries on. (#228) (#232)
+
+- **View model thinking in the dashboard.** With `PROSPERO_INCLUDE_THINKING`
+  set, reasoning content is kept through normalization and shown as a
+  collapsible "Thinking" segment on the agent timeline, separate from output. Off
+  by default. (#212) (#216)
+
+### Fixed
+
+- **A re-spawned k8s agent that reuses a task name is attached again.** A fast
+  delete and recreate of a same-named `CalibanTask` left the predecessor's
+  terminal mark in place, so prospero never attached to the healthy new agent
+  until prosperod restarted. The poll loop now tracks each CR's uid and clears
+  the mark when a known name returns with a new uid. (#213) (#214)
+
+### Documentation
+
+- User guide pages, and the README and container docs brought current. (#229)
+- Competitor evaluation: re-verified the OpenClaw parity matrix and added
+  OpenHands, Coder, GitHub Agent HQ and Vibe Kanban. (#215)
+
 ## [0.7.0] - 2026-09-13
 
 Follows caliban's removal of its bespoke `ollama` provider (caliban ADR 0056).
@@ -572,7 +635,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/caliban-ai/prospero/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/caliban-ai/prospero/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/caliban-ai/prospero/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/caliban-ai/prospero/compare/v0.4.0...v0.5.0
