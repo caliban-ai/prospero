@@ -19,7 +19,7 @@ pub const AGENTS_SETTLED: &str = "AgentsSettled";
 /// operator input rather than finished. A task with no agents yet is likewise
 /// unsettled. Once settled, any `Failed`/`Crashed` agent makes the whole task
 /// `Failed`; otherwise it `Succeeded`.
-pub fn agents_settled_condition(agents: &[AgentStatus], now: &str) -> Condition {
+pub fn agents_settled_condition(agents: &[AgentStatus]) -> Condition {
     let settled = !agents.is_empty() && agents.iter().all(|s| s.is_terminal());
     let (status, reason) = if !settled {
         ("False", "AgentsActive")
@@ -36,7 +36,6 @@ pub fn agents_settled_condition(agents: &[AgentStatus], now: &str) -> Condition 
         status: status.to_string(),
         reason: reason.to_string(),
         message: None,
-        last_transition_time: now.to_string(),
     }
 }
 
@@ -49,10 +48,9 @@ pub fn agents_settled_condition(agents: &[AgentStatus], now: &str) -> Condition 
 pub async fn report_agents_settled<A: super::fleet::CalibanTaskApi + ?Sized>(
     api: &A,
     observed: &[(String, Vec<AgentStatus>)],
-    now: &str,
 ) {
     for (name, agents) in observed {
-        let condition = agents_settled_condition(agents, now);
+        let condition = agents_settled_condition(agents);
         if let Err(e) = api.apply_status_condition(name, &condition).await {
             // Reporting is best-effort: the next poll re-derives and re-applies,
             // so a failed write must not take down the observation loop.
@@ -84,21 +82,18 @@ mod tests {
     use super::{AGENTS_SETTLED, agents_settled_condition};
     use crate::AgentStatus;
 
-    const NOW: &str = "2026-09-15T00:00:00Z";
-
     #[test]
     fn all_finished_cleanly_is_settled_succeeded() {
-        let c = agents_settled_condition(&[AgentStatus::Done, AgentStatus::Killed], NOW);
+        let c = agents_settled_condition(&[AgentStatus::Done, AgentStatus::Killed]);
         assert_eq!(c.r#type, AGENTS_SETTLED);
         assert_eq!(c.status, "True");
         assert_eq!(c.reason, "Succeeded");
-        assert_eq!(c.last_transition_time, NOW);
     }
 
     #[test]
     fn any_bad_ending_is_settled_failed() {
         for bad in [AgentStatus::Failed, AgentStatus::Crashed] {
-            let c = agents_settled_condition(&[AgentStatus::Done, bad], NOW);
+            let c = agents_settled_condition(&[AgentStatus::Done, bad]);
             assert_eq!(c.status, "True", "{bad:?}");
             assert_eq!(c.reason, "Failed", "{bad:?}");
         }
@@ -111,7 +106,7 @@ mod tests {
             AgentStatus::Running,
             AgentStatus::Idle,
         ] {
-            let c = agents_settled_condition(&[AgentStatus::Done, busy], NOW);
+            let c = agents_settled_condition(&[AgentStatus::Done, busy]);
             assert_eq!(c.status, "False", "{busy:?}");
             assert_eq!(c.reason, "AgentsActive", "{busy:?}");
         }
@@ -119,7 +114,7 @@ mod tests {
 
     #[test]
     fn no_agents_yet_is_not_settled() {
-        let c = agents_settled_condition(&[], NOW);
+        let c = agents_settled_condition(&[]);
         assert_eq!(c.status, "False");
         assert_eq!(c.reason, "AgentsActive");
     }
@@ -132,7 +127,7 @@ mod tests {
             ("busy-task".to_string(), vec![AgentStatus::Running]),
         ];
 
-        super::report_agents_settled(&api, &observed, NOW).await;
+        super::report_agents_settled(&api, &observed).await;
 
         let done = api
             .status_condition("done-task", AGENTS_SETTLED)
@@ -153,7 +148,7 @@ mod tests {
 
         // The caller only reports tasks whose pod answered, so an unreachable
         // one simply never appears here — and must not be written at all.
-        super::report_agents_settled(&api, &[], NOW).await;
+        super::report_agents_settled(&api, &[]).await;
 
         assert!(
             api.status_condition("silent-task", AGENTS_SETTLED)
@@ -163,7 +158,7 @@ mod tests {
 
     #[test]
     fn the_patch_body_carries_only_our_condition() {
-        let c = agents_settled_condition(&[AgentStatus::Done], NOW);
+        let c = agents_settled_condition(&[AgentStatus::Done]);
         let body = super::status_condition_patch("task-7", &c);
 
         assert_eq!(body["apiVersion"], "caliban.caliban-ai.dev/v1alpha1");
@@ -177,7 +172,19 @@ mod tests {
         assert_eq!(conditions[0]["type"], AGENTS_SETTLED);
         assert_eq!(conditions[0]["status"], "True");
         assert_eq!(conditions[0]["reason"], "Succeeded");
-        assert_eq!(conditions[0]["lastTransitionTime"], NOW);
+
+        // Server-side apply builds a typed patch against the CalibanTask CRD's
+        // structural schema and rejects any undeclared field with a 500, so the
+        // condition may carry only what caliban-operator's `Condition` declares
+        // (#234: `lastTransitionTime` broke every apply in a real cluster).
+        const CRD_CONDITION_FIELDS: [&str; 4] = ["type", "status", "reason", "message"];
+        let condition = conditions[0].as_object().expect("condition is an object");
+        for key in condition.keys() {
+            assert!(
+                CRD_CONDITION_FIELDS.contains(&key.as_str()),
+                "condition field {key:?} is not declared in the CalibanTask CRD schema"
+            );
+        }
 
         // Operator-owned fields must never appear: applying them under our
         // field manager would fight caliban-operator for ownership.
