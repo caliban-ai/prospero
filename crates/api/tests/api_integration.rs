@@ -598,6 +598,8 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
                 id: "tu_1".to_string(),
                 name: "Read".to_string(),
                 ok: true,
+                result: None,
+                truncated: false,
             },
         ))
         .await

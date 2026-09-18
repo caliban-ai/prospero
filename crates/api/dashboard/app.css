@@ -1581,7 +1581,8 @@ textarea.input {
   color: var(--ink-dim);
 }
 
-.tl-tool-input {
+.tl-tool-input,
+.tl-tool-result {
   margin: 0;
   padding: var(--sp-2);
   border-radius: var(--radius-sm);
