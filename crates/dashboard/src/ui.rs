@@ -14,7 +14,7 @@ use crate::charts::{Measure, Point, Window};
 use crate::config_form::{K8sForm, LocalForm, PROVIDER_KINDS, ProviderRow, SourceRow};
 use crate::stream::{StreamSession, StreamState};
 use crate::theme::{STORAGE_KEY, Theme};
-use crate::timeline::{Segment, ToolCall};
+use crate::timeline::{ResultView, Segment, ToolCall};
 use crate::view_model::{
     AgentControls, FleetTotals, SessionState, StatusCounts, awaits_input, basename, controls_for,
     count_statuses, elapsed, health_reason, is_healthy, is_launchable, permits, session_label,
@@ -1995,7 +1995,8 @@ fn TimelineSegment(segment: Segment) -> Element {
     }
 }
 
-/// One tool call: collapsed to name/outcome/duration, expanding to its input.
+/// One tool call: collapsed to name/outcome/duration, expanding to its input
+/// and result.
 #[component]
 fn ToolEntry(call: ToolCall) -> Element {
     let duration = call
@@ -2028,14 +2029,28 @@ fn ToolEntry(call: ToolCall) -> Element {
                     div { class: "tl-tool-legend", "input" }
                     pre { class: "tl-tool-input", "{input}" }
                 }
-                // Stated rather than shown as an empty panel: the result body
-                // is genuinely not on the wire, and a blank box reads as a bug.
+                // A missing result is stated rather than shown as an empty
+                // panel: a blank box reads as a bug.
                 div { class: "tl-tool-section",
                     div { class: "tl-tool-legend", "result" }
-                    p { class: "tl-tool-absent",
-                        "The event stream carries this call's input and whether it "
-                        "succeeded, but not the result body — that needs a "
-                        "caliban-side change."
+                    match call.result_view() {
+                        ResultView::Pending => rsx! {
+                            p { class: "tl-tool-absent", "Still running — no result yet." }
+                        },
+                        ResultView::Unrecorded => rsx! {
+                            p { class: "tl-tool-absent",
+                                "No result was recorded for this call. It predates "
+                                "result capture, or the agent sent none."
+                            }
+                        },
+                        ResultView::Text { text, truncated } => rsx! {
+                            pre { class: "tl-tool-result", "{text}" }
+                            if truncated {
+                                p { class: "tl-tool-absent",
+                                    "Truncated — showing the start of the result."
+                                }
+                            }
+                        },
                     }
                 }
             }

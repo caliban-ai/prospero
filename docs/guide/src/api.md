@@ -177,7 +177,7 @@ which today means local-fleet spawn and remove.
 | `status_changed` | `from`, `to` | Lifecycle transition (`spawning`, `running`, `idle`, `killed`, `done`, `failed`, `crashed`) |
 | `output` | `stream` (`stdout` or `thinking`), `chunk` | Streamed text |
 | `tool_started` | `id`, `name`, `input` | A tool call began |
-| `tool_finished` | `id`, `name`, `ok` | A tool call ended. Pair it with its start by `id`; `name` is usually empty |
+| `tool_finished` | `id`, `name`, `ok`, `result`?, `truncated`? | A tool call ended. Pair it with its start by `id`; `name` is usually empty. `result` is what the tool returned as text, capped at 8,192 characters; `truncated: true` means it is only the start of a longer result. Both are omitted when absent (events recorded before results were captured, or no result sent) |
 | `agent_finished` | `outcome`, `cost_usd`, `turns` | Terminal accounting |
 | `agent_gone` | — | The agent left caliband's registry |
 | `repo_health` | `state` | A workspace's caliband became `healthy` or `unreachable` |

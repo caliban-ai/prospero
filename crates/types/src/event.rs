@@ -75,6 +75,15 @@ pub enum EventKind {
         name: String,
         /// Whether the tool succeeded.
         ok: bool,
+        /// What the tool returned, as display text: caliban's `result_text`,
+        /// the head of the result, bounded (see
+        /// `prospero_core::caliband::stream::TOOL_RESULT_CAP`). `None` for
+        /// events stored before #236 or a frame that carried no result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        /// `true` when `result` is only the head of a longer result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// The agent finished; carries the final accounting.
     AgentFinished {
@@ -157,12 +166,48 @@ mod tests {
             id: "tu_1".into(),
             name: "Read".into(),
             ok: true,
+            result: None,
+            truncated: false,
         };
         let v = serde_json::to_value(&k).unwrap();
         assert_eq!(v["kind"], "tool_finished");
         assert_eq!(v["id"], "tu_1");
         assert_eq!(v["name"], "Read");
         assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn tool_finished_carries_its_result_and_truncation() {
+        let k = EventKind::ToolFinished {
+            id: "tu_1".into(),
+            name: String::new(),
+            ok: true,
+            result: Some("src/main.rs".into()),
+            truncated: true,
+        };
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["result"], "src/main.rs");
+        assert_eq!(v["truncated"], true);
+        let back: EventKind = serde_json::from_value(v).unwrap();
+        assert_eq!(back, k);
+    }
+
+    #[test]
+    fn tool_finished_stored_before_results_still_deserializes() {
+        // Events persisted before #236 carry no `result`/`truncated`.
+        let old =
+            serde_json::json!({"kind": "tool_finished", "id": "tu_1", "name": "", "ok": false});
+        let k: EventKind = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            k,
+            EventKind::ToolFinished {
+                id: "tu_1".into(),
+                name: String::new(),
+                ok: false,
+                result: None,
+                truncated: false,
+            }
+        );
     }
 
     #[test]

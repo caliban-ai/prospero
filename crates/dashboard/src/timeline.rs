@@ -63,6 +63,42 @@ pub struct ToolCall {
     pub outcome: ToolOutcome,
     /// Wall time between start and finish, when both timestamps parsed.
     pub duration_ms: Option<i64>,
+    /// What the tool returned, from the finish (#236). `None` while running,
+    /// or for a finish recorded before results were captured.
+    pub result: Option<String>,
+    /// `result` is only the head of a longer result.
+    pub result_truncated: bool,
+}
+
+/// What the inspector's `result` section shows for a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultView {
+    /// Still running; no finish yet.
+    Pending,
+    /// Finished, but the event carries no result: recorded before #236, or
+    /// from a caliban that sent no `result_text`.
+    Unrecorded,
+    /// The result text, and whether it is only the head of a longer one.
+    Text {
+        /// The result (or its head).
+        text: String,
+        /// Cut to fit a cap, caliban's or prospero's.
+        truncated: bool,
+    },
+}
+
+impl ToolCall {
+    /// Decide what the inspector shows as this call's result.
+    pub fn result_view(&self) -> ResultView {
+        match (&self.result, self.outcome) {
+            (Some(text), _) => ResultView::Text {
+                text: text.clone(),
+                truncated: self.result_truncated,
+            },
+            (None, ToolOutcome::Running) => ResultView::Pending,
+            (None, _) => ResultView::Unrecorded,
+        }
+    }
 }
 
 /// One renderable block of the timeline.
@@ -222,12 +258,20 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
                     input: input.clone(),
                     outcome: ToolOutcome::Running,
                     duration_ms: None,
+                    result: None,
+                    result_truncated: false,
                 }));
                 let at = segs.len() - 1;
                 open_tools.push(at);
                 started_at.insert(at, event.ts.clone());
             }
-            EventKind::ToolFinished { id, ok, .. } => {
+            EventKind::ToolFinished {
+                id,
+                ok,
+                result,
+                truncated,
+                ..
+            } => {
                 // Pair on the id; fall back to the oldest open call for
                 // pre-#106 events that carry none. `name` is deliberately
                 // ignored — the finish frame leaves it empty (#106).
@@ -249,6 +293,8 @@ pub fn group(entries: &[Entry]) -> Vec<Segment> {
                             ToolOutcome::Failed
                         };
                         t.duration_ms = duration;
+                        t.result = result.clone();
+                        t.result_truncated = *truncated;
                     }
                     open_tools.retain(|x| *x != i);
                     started_at.remove(&i);
@@ -381,6 +427,8 @@ mod tests {
                     id: "tu_1".into(),
                     name: "Read".into(),
                     ok: true,
+                    result: None,
+                    truncated: false,
                 },
             ),
         ]);
@@ -396,6 +444,71 @@ mod tests {
         assert_eq!(t.duration_ms, Some(2000));
     }
 
+    /// #236: the finish carries what the tool returned; the inspector reads it
+    /// off the paired call.
+    #[test]
+    fn the_finish_result_lands_on_the_paired_call() {
+        let segs = group(&[
+            ev(1, "2026-08-01T10:00:00+00:00", started("tu_1", "Glob")),
+            ev(
+                2,
+                "2026-08-01T10:00:01+00:00",
+                EventKind::ToolFinished {
+                    id: "tu_1".into(),
+                    name: String::new(),
+                    ok: true,
+                    result: Some("a.rs\nb.rs".into()),
+                    truncated: true,
+                },
+            ),
+        ]);
+
+        let t = tool(&segs);
+        assert_eq!(t.result.as_deref(), Some("a.rs\nb.rs"));
+        assert!(t.result_truncated);
+    }
+
+    fn call(outcome: ToolOutcome, result: Option<&str>, truncated: bool) -> ToolCall {
+        ToolCall {
+            seq: 1,
+            id: "tu_1".into(),
+            name: "Read".into(),
+            input: serde_json::Value::Null,
+            outcome,
+            duration_ms: None,
+            result: result.map(str::to_string),
+            result_truncated: truncated,
+        }
+    }
+
+    #[test]
+    fn a_running_call_has_no_result_yet() {
+        assert_eq!(
+            call(ToolOutcome::Running, None, false).result_view(),
+            ResultView::Pending
+        );
+    }
+
+    #[test]
+    fn a_finish_without_a_result_is_stated_as_unrecorded() {
+        // Stored before #236, or a caliban that sent no `result_text`.
+        assert_eq!(
+            call(ToolOutcome::Ok, None, false).result_view(),
+            ResultView::Unrecorded
+        );
+    }
+
+    #[test]
+    fn a_finish_with_a_result_shows_it_and_its_truncation() {
+        assert_eq!(
+            call(ToolOutcome::Failed, Some("boom"), true).result_view(),
+            ResultView::Text {
+                text: "boom".into(),
+                truncated: true
+            }
+        );
+    }
+
     /// #106: caliban's `ToolCallEnd` omits the name. Pairing on the name left
     /// every tool stuck "running"; pairing on the id must survive it.
     #[test]
@@ -409,6 +522,8 @@ mod tests {
                     id: "tu_1".into(),
                     name: String::new(),
                     ok: true,
+                    result: None,
+                    truncated: false,
                 },
             ),
         ]);
@@ -436,6 +551,8 @@ mod tests {
                     id: String::new(),
                     name: String::new(),
                     ok: false,
+                    result: None,
+                    truncated: false,
                 },
             ),
         ]);
@@ -484,6 +601,8 @@ mod tests {
                     id: "tu_1".into(),
                     name: String::new(),
                     ok: true,
+                    result: None,
+                    truncated: false,
                 },
             ),
             ev(4, "2026-08-01T10:00:02+00:00", out("after")),
@@ -592,6 +711,8 @@ mod tests {
                     id: "tu_1".into(),
                     name: String::new(),
                     ok: true,
+                    result: None,
+                    truncated: false,
                 },
             ),
         ]);

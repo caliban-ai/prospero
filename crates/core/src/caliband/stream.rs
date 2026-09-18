@@ -71,15 +71,28 @@ pub fn normalize_frame(frame: &serde_json::Value, opts: NormalizeOptions) -> Nor
         // A tool call completed. caliban's `ToolCallEnd` carries the
         // `tool_use_id` and `is_error` but not the tool name (that was on the
         // matching `ToolCallStart`), so `name` is left empty and consumers pair
-        // the finish to its start on `tool_use_id`.
-        "ToolCallEnd" => Normalized::Event(EventKind::ToolFinished {
-            id: str_field(frame, "tool_use_id"),
-            name: String::new(),
-            ok: !frame
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        }),
+        // the finish to its start on `tool_use_id`. The result comes from
+        // `result_text`, caliban's bounded display preview (caliban#391) —
+        // not the full structured `content`, which can be arbitrarily large.
+        "ToolCallEnd" => {
+            let (result, capped) = match frame.get("result_text").and_then(|v| v.as_str()) {
+                Some(text) => {
+                    let (head, capped) = cap_chars(text, TOOL_RESULT_CAP);
+                    (Some(head), capped)
+                }
+                None => (None, false),
+            };
+            Normalized::Event(EventKind::ToolFinished {
+                id: str_field(frame, "tool_use_id"),
+                name: String::new(),
+                ok: !frame
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                result,
+                truncated: capped || bool_field(frame, "truncated"),
+            })
+        }
         // Terminal frame: the whole run finished. This closes the SSE stream.
         "RunEnd" => Normalized::Event(EventKind::AgentFinished {
             outcome: stop_label(frame.get("stopped_for")),
@@ -96,6 +109,24 @@ pub fn normalize_frame(frame: &serde_json::Value, opts: NormalizeOptions) -> Nor
         "TurnStart" | "ToolCallInputDelta" | "TurnEnd" => Normalized::Dropped,
         _ => Normalized::Unknown,
     }
+}
+
+/// Longest tool result, in chars, prospero keeps on a `ToolFinished` event.
+/// Matches caliban's `STREAM_RESULT_TEXT_CAP` (8 KiB), so a current caliban's
+/// `result_text` passes through unchanged; the cap is prospero's own guarantee
+/// that one tool call cannot put an unbounded body into the event stores or SSE.
+pub const TOOL_RESULT_CAP: usize = 8 * 1024;
+
+/// The first `max` chars of `text`, and whether anything was cut.
+fn cap_chars(text: &str, max: usize) -> (String, bool) {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => (text[..at].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+fn bool_field(frame: &serde_json::Value, key: &str) -> bool {
+    frame.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 fn str_field(frame: &serde_json::Value, key: &str) -> String {
@@ -187,7 +218,9 @@ mod tests {
             Normalized::Event(EventKind::ToolFinished {
                 id: "tu_1".into(),
                 name: String::new(),
-                ok: false
+                ok: false,
+                result: None,
+                truncated: false,
             })
         );
         assert_eq!(
@@ -198,9 +231,53 @@ mod tests {
             Normalized::Event(EventKind::ToolFinished {
                 id: "tu_1".into(),
                 name: String::new(),
-                ok: true
+                ok: true,
+                result: None,
+                truncated: false,
             })
         );
+    }
+
+    #[test]
+    fn tool_call_end_carries_the_result_text_and_its_truncation() {
+        // Shape from caliban's `TurnEvent::ToolCallEnd` (caliban#391).
+        let f = json!({
+            "type": "ToolCallEnd", "turn_index": 1, "tool_use_id": "tu_2",
+            "is_error": false,
+            "content": [{"type": "text", "text": "a.rs\nb.rs\n...the full body"}],
+            "result_text": "a.rs\nb.rs\n", "truncated": true
+        });
+        assert_eq!(
+            norm(f),
+            Normalized::Event(EventKind::ToolFinished {
+                id: "tu_2".into(),
+                name: String::new(),
+                ok: true,
+                result: Some("a.rs\nb.rs\n".into()),
+                truncated: true,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_call_end_result_is_capped_on_a_char_boundary() {
+        // A caliban without its own cap must not push an unbounded body into
+        // the event stores: keep the head, flag it truncated.
+        let long = "é".repeat(TOOL_RESULT_CAP + 10);
+        let f = json!({
+            "type": "ToolCallEnd", "tool_use_id": "tu_3", "is_error": false,
+            "result_text": long, "truncated": false
+        });
+        let Normalized::Event(EventKind::ToolFinished {
+            result, truncated, ..
+        }) = norm(f)
+        else {
+            panic!("expected ToolFinished");
+        };
+        let result = result.expect("result kept");
+        assert_eq!(result.chars().count(), TOOL_RESULT_CAP);
+        assert!(result.chars().all(|c| c == 'é'));
+        assert!(truncated);
     }
 
     #[test]
