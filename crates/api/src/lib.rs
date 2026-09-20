@@ -10,6 +10,7 @@ pub mod dashboard;
 pub mod dto;
 pub mod error;
 pub mod handlers;
+pub mod mcp;
 pub mod sse;
 
 use std::sync::Arc;
@@ -49,6 +50,9 @@ pub fn router_with_auth(
     auth: auth::AuthState,
 ) -> Router {
     let auth = Arc::new(auth);
+    // #218: the MCP service holds its own handles to the same seams — the
+    // state below moves them.
+    let mcp_service = mcp::service(fleet.clone(), store.clone());
     let state = AppState {
         fleet,
         admin,
@@ -81,6 +85,9 @@ pub fn router_with_auth(
         // Fleet + workspaces.
         .route("/api/fleet", get(handlers::get_fleet))
         .route("/api/fleet/stream", get(sse::fleet_stream))
+        // #218: the fleet as an MCP server, behind the same scope check as the
+        // REST routes (see `auth::required_access`).
+        .nest_service("/mcp", mcp_service)
         .route("/api/usage", get(handlers::get_usage))
         .route(
             "/api/workspaces",

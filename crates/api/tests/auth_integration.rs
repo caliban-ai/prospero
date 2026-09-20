@@ -101,6 +101,8 @@ const PROTECTED: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/fleet", "", Scope::Read),
     // #219: the fleet-wide stream is a read of the same fleet.
     ("GET", "/api/fleet/stream?from=now", "", Scope::Read),
+    // #218: MCP drives the fleet (spawn/steer/kill), so it sits at `operate`.
+    ("POST", "/mcp", "", Scope::Operate),
     ("GET", "/api/usage", "", Scope::Read),
     ("GET", "/api/workspaces", "", Scope::Read),
     ("GET", "/api/workspaces/repo/agents", "", Scope::Read),

@@ -41,6 +41,7 @@ Errors come back as `{"error": "<message>", "kind": "<kind>"}`:
 | GET | `/api/metrics` | read | Operational counters |
 | GET | `/api/fleet` | read | Fleet snapshot: every workspace and its agents |
 | GET | `/api/fleet/stream?from=N\|now` | read | Every stream's events, replay then tail (SSE) |
+| POST/GET | `/mcp` | operate | Drive the fleet over the Model Context Protocol |
 | GET | `/api/usage` | read | Cost, turns and outcomes per workspace per day |
 | GET | `/api/workspaces` | read | Workspaces with health, sources, agent count and config |
 | POST | `/api/workspaces` | admin | Register a workspace |
@@ -153,6 +154,32 @@ instead of starting a new one. Spawning is idempotent under k8s.
 `POST /api/agents/{id}/respawn` returns `{"agent_id": "<new id>"}`. The old id
 leaves `/api/fleet` and `/api/agents/{id}`, but its history is still available
 from `/api/agents/{old id}/events`.
+
+### MCP
+
+`/mcp` exposes the fleet as an **MCP server** (streamable HTTP), so an agentic
+client can drive prospero with tools instead of hand-written HTTP calls. It is a
+thin adapter over the same seam the REST handlers use, so it works on both
+backends.
+
+| Tool | Does |
+|---|---|
+| `prospero_list_workspaces` | Workspaces, health, agent counts |
+| `prospero_list_agents` | Every agent with status and workspace |
+| `prospero_spawn_agent` | Launch an agent (`workspace`, `prompt`, optional `label`, `model`, `interactive`, `timeout_secs`) |
+| `prospero_agent_status` | One agent's current state |
+| `prospero_agent_events` | Recorded events from `from` onward, capped (100 default, 500 max) with `truncated` + `next_from` |
+| `prospero_send_input` / `prospero_end_input` | Steer an interactive agent |
+| `prospero_kill_agent` / `prospero_respawn_agent` | Stop or restart an agent |
+
+The whole endpoint requires the **`operate`** scope — its tools spawn, steer and
+kill, and one scope for the surface is simpler to reason about than a second,
+per-tool authorization model inside the handler. Workspace administration
+(add/remove/configure) is deliberately *not* exposed; use the REST API with an
+`admin` token.
+
+A spawn is visible to `prospero_list_agents` from the next poll, exactly as it is
+on `GET /api/fleet` — the fleet view is the poll snapshot.
 
 ### The fleet stream
 

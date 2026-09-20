@@ -11,6 +11,8 @@ edition.workspace = true
 k8s = ["prospero-core/k8s"]
 
 [dependencies]
+rmcp.workspace = true
+schemars.workspace = true
 prospero-core.workspace = true
 prospero-types.workspace = true
 axum.workspace = true

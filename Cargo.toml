@@ -24,6 +24,10 @@ prospero-types = { path = "crates/types" }
 # own description asks, because it *is* the wire contract.
 caliban-contract = "=0.14.0"
 
+# MCP server surface (#218). Same crate caliban drives its own MCP adapter
+# with, so the two speak an identical protocol version to any client.
+rmcp = { version = "1.7", features = ["server", "macros", "transport-streamable-http-server"] }
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"
