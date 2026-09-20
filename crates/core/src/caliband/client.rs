@@ -219,7 +219,7 @@ fn unexpected(op: &str, reply: CtlReply) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::caliband::wire::{AttachInbound, PermissionPosture};
+    use crate::caliband::wire::AttachInbound;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -248,19 +248,11 @@ mod tests {
         );
     }
 
+    /// Built from its wire defaults rather than field-by-field: every other
+    /// field of caliban's `SpawnSpec` is `#[serde(default)]`, so this stays
+    /// valid when the contract grows one (#239).
     fn test_spec() -> SpawnSpec {
-        SpawnSpec {
-            label: None,
-            frontmatter_path: None,
-            initial_prompt: "hi".into(),
-            model: None,
-            provider: None,
-            tool_allowlist: None,
-            isolation_worktree: false,
-            inherit_hooks: true,
-            interactive: false,
-            permission_posture: PermissionPosture::Supervised,
-        }
+        serde_json::from_str(r#"{"initial_prompt":"hi"}"#).expect("default spawn spec")
     }
 
     #[tokio::test]

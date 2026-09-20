@@ -108,7 +108,6 @@ impl From<SupervisorError> for CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::AgentStatus;
 
     #[test]
     fn display_messages() {
@@ -170,7 +169,8 @@ mod tests {
         let inv: CoreError = SupervisorError::InvalidState {
             op: "respawn".into(),
             id: "a2".into(),
-            status: AgentStatus::Done,
+            // caliban's wire status (#239), not prospero's domain enum.
+            status: crate::caliband::wire::WireAgentStatus::Done,
         }
         .into();
         match inv {

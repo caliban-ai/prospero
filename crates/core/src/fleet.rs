@@ -18,7 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 use crate::bus::{EventBus, InProcessBus};
 use crate::caliband::client::CalibandClient;
 use crate::caliband::stream::{NormalizeOptions, Normalized, normalize_frame};
-use crate::caliband::wire::{AgentRecord, AttachInbound, Endpoint, SpawnSpec};
+use crate::caliband::wire::{self, AgentRecord, AttachInbound, Endpoint, SpawnSpec};
 use crate::config_store::{ConfigStore, SqliteConfigStore};
 use crate::discovery::{DiscoveryEnv, EnsureConfig, ensure_caliband};
 use crate::error::{CoreError, Result};
@@ -96,7 +96,16 @@ impl SpawnRequest {
             isolation_worktree: self.isolation_worktree,
             inherit_hooks: true,
             interactive: self.interactive,
-            permission_posture: self.permission_posture,
+            permission_posture: wire::wire_posture(self.permission_posture),
+            // Fields prospero does not use. `inherited_hooks_config` is
+            // caliban's opaque parent-permission bridge, superseded for posture
+            // by `permission_posture` (ADR 0059); `source` and `resume_session`
+            // belong to caliban's own sub-agent flows; `drive_protocol` stays
+            // NDJSON until the ACP driver lands (#242, ADR-0011).
+            inherited_hooks_config: None,
+            source: None,
+            resume_session: None,
+            drive_protocol: wire::DriveProtocol::Ndjson,
         }
     }
 }
@@ -1186,14 +1195,18 @@ impl FleetManager {
                 id: rec.id.clone(),
                 name: rec.name.clone(),
                 workspace: repo.to_string(),
-                status: rec.status,
+                // caliband's wire status → prospero's domain status (#239).
+                status: wire::domain_status(rec.status),
                 started_at: rec.started_at.clone(),
                 isolated: rec.spec.isolation_worktree,
                 interactive: rec.spec.interactive,
                 session_dir: rec.session_dir.clone(),
                 // caliband echoes back the spec it was spawned with, so this is
                 // the posture the agent is really running under (#238).
-                permission_posture: rec.spec.permission_posture,
+                permission_posture: match rec.spec.permission_posture {
+                    wire::WirePermissionPosture::Unattended => PermissionPosture::Unattended,
+                    wire::WirePermissionPosture::Supervised => PermissionPosture::Supervised,
+                },
             };
             match prior.get(&rec.id) {
                 // New to the snapshot. Suppress "discovered" for agents we just
@@ -1208,7 +1221,7 @@ impl FleetManager {
                 }
                 None => {}
                 // Only the repo lifecycle-lease owner emits transitions. (#59)
-                Some(&old) if own_lifecycle && old != rec.status => {
+                Some(&old) if own_lifecycle && old != wire::domain_status(rec.status) => {
                     self.inner
                         .emitter
                         .emit(
@@ -1216,7 +1229,7 @@ impl FleetManager {
                             &rec.id,
                             EventKind::StatusChanged {
                                 from: old,
-                                to: rec.status,
+                                to: wire::domain_status(rec.status),
                             },
                         )
                         .await;
@@ -1228,7 +1241,7 @@ impl FleetManager {
             // clustered mode — holding its lease is what lets a survivor replica
             // reap the expired lease and fail it over. The lease still gates who
             // actually attaches. (#51)
-            if !rec.status.is_terminal() && !attached_now.contains(&rec.id) {
+            if !wire::domain_status(rec.status).is_terminal() && !attached_now.contains(&rec.id) {
                 to_attach.push(rec.id.clone());
             }
             new_agents.push(agent);
@@ -1815,13 +1828,13 @@ mod tests {
         let mut req = SpawnRequest::new("p");
         assert_eq!(
             req.clone().into_spec().permission_posture,
-            PermissionPosture::Supervised,
+            wire::WirePermissionPosture::Supervised,
             "a plain request must spawn supervised"
         );
         req.permission_posture = PermissionPosture::Unattended;
         assert_eq!(
             req.into_spec().permission_posture,
-            PermissionPosture::Unattended
+            wire::WirePermissionPosture::Unattended
         );
     }
 

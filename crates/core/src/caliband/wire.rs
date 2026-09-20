@@ -1,122 +1,103 @@
-//! Mirrored caliband IPC wire types.
+//! caliband's control-plane wire types.
 //!
-//! These mirror `caliban-supervisor`'s `proto.rs`. The **wire format is the
-//! only contract** between Prospero and caliban — we deliberately do not
-//! depend on the caliban crate. If caliban's protocol changes, these types
-//! (and the golden tests) are where the drift surfaces.
-
-use std::path::PathBuf;
+//! These are **caliban's own definitions**, re-exported from the published
+//! `caliban-contract` crate (#239): serde-only, no daemon internals, so it is
+//! not the wide coupling [ADR-0003] rejected — that was `caliban-supervisor`,
+//! the whole daemon. ADR-0003's "revisit if" clause called for exactly this
+//! once hand-mirroring became a drift source, and it had: the mirror never
+//! learned caliban's `AgentStatus::Drained` (caliban ADR 0057), so a single
+//! drained agent failed the *entire* `Listed` reply.
+//!
+//! What stays here is what has no upstream home: [`AttachInbound`] (caliban's
+//! per-agent attach protocol, not part of the control-plane contract) and the
+//! boundary conversion to prospero's own domain [`crate::model::AgentStatus`],
+//! which is prospero's public API vocabulary and deliberately not caliban's
+//! type.
+//!
+//! [ADR-0003]: ../../../../docs/adr/0003-couple-to-caliban-via-ndjson-wire-format.md
 
 use serde::{Deserialize, Serialize};
 
+/// caliban's lifecycle enum, as it appears on the wire. Converted to
+/// prospero's [`crate::model::AgentStatus`] at the boundary by
+/// [`domain_status`] — the two are separate on purpose: prospero's is the
+/// vocabulary its own API and dashboard speak.
+pub use caliban_contract::wire::AgentStatus as WireAgentStatus;
+/// caliban's permission posture, as it appears on the wire. Prospero's own
+/// [`crate::model::PermissionPosture`] (#238) is what the API and CR use.
+pub use caliban_contract::wire::PermissionPosture as WirePermissionPosture;
+pub use caliban_contract::wire::{
+    AgentRecord, CtlReply, CtlRequest, DaemonStatus, DrainedAgent, DriveProtocol, Endpoint,
+    SpawnSpec, SupervisorError,
+};
+
 pub use crate::model::{AgentStatus, PermissionPosture};
 
-/// Where a caliband socket lives, independent of transport family. Mirrors
-/// `caliban-supervisor::transport::Endpoint` byte-for-byte on the wire (ADR 0051).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "scheme", rename_all = "snake_case")]
-pub enum Endpoint {
-    /// Local Unix-domain socket at this filesystem path.
-    Unix {
-        /// Socket file path.
-        path: PathBuf,
-    },
-    /// TCP endpoint as a `host:port` string (host may be a DNS name).
-    Tcp {
-        /// `host:port`.
-        addr: String,
-    },
+/// Map caliban's wire status onto prospero's domain status.
+///
+/// `Drained` (caliban ADR 0057) has no prospero equivalent: prospero's model
+/// has no "stopped but resumable" state, and inventing one here would change
+/// the public API. It reads as [`AgentStatus::Done`] — terminal and not a
+/// failure, which is what a drained agent is from the fleet's point of view.
+/// The exhaustive match is the point: a future caliban state stops compiling
+/// here instead of failing a poll at runtime.
+#[must_use]
+pub fn domain_status(status: WireAgentStatus) -> AgentStatus {
+    match status {
+        WireAgentStatus::Spawning => AgentStatus::Spawning,
+        WireAgentStatus::Running => AgentStatus::Running,
+        WireAgentStatus::Idle => AgentStatus::Idle,
+        WireAgentStatus::Killed => AgentStatus::Killed,
+        WireAgentStatus::Drained | WireAgentStatus::Done => AgentStatus::Done,
+        WireAgentStatus::Failed => AgentStatus::Failed,
+        WireAgentStatus::Crashed => AgentStatus::Crashed,
+    }
 }
 
-impl Endpoint {
-    /// The Unix socket path, when this endpoint is Unix-domain.
-    #[must_use]
-    pub fn unix_socket_path(&self) -> Option<&std::path::Path> {
+/// Map prospero's domain status onto caliban's wire status.
+///
+/// Total in this direction — prospero's model has no state caliban lacks. Used
+/// where prospero writes a status caliban would have sent (the fake caliband).
+#[must_use]
+pub fn wire_status(status: AgentStatus) -> WireAgentStatus {
+    match status {
+        AgentStatus::Spawning => WireAgentStatus::Spawning,
+        AgentStatus::Running => WireAgentStatus::Running,
+        AgentStatus::Idle => WireAgentStatus::Idle,
+        AgentStatus::Killed => WireAgentStatus::Killed,
+        AgentStatus::Done => WireAgentStatus::Done,
+        AgentStatus::Failed => WireAgentStatus::Failed,
+        AgentStatus::Crashed => WireAgentStatus::Crashed,
+    }
+}
+
+/// Map prospero's domain posture onto caliban's wire posture (#238).
+#[must_use]
+pub fn wire_posture(posture: PermissionPosture) -> WirePermissionPosture {
+    match posture {
+        PermissionPosture::Supervised => WirePermissionPosture::Supervised,
+        PermissionPosture::Unattended => WirePermissionPosture::Unattended,
+    }
+}
+
+/// Prospero's accessor on caliban's [`Endpoint`].
+///
+/// The contract crate puts the equivalent on `AgentRecord`, but prospero asks
+/// it of a bare endpoint (a transport decision, made before any record exists),
+/// so it lives here as an extension rather than forcing the call sites to
+/// re-match.
+pub trait EndpointExt {
+    /// The Unix socket path, when this endpoint is one.
+    fn unix_socket_path(&self) -> Option<&std::path::Path>;
+}
+
+impl EndpointExt for Endpoint {
+    fn unix_socket_path(&self) -> Option<&std::path::Path> {
         match self {
             Endpoint::Unix { path } => Some(path.as_path()),
             Endpoint::Tcp { .. } => None,
         }
     }
-}
-
-/// Snapshot describing a registered sub-agent (caliband `AgentRecord`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentRecord {
-    /// Opaque id.
-    pub id: String,
-    /// Human-readable label.
-    pub name: String,
-    /// Current lifecycle state.
-    pub status: AgentStatus,
-    /// RFC-3339 registration timestamp.
-    pub started_at: String,
-    /// Path to the agent's session directory.
-    pub session_dir: PathBuf,
-    /// Endpoint for the agent's per-agent socket (for attach).
-    pub endpoint: Endpoint,
-    /// Original spawn spec.
-    pub spec: SpawnSpec,
-}
-
-/// Daemon status (caliband `DaemonStatus`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DaemonStatus {
-    /// Daemon PID.
-    pub pid: u32,
-    /// Number of registered agents.
-    pub agents: u32,
-    /// Seconds since the daemon started.
-    pub uptime_secs: u64,
-    /// Endpoint of the control socket.
-    pub endpoint: Endpoint,
-}
-
-/// Parameters for a new sub-agent spawn (caliband `SpawnSpec`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpawnSpec {
-    /// Optional human-readable name.
-    #[serde(default)]
-    pub label: Option<String>,
-    /// Path to a frontmatter markdown file, if any.
-    #[serde(default)]
-    pub frontmatter_path: Option<PathBuf>,
-    /// Initial prompt handed to the agent.
-    pub initial_prompt: String,
-    /// Optional model override.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Optional provider override (e.g. `"anthropic"`, `"openai"`,
-    /// `"google"`). The caliban worker parses this to select the provider
-    /// before model resolution; without it the worker uses caliban's default
-    /// (anthropic). Mirrors caliban `SpawnSpec.provider` (#93). Prospero fills
-    /// it from the repo's stored provider config at spawn time.
-    #[serde(default)]
-    pub provider: Option<String>,
-    /// Optional tool allowlist.
-    #[serde(default)]
-    pub tool_allowlist: Option<Vec<String>>,
-    /// True iff the agent runs in an isolated worktree.
-    #[serde(default)]
-    pub isolation_worktree: bool,
-    /// Whether to inherit parent hooks.
-    #[serde(default = "true_default")]
-    pub inherit_hooks: bool,
-    /// When true, the worker runs in interactive mode: at each end-of-run
-    /// boundary it awaits inbound operator messages over the per-agent socket
-    /// instead of finishing. Mirrors caliban `SpawnSpec.interactive`.
-    #[serde(default)]
-    pub interactive: bool,
-    /// How this session handles tool calls needing permission (#238). Mirrors
-    /// caliban `SpawnSpec.permission_posture` (ADR 0059, caliban#676, released
-    /// in v0.14.0). Absent on the wire ⇒ supervised, both here and in caliban,
-    /// so an older caliband that ignores the field runs supervised — the same
-    /// fail-closed answer. Authorization happens before this is set.
-    #[serde(default)]
-    pub permission_posture: PermissionPosture,
-}
-
-fn true_default() -> bool {
-    true
 }
 
 /// Inbound control frames written to an interactive agent's per-agent socket.
@@ -134,118 +115,10 @@ pub enum AttachInbound {
     EndInput,
 }
 
-/// Control-plane requests sent to the daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CtlRequest {
-    /// List all registered agents.
-    List,
-    /// Register and start a new agent.
-    Spawn {
-        /// Spec describing the agent.
-        spec: SpawnSpec,
-    },
-    /// Return the dedicated socket for an agent.
-    Attach {
-        /// Target agent.
-        id: String,
-    },
-    /// Terminate an agent.
-    Kill {
-        /// Target agent.
-        id: String,
-    },
-    /// Kill + respawn with the same spec.
-    Respawn {
-        /// Target agent.
-        id: String,
-    },
-    /// Remove an agent from the registry.
-    Rm {
-        /// Target agent.
-        id: String,
-        /// Force-remove even if running.
-        #[serde(default)]
-        force: bool,
-    },
-    /// Daemon health probe.
-    Status,
-    /// Ask the daemon to drain and shut down.
-    Shutdown,
-}
-
-/// Control-plane replies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CtlReply {
-    /// Successful list.
-    Listed {
-        /// Registered agents.
-        agents: Vec<AgentRecord>,
-    },
-    /// Successful spawn.
-    Spawned {
-        /// New id.
-        id: String,
-        /// Per-agent endpoint.
-        endpoint: Endpoint,
-    },
-    /// Successful attach handshake.
-    AttachAck {
-        /// Per-agent endpoint.
-        endpoint: Endpoint,
-    },
-    /// Successful kill.
-    Killed,
-    /// Successful respawn.
-    Respawned {
-        /// New id (old id removed).
-        id: String,
-    },
-    /// Successful rm.
-    Removed,
-    /// Daemon status snapshot.
-    Status(DaemonStatus),
-    /// Daemon will shut down once drained.
-    ShutdownAck,
-    /// An error occurred.
-    Error {
-        /// Structured error.
-        error: SupervisorError,
-    },
-}
-
-/// Errors the supervisor reports to clients.
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SupervisorError {
-    /// No such agent.
-    #[error("agent not found: {id}")]
-    NotFound {
-        /// Missing id.
-        id: String,
-    },
-    /// Agent is in the wrong state for the operation.
-    #[error("invalid state for {op}: agent {id} is {status:?}")]
-    InvalidState {
-        /// Operation attempted.
-        op: String,
-        /// Target id.
-        id: String,
-        /// Actual status.
-        status: AgentStatus,
-    },
-    /// Generic internal daemon error.
-    #[error("internal supervisor error: {message}")]
-    Internal {
-        /// Free-form message.
-        message: String,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn endpoint_matches_caliban_wire_shape() {
@@ -294,15 +167,15 @@ mod tests {
         );
     }
 
+    /// Compared through serde rather than `==`: the contract's request/reply
+    /// enums derive no `PartialEq`, and the serialized form is the contract
+    /// anyway.
     #[test]
     fn ctl_request_rm_force_defaults_false() {
         let r: CtlRequest = serde_json::from_str("{\"kind\":\"rm\",\"id\":\"a1\"}").unwrap();
         assert_eq!(
-            r,
-            CtlRequest::Rm {
-                id: "a1".into(),
-                force: false
-            }
+            serde_json::to_value(&r).unwrap(),
+            json!({"kind": "rm", "id": "a1", "force": false})
         );
     }
 
@@ -315,75 +188,108 @@ mod tests {
         assert!(s.provider.is_none());
     }
 
-    /// #238: an absent posture is supervised — the fail-closed default caliban
-    /// itself applies (ADR 0059), so an old caliband and a new one agree.
+    /// #239: caliban's `AgentStatus` grew a `drained` state (caliban ADR 0057,
+    /// #650) that prospero's hand-mirror never learned. The mirror has no
+    /// catch-all, so one drained agent fails the **whole** `Listed` reply —
+    /// every agent on that caliband disappears from the poll, not just the
+    /// drained one. Exactly the silent drift the contract crate ends.
     #[test]
-    fn spawn_spec_defaults_permission_posture_to_supervised() {
-        let s: SpawnSpec = serde_json::from_str("{\"initial_prompt\":\"hi\"}").unwrap();
-        assert_eq!(s.permission_posture, PermissionPosture::Supervised);
-    }
+    fn a_drained_agent_does_not_break_the_whole_list_reply() {
+        let listed = json!({
+            "kind": "listed",
+            "agents": [{
+                "id": "a1", "name": "one", "status": "running",
+                "started_at": "2026-09-19T00:00:00Z", "session_dir": "/s/a1",
+                "endpoint": {"scheme": "unix", "path": "/s/a1.sock"},
+                "spec": {"initial_prompt": "hi"}
+            }, {
+                "id": "a2", "name": "two", "status": "drained",
+                "started_at": "2026-09-19T00:00:00Z", "session_dir": "/s/a2",
+                "endpoint": {"scheme": "unix", "path": "/s/a2.sock"},
+                "spec": {"initial_prompt": "hi"}
+            }]
+        });
 
-    /// The values caliban's `PermissionPosture` uses (caliban-contract 0.14.0).
-    /// Drift here means prospero silently asks for the wrong posture.
-    #[test]
-    fn spawn_spec_posture_is_wire_compatible_with_caliban() {
-        let spec = SpawnSpec {
-            label: None,
-            frontmatter_path: None,
-            initial_prompt: "hi".into(),
-            model: None,
-            provider: None,
-            tool_allowlist: None,
-            isolation_worktree: false,
-            inherit_hooks: true,
-            interactive: false,
-            permission_posture: PermissionPosture::Unattended,
+        let reply: CtlReply = serde_json::from_value(listed).expect("drained must parse");
+        let CtlReply::Listed { agents } = reply else {
+            panic!("expected Listed");
         };
-        let v = serde_json::to_value(&spec).unwrap();
-        assert_eq!(v["permission_posture"], "unattended");
-
-        let back: SpawnSpec = serde_json::from_value(v).unwrap();
-        assert_eq!(back.permission_posture, PermissionPosture::Unattended);
+        assert_eq!(agents.len(), 2, "a drained agent must not drop its peers");
     }
 
+    /// #238 / #239: the posture rides caliban's own type now, so what prospero
+    /// must get right is the *conversion*, not the serialization.
     #[test]
-    fn spawn_spec_is_wire_compatible_with_caliban_interactive() {
-        // Golden JSON in caliban's serialized SpawnSpec form (proto.rs). Pinned
-        // so upstream protocol drift on `interactive` fails loudly here.
-        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
-        let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
-        assert!(
-            spec.interactive,
-            "interactive must round-trip from caliban's wire form"
-        );
-        let json = serde_json::to_value(&spec).unwrap();
-        assert_eq!(json["interactive"], serde_json::json!(true));
-        // Pin our serialized form. It is a *subset* of caliban's SpawnSpec —
-        // caliban also has `inherited_hooks_config`, `source`, `resume_session`
-        // and `drive_protocol`, each `#[serde(default)]` there, and prospero
-        // sends none of them — so this asserts prospero's own shape, not field
-        // parity. A field added or dropped here drifts loudly.
-        let ours = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true,"permission_posture":"supervised"}"#;
+    fn posture_converts_to_calibans_wire_values() {
         assert_eq!(
-            serde_json::to_string(&spec).unwrap(),
-            ours,
-            "re-serialised SpawnSpec must match prospero's pinned wire form"
+            serde_json::to_value(wire_posture(PermissionPosture::Unattended)).unwrap(),
+            json!("unattended")
         );
+        assert_eq!(
+            serde_json::to_value(wire_posture(PermissionPosture::Supervised)).unwrap(),
+            json!("supervised")
+        );
+        // Absent on the wire ⇒ supervised, fail-closed (caliban ADR 0059).
+        let s: SpawnSpec = serde_json::from_str(r#"{"initial_prompt":"hi"}"#).unwrap();
+        assert_eq!(s.permission_posture, WirePermissionPosture::Supervised);
     }
 
+    /// #239: every caliban lifecycle state maps onto one prospero shows. The
+    /// match is exhaustive, so a new caliban state breaks the build here rather
+    /// than a poll at runtime — which is what the hand-mirror got wrong.
     #[test]
-    fn spawn_spec_provider_round_trips_with_caliban() {
-        // A provider set on our side must serialize into caliban's wire form,
-        // and caliban's serialized provider must deserialize back. Guards the
-        // #93 contract end-to-end at the wire boundary.
-        let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"openai","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false}"#;
-        let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
+    fn every_caliban_status_maps_to_a_domain_status() {
+        use WireAgentStatus as W;
+        for (wire, expected) in [
+            (W::Spawning, AgentStatus::Spawning),
+            (W::Running, AgentStatus::Running),
+            (W::Idle, AgentStatus::Idle),
+            (W::Killed, AgentStatus::Killed),
+            (W::Done, AgentStatus::Done),
+            (W::Failed, AgentStatus::Failed),
+            (W::Crashed, AgentStatus::Crashed),
+            // No prospero equivalent: drained is terminal and not a failure.
+            (W::Drained, AgentStatus::Done),
+        ] {
+            assert_eq!(domain_status(wire), expected, "{wire:?}");
+        }
+    }
+
+    /// The reverse direction is total and round-trips for every domain state.
+    #[test]
+    fn domain_status_round_trips_through_the_wire_status() {
+        for s in [
+            AgentStatus::Spawning,
+            AgentStatus::Running,
+            AgentStatus::Idle,
+            AgentStatus::Killed,
+            AgentStatus::Done,
+            AgentStatus::Failed,
+            AgentStatus::Crashed,
+        ] {
+            assert_eq!(domain_status(wire_status(s)), s);
+        }
+    }
+
+    /// A caliband-shaped spawn spec still deserializes, including one written
+    /// before a field existed. The old goldens here pinned prospero's *own*
+    /// serialization of its mirror; with the contract crate that would only
+    /// re-test caliban's serde, so what is worth asserting is that the payloads
+    /// prospero actually sees still parse (#239).
+    #[test]
+    fn caliban_spawn_spec_payloads_still_parse() {
+        let interactive = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true}"#;
+        let spec: SpawnSpec = serde_json::from_str(interactive).expect("caliban spec parses");
+        assert!(spec.interactive);
+        assert_eq!(spec.permission_posture, WirePermissionPosture::Supervised);
+
+        // #93: the provider round-trips.
+        let with_provider = r#"{"initial_prompt":"hi","provider":"openai"}"#;
+        let spec: SpawnSpec = serde_json::from_str(with_provider).unwrap();
         assert_eq!(spec.provider.as_deref(), Some("openai"));
-        let ours = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"openai","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false,"permission_posture":"supervised"}"#;
         assert_eq!(
-            serde_json::to_string(&spec).unwrap(),
-            ours,
-            "re-serialised SpawnSpec must match prospero's pinned wire form"
+            serde_json::to_value(&spec).unwrap()["provider"],
+            json!("openai")
         );
     }
 
@@ -439,7 +345,11 @@ mod tests {
         };
         let s = serde_json::to_string(&reply).unwrap();
         let back: CtlReply = serde_json::from_str(&s).unwrap();
-        assert_eq!(reply, back);
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            s,
+            "round-trip must preserve the wire form"
+        );
     }
 
     #[test]
@@ -447,13 +357,14 @@ mod tests {
         let json =
             r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"unix","path":"/tmp/a1.sock"}}"#;
         let r: CtlReply = serde_json::from_str(json).unwrap();
+        let CtlReply::Spawned { id, endpoint } = r else {
+            panic!("expected Spawned");
+        };
+        assert_eq!(id, "a1");
         assert_eq!(
-            r,
-            CtlReply::Spawned {
-                id: "a1".into(),
-                endpoint: Endpoint::Unix {
-                    path: "/tmp/a1.sock".into()
-                },
+            endpoint,
+            Endpoint::Unix {
+                path: "/tmp/a1.sock".into()
             }
         );
     }
@@ -463,13 +374,14 @@ mod tests {
         let json =
             r#"{"kind":"spawned","id":"a1","endpoint":{"scheme":"tcp","addr":"pod.ns.svc:9443"}}"#;
         let r: CtlReply = serde_json::from_str(json).unwrap();
+        let CtlReply::Spawned { id, endpoint } = r else {
+            panic!("expected Spawned");
+        };
+        assert_eq!(id, "a1");
         assert_eq!(
-            r,
-            CtlReply::Spawned {
-                id: "a1".into(),
-                endpoint: Endpoint::Tcp {
-                    addr: "pod.ns.svc:9443".into()
-                },
+            endpoint,
+            Endpoint::Tcp {
+                addr: "pod.ns.svc:9443".into()
             }
         );
     }
