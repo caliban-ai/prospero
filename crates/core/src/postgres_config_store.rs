@@ -217,12 +217,24 @@ impl ConfigStore for PostgresConfigStore {
 mod tests {
     use super::*;
 
+    /// Serialize the Postgres-gated config-store tests against each other.
+    /// They share one database and each one starts by TRUNCATE-ing it, so run
+    /// in parallel a sibling's reset deletes the rows this test just wrote —
+    /// and, worse, a sibling claiming the same tick makes the exactly-once
+    /// assertion fail for a reason that has nothing to do with the code under
+    /// test. Distinct ids would not help: the reset is what collides. Held
+    /// across awaits, so it must be a `tokio` mutex; taken right after the
+    /// `DATABASE_URL` guard, since an unset-DB skip never contends. Mirrors
+    /// `distributed_bus`'s `BUS_TEST_SERIAL`.
+    static CONFIG_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn postgres_config_store_satisfies_conformance() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP postgres_config_store_satisfies_conformance: DATABASE_URL unset");
             return;
         };
+        let _serial = CONFIG_TEST_SERIAL.lock().await;
         let store = PostgresConfigStore::connect(&url).await.unwrap();
         store.reset_for_tests().await.unwrap();
         crate::testkit::config_store_conformance(&store).await;
@@ -236,6 +248,7 @@ mod tests {
             );
             return;
         };
+        let _serial = CONFIG_TEST_SERIAL.lock().await;
         let store = PostgresConfigStore::connect(&url).await.unwrap();
         store.reset_for_tests().await.unwrap();
         crate::testkit::automation_store_conformance(&store).await;
@@ -247,6 +260,7 @@ mod tests {
             eprintln!("SKIP postgres_config_store_claims_a_tick_once: DATABASE_URL unset");
             return;
         };
+        let _serial = CONFIG_TEST_SERIAL.lock().await;
         let store = PostgresConfigStore::connect(&url).await.unwrap();
         store.reset_for_tests().await.unwrap();
         crate::testkit::automation_claim_conformance(&store).await;
