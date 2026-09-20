@@ -219,7 +219,7 @@ fn unexpected(op: &str, reply: CtlReply) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::caliband::wire::AttachInbound;
+    use crate::caliband::wire::{AttachInbound, PermissionPosture};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -259,6 +259,7 @@ mod tests {
             isolation_worktree: false,
             inherit_hooks: true,
             interactive: false,
+            permission_posture: PermissionPosture::Supervised,
         }
     }
 

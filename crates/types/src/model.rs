@@ -208,6 +208,26 @@ pub struct Readiness {
     pub workspaces_unreachable: usize,
 }
 
+/// How a session handles tool calls that need permission (#238).
+///
+/// The wire values mirror caliban's `PermissionPosture` (ADR 0059) and the
+/// `CalibanTask` CR `permissionPosture` enum (caliban-operator#80), so prospero
+/// maps between them without translating. Authorization for
+/// [`PermissionPosture::Unattended`] is enforced upstream — prospero's `admin`
+/// scope at the API, the Workspace's `agentPolicy` in-cluster — never by the
+/// caliban worker, which only honors and audits what it is handed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPosture {
+    /// The normal gate: a tool call needing approval is surfaced to a human, and
+    /// denied when none is attached. The default, and fail-closed.
+    #[default]
+    Supervised,
+    /// No permission gate — every tool runs without asking. Privileged and
+    /// audited, for long runs that must not stall.
+    Unattended,
+}
+
 /// Lifecycle state of an agent. Mirrors caliban's `AgentStatus` wire enum exactly
 /// so the same value round-trips through both protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +296,11 @@ pub struct Agent {
     pub interactive: bool,
     /// Path to the agent's session directory on disk.
     pub session_dir: PathBuf,
+    /// The posture this agent is actually running under (#238) — in k8s the one
+    /// the operator admitted, not the one requested. `#[serde(default)]` so a
+    /// snapshot from an older prosperod still deserializes, as supervised.
+    #[serde(default)]
+    pub permission_posture: PermissionPosture,
 }
 
 /// A managed workspace (root + its source checkouts) and the agents running
@@ -358,6 +383,26 @@ mod tests {
         assert_eq!(id.to_string(), "agent-abc");
     }
 
+    /// #238: the wire values are caliban's `PermissionPosture` and the
+    /// `CalibanTask` CR enum; they must not drift.
+    #[test]
+    fn permission_posture_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PermissionPosture::Supervised).unwrap(),
+            "\"supervised\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionPosture::Unattended).unwrap(),
+            "\"unattended\""
+        );
+    }
+
+    /// Fail closed: anything that doesn't say `unattended` is supervised.
+    #[test]
+    fn permission_posture_defaults_to_supervised() {
+        assert_eq!(PermissionPosture::default(), PermissionPosture::Supervised);
+    }
+
     #[test]
     fn status_serializes_snake_case() {
         let j = serde_json::to_string(&AgentStatus::Running).unwrap();
@@ -411,6 +456,7 @@ mod tests {
                     isolated: true,
                     interactive: false,
                     session_dir: "/s".into(),
+                    permission_posture: PermissionPosture::Supervised,
                 }],
             }],
         };

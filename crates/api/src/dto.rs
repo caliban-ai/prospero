@@ -49,6 +49,7 @@ pub fn spawn_request(body: SpawnBody) -> SpawnRequest {
         interactive: body.interactive,
         frontmatter_path: body.frontmatter_path.map(std::path::PathBuf::from),
         provider_ref: body.provider_ref,
+        permission_posture: body.permission_posture,
     }
 }
 

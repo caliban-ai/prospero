@@ -19,7 +19,7 @@ pub use api::{
 pub use auth::{Scope, SessionInfo, SignInBody};
 pub use event::{EventKind, FleetEvent, OutputStream, stream_key_for};
 pub use model::{
-    Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, ProviderInfo,
-    ProviderSpec, Readiness, RepoProviderConfig, Source, Workspace, WorkspaceConfig,
+    Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, PermissionPosture,
+    ProviderInfo, ProviderSpec, Readiness, RepoProviderConfig, Source, Workspace, WorkspaceConfig,
     WorkspaceHealth, WorkspaceInfo, WorkspaceSourceSpec, WorkspaceStatusInfo,
 };

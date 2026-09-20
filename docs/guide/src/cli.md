@@ -63,6 +63,7 @@ Each call replaces the whole configuration. Flags you leave out are cleared.
 | `--interactive` | Wait for operator input after each run instead of finishing |
 | `--tool-allowlist <TOOL>` | Restrict the agent to these tools; repeat once per tool |
 | `--frontmatter <PATH>` | Agent-template / frontmatter markdown file |
+| `--permission-posture <POSTURE>` | `supervised` (default) keeps the agent's permission gate; `unattended` runs every tool without asking. `unattended` needs an **admin** token, and in-cluster a workspace that allows it |
 
 `follow` prints output text inline, one line per tool start and finish, and
 short markers for `init`, `status` and `finished`. A `[gap]` line means the

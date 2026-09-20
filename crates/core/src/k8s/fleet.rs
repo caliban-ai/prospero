@@ -37,7 +37,9 @@ use crate::k8s::crd::{
     CalibanTask, CalibanTaskSpec, Condition, TaskSpec as CrdTaskSpec, WorkspaceRef,
 };
 use crate::k8s::workspace_api::WorkspaceApi;
-use crate::model::{Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, TaskSpec};
+use crate::model::{
+    Agent, AgentHandle, AgentId, AgentStatus, DrainPolicy, FleetChange, PermissionPosture, TaskSpec,
+};
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::store::Store;
 
@@ -88,6 +90,11 @@ pub fn build_calibantask(spec: &TaskSpec, name: &str) -> CalibanTask {
             // Only set when requested, so a non-interactive task's CR stays
             // byte-identical to what pre-#163 prospero wrote.
             interactive: spec.request.interactive.then_some(true),
+            // Only set when something other than the default is asked for, so
+            // an ordinary task's CR stays minimal (as `interactive` does). The
+            // operator decides whether to admit it.
+            permission_posture: (spec.request.permission_posture != PermissionPosture::Supervised)
+                .then_some(spec.request.permission_posture),
         },
         isolation: None,
         tools: spec.request.tool_allowlist.clone(),
@@ -198,9 +205,27 @@ fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
         model: provider.and_then(|p| p.model.clone()),
         provider: provider.map(|p| p.kind.clone()),
         tool_allowlist: task.spec.tools.clone(),
-        isolation_worktree: false,
+        // #226: honor the CR's isolation strategy. `per-source` is the only
+        // value the operator's CRD defines that means "isolate"; anything else
+        // (including an unknown future value) stays shared rather than guessing.
+        isolation_worktree: task
+            .spec
+            .isolation
+            .as_ref()
+            .and_then(|i| i.worktrees.as_deref())
+            .is_some_and(|w| w == "per-source"),
         inherit_hooks: true,
         interactive: task.spec.task.interactive.unwrap_or(false),
+        // The posture the operator **admitted**, not the one the spec asked
+        // for (#238). An operator that predates the field never admits one and
+        // never checked the Workspace's `agentPolicy`, so absent ⇒ supervised
+        // keeps an old operator from being talked past. `PostureNotPermitted`
+        // tasks never reach here: the operator fails them before any Sandbox.
+        permission_posture: task
+            .status
+            .as_ref()
+            .and_then(|s| s.permission_posture)
+            .unwrap_or(PermissionPosture::Supervised),
     }
 }
 
@@ -410,6 +435,13 @@ pub fn agent_from_task(task: &CalibanTask) -> Agent {
         isolated: false,
         interactive: false,
         session_dir: std::path::PathBuf::new(),
+        // The admitted posture (#238), matching what `spawn_spec_from_task`
+        // actually sends — absent status reads as supervised.
+        permission_posture: task
+            .status
+            .as_ref()
+            .and_then(|s| s.permission_posture)
+            .unwrap_or(PermissionPosture::Supervised),
     }
 }
 
@@ -1973,6 +2005,7 @@ impl MemTaskApi {
             sandbox_ref: None,
             resolved_workspace: None,
             conditions: Vec::new(),
+            permission_posture: None,
         });
     }
 }
@@ -2358,6 +2391,7 @@ mod tests {
                 sandbox_ref: None,
                 resolved_workspace: None,
                 conditions: Vec::new(),
+                permission_posture: None,
             });
             ct
         };
@@ -2433,6 +2467,7 @@ mod tests {
             sandbox_ref: None,
             resolved_workspace: None,
             conditions: Vec::new(),
+            permission_posture: None,
         });
 
         let agent = agent_from_task(&ct);
@@ -2985,6 +3020,103 @@ mod tests {
         assert!(!spawn_spec_from_task(&plain).interactive);
     }
 
+    /// #238: an unattended request must reach the CR, and a supervised one must
+    /// leave the field unset so ordinary CRs stay minimal (as `interactive`
+    /// does).
+    #[test]
+    fn build_calibantask_propagates_permission_posture_to_the_cr() {
+        let mut s = spec("repo-a", "p", None);
+        s.request.permission_posture = PermissionPosture::Unattended;
+        let ct = build_calibantask(&s, "ct-1");
+        assert_eq!(
+            ct.spec.task.permission_posture,
+            Some(PermissionPosture::Unattended)
+        );
+
+        let plain = build_calibantask(&spec("repo-a", "p", None), "ct-2");
+        assert_eq!(plain.spec.task.permission_posture, None);
+    }
+
+    /// #238: prospero sends the posture the **operator admitted**
+    /// (`status.permissionPosture`), never the one the spec asked for. An
+    /// operator too old to set the status (≤ v0.5.0) never checked the
+    /// Workspace's `agentPolicy`, so trusting the spec there would bypass the
+    /// in-cluster authority. Absent status ⇒ supervised, fail-closed.
+    #[test]
+    fn spawn_spec_from_task_uses_the_admitted_posture_not_the_request() {
+        let mut s = spec("repo-a", "p", None);
+        s.request.permission_posture = PermissionPosture::Unattended;
+        let mut ct = build_calibantask(&s, "ct-1");
+
+        assert_eq!(
+            spawn_spec_from_task(&ct).permission_posture,
+            PermissionPosture::Supervised,
+            "an unadmitted request must not run unattended"
+        );
+
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            permission_posture: Some(PermissionPosture::Unattended),
+            ..Default::default()
+        });
+        assert_eq!(
+            spawn_spec_from_task(&ct).permission_posture,
+            PermissionPosture::Unattended,
+            "the operator-admitted posture must be honored"
+        );
+    }
+
+    /// #238: an operator needs to see which posture a running agent was
+    /// admitted with, so the snapshot carries it — again the admitted one, not
+    /// the requested one.
+    #[test]
+    fn agent_from_task_reports_the_admitted_posture() {
+        let mut s = spec("repo-a", "p", None);
+        s.request.permission_posture = PermissionPosture::Unattended;
+        let mut ct = build_calibantask(&s, "ct-1");
+        assert_eq!(
+            agent_from_task(&ct).permission_posture,
+            PermissionPosture::Supervised,
+            "requested-but-unadmitted must not read as unattended"
+        );
+
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            permission_posture: Some(PermissionPosture::Unattended),
+            ..Default::default()
+        });
+        assert_eq!(
+            agent_from_task(&ct).permission_posture,
+            PermissionPosture::Unattended
+        );
+    }
+
+    /// #226: `spec.isolation.worktrees` was ignored — `spawn_spec_from_task`
+    /// hardcoded `isolation_worktree: false`, so a CR asking for per-source
+    /// worktrees silently got none.
+    #[test]
+    fn spawn_spec_from_task_honors_isolation_worktrees() {
+        let mut ct = build_calibantask(&spec("repo-a", "p", None), "ct-1");
+        assert!(
+            !spawn_spec_from_task(&ct).isolation_worktree,
+            "no isolation block ⇒ no worktree"
+        );
+
+        ct.spec.isolation = Some(crate::k8s::crd::IsolationSpec {
+            runtime_class: None,
+            worktrees: Some("per-source".to_string()),
+        });
+        assert!(
+            spawn_spec_from_task(&ct).isolation_worktree,
+            "per-source must reach SpawnSpec.isolation_worktree"
+        );
+
+        // An unknown strategy is not silently treated as "isolate".
+        ct.spec.isolation = Some(crate::k8s::crd::IsolationSpec {
+            runtime_class: None,
+            worktrees: Some("none".to_string()),
+        });
+        assert!(!spawn_spec_from_task(&ct).isolation_worktree);
+    }
+
     /// Build a CR whose status carries an operator-pinned resolved provider.
     fn task_with_resolved_provider(
         name: &str,
@@ -3009,6 +3141,7 @@ mod tests {
                 isolation: None,
             }),
             conditions: Vec::new(),
+            permission_posture: None,
         });
         ct
     }
@@ -3726,6 +3859,7 @@ mod tests {
             sandbox_ref: None,
             resolved_workspace: None,
             conditions: Vec::new(),
+            permission_posture: None,
         });
 
         let client_tls =

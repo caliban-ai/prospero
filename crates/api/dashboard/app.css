@@ -736,6 +736,14 @@ body {
   flex: none;
 }
 
+/* An unattended agent runs every tool unasked (#238) — the one tag that has to
+   catch the eye while scanning a fleet, so it borrows the bad tone. */
+.tag-warn {
+  color: var(--tone-bad);
+  border-color: var(--tone-bad);
+  background: var(--tone-bad-wash);
+}
+
 .tag {
   font-size: 10px;
   font-weight: 600;

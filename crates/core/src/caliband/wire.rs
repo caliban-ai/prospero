@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::model::AgentStatus;
+pub use crate::model::{AgentStatus, PermissionPosture};
 
 /// Where a caliband socket lives, independent of transport family. Mirrors
 /// `caliban-supervisor::transport::Endpoint` byte-for-byte on the wire (ADR 0051).
@@ -106,6 +106,13 @@ pub struct SpawnSpec {
     /// instead of finishing. Mirrors caliban `SpawnSpec.interactive`.
     #[serde(default)]
     pub interactive: bool,
+    /// How this session handles tool calls needing permission (#238). Mirrors
+    /// caliban `SpawnSpec.permission_posture` (ADR 0059, caliban#676, released
+    /// in v0.14.0). Absent on the wire ⇒ supervised, both here and in caliban,
+    /// so an older caliband that ignores the field runs supervised — the same
+    /// fail-closed answer. Authorization happens before this is set.
+    #[serde(default)]
+    pub permission_posture: PermissionPosture,
 }
 
 fn true_default() -> bool {
@@ -308,6 +315,37 @@ mod tests {
         assert!(s.provider.is_none());
     }
 
+    /// #238: an absent posture is supervised — the fail-closed default caliban
+    /// itself applies (ADR 0059), so an old caliband and a new one agree.
+    #[test]
+    fn spawn_spec_defaults_permission_posture_to_supervised() {
+        let s: SpawnSpec = serde_json::from_str("{\"initial_prompt\":\"hi\"}").unwrap();
+        assert_eq!(s.permission_posture, PermissionPosture::Supervised);
+    }
+
+    /// The values caliban's `PermissionPosture` uses (caliban-contract 0.14.0).
+    /// Drift here means prospero silently asks for the wrong posture.
+    #[test]
+    fn spawn_spec_posture_is_wire_compatible_with_caliban() {
+        let spec = SpawnSpec {
+            label: None,
+            frontmatter_path: None,
+            initial_prompt: "hi".into(),
+            model: None,
+            provider: None,
+            tool_allowlist: None,
+            isolation_worktree: false,
+            inherit_hooks: true,
+            interactive: false,
+            permission_posture: PermissionPosture::Unattended,
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["permission_posture"], "unattended");
+
+        let back: SpawnSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back.permission_posture, PermissionPosture::Unattended);
+    }
+
     #[test]
     fn spawn_spec_is_wire_compatible_with_caliban_interactive() {
         // Golden JSON in caliban's serialized SpawnSpec form (proto.rs). Pinned
@@ -320,12 +358,16 @@ mod tests {
         );
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["interactive"], serde_json::json!(true));
-        // Bidirectional pin: our serialized form must match caliban's exact wire
-        // shape (field set + order), so adding/dropping a field drifts loudly.
+        // Pin our serialized form. It is a *subset* of caliban's SpawnSpec —
+        // caliban also has `inherited_hooks_config`, `source`, `resume_session`
+        // and `drive_protocol`, each `#[serde(default)]` there, and prospero
+        // sends none of them — so this asserts prospero's own shape, not field
+        // parity. A field added or dropped here drifts loudly.
+        let ours = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":null,"tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":true,"permission_posture":"supervised"}"#;
         assert_eq!(
             serde_json::to_string(&spec).unwrap(),
-            golden,
-            "re-serialised SpawnSpec must match caliban's golden wire form"
+            ours,
+            "re-serialised SpawnSpec must match prospero's pinned wire form"
         );
     }
 
@@ -337,10 +379,11 @@ mod tests {
         let golden = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"openai","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false}"#;
         let spec: SpawnSpec = serde_json::from_str(golden).expect("deserialize caliban spec");
         assert_eq!(spec.provider.as_deref(), Some("openai"));
+        let ours = r#"{"label":null,"frontmatter_path":null,"initial_prompt":"hi","model":null,"provider":"openai","tool_allowlist":null,"isolation_worktree":false,"inherit_hooks":true,"interactive":false,"permission_posture":"supervised"}"#;
         assert_eq!(
             serde_json::to_string(&spec).unwrap(),
-            golden,
-            "re-serialised SpawnSpec must match caliban's golden wire form"
+            ours,
+            "re-serialised SpawnSpec must match prospero's pinned wire form"
         );
     }
 

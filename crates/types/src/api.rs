@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    ProviderInfo, RepoProviderConfig, Source, WorkspaceConfig, WorkspaceHealth,
+    PermissionPosture, ProviderInfo, RepoProviderConfig, Source, WorkspaceConfig, WorkspaceHealth,
     WorkspaceSourceSpec, WorkspaceStatusInfo,
 };
 
@@ -89,6 +89,12 @@ pub struct SpawnBody {
     /// `CalibanTask.providerRef`). `None` ⇒ the workspace's default (#142).
     #[serde(default)]
     pub provider_ref: Option<String>,
+    /// How this session handles tool calls needing permission (#238). Absent ⇒
+    /// [`PermissionPosture::Supervised`]. Asking for
+    /// [`PermissionPosture::Unattended`] requires an `admin`-scope credential
+    /// (ADR-0010); the handler rejects it otherwise.
+    #[serde(default)]
+    pub permission_posture: PermissionPosture,
 }
 
 impl SpawnBody {
@@ -279,6 +285,18 @@ pub struct UsageReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #238: an old client's body has no posture; it must mean supervised, and
+    /// a spawn body must be able to ask for unattended.
+    #[test]
+    fn spawn_body_permission_posture_defaults_to_supervised() {
+        let body: SpawnBody = serde_json::from_str(r#"{"prompt":"hi"}"#).unwrap();
+        assert_eq!(body.permission_posture, PermissionPosture::Supervised);
+
+        let unattended: SpawnBody =
+            serde_json::from_str(r#"{"prompt":"hi","permission_posture":"unattended"}"#).unwrap();
+        assert_eq!(unattended.permission_posture, PermissionPosture::Unattended);
+    }
 
     /// The point of the move: every one of these round-trips through serde in
     /// *both* directions, so the client and the server can share one definition.

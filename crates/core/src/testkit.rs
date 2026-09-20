@@ -14,8 +14,8 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 use crate::caliband::wire::{
-    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, Endpoint, SpawnSpec,
-    SupervisorError,
+    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, Endpoint, PermissionPosture,
+    SpawnSpec, SupervisorError,
 };
 
 /// Shared mutable state inside a running fake.
@@ -1129,6 +1129,7 @@ pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) ->
             isolation_worktree: isolated,
             inherit_hooks: true,
             interactive: false,
+            permission_posture: PermissionPosture::Supervised,
         },
     }
 }

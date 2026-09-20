@@ -127,6 +127,7 @@ impl CalibanTaskApi for FakeK8s {
             // `spec.workspaceRef.name` for the workspace label, which suffices.
             resolved_workspace: None,
             conditions: Vec::new(),
+            permission_posture: None,
         });
 
         self.store.lock().unwrap().insert(name, reconciled);

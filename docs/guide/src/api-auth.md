@@ -8,7 +8,7 @@ prosperod authenticates requests with **named API tokens** (ADR-0010).
 |---|---|
 | `read` | every GET: fleet, usage, workspaces, agent events and streams, metrics |
 | `operate` | `read` + spawn, kill, respawn, input, end-input, remove agent |
-| `admin` | `operate` + add/remove workspace and set workspace config |
+| `admin` | `operate` + add/remove workspace, set workspace config, and spawn with `permission_posture: "unattended"` |
 
 `/healthz`, `/readyz`, the dashboard shell and `/api/session` are always open.
 
