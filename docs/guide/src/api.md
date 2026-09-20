@@ -144,6 +144,23 @@ instead of starting a new one. Spawning is idempotent under k8s.
 leaves `/api/fleet` and `/api/agents/{id}`, but its history is still available
 from `/api/agents/{old id}/events`.
 
+### Why an agent is in its state
+
+An agent in `/api/fleet` and `/api/agents/{id}` may carry `reason` and
+`detail` — present only when something *outside* the agent decided its state,
+and omitted entirely otherwise.
+
+Under k8s they come from the operator's `Ready` condition on the `CalibanTask`.
+The case worth knowing: a task that asks for `permission_posture: "unattended"`
+under a Workspace that does not set `spec.agentPolicy.allowUnattended: true` is
+failed by the operator with `reason: "PostureNotPermitted"` **before any sandbox
+is created** — so there is no pod, no caliband and no agent-side error, and this
+field is the only account of it. The spawn itself still returns `201`: the
+refusal happens during reconciliation, after the API has answered.
+
+Local (non-k8s) agents never carry these: caliband reports their state directly,
+with no admission step above it.
+
 ### Usage
 
 `GET /api/usage` aggregates `agent_finished` accounting and terminal outcomes
