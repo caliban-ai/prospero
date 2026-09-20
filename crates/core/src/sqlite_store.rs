@@ -236,12 +236,15 @@ impl Store for SqliteStore {
                 COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'done' THEN 1 END), 0) AS done, \
                 COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'failed' THEN 1 END), 0) AS failed, \
                 COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'killed' THEN 1 END), 0) AS killed, \
-                COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'crashed' THEN 1 END), 0) AS crashed \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.to') = 'crashed' THEN 1 END), 0) AS crashed, \
+                COALESCE(SUM(CASE WHEN json_extract(kind, '$.kind') = 'agent_timed_out' \
+                    THEN 1 END), 0) AS timed_out \
              FROM events \
              WHERE ts >= ? AND ts < ? AND ( \
                 json_extract(kind, '$.kind') = 'agent_finished' OR ( \
                     json_extract(kind, '$.kind') = 'status_changed' \
-                    AND json_extract(kind, '$.to') IN ('done', 'failed', 'killed', 'crashed'))) \
+                    AND json_extract(kind, '$.to') IN ('done', 'failed', 'killed', 'crashed')) \
+                OR json_extract(kind, '$.kind') = 'agent_timed_out') \
              GROUP BY repo, substr(ts, 1, 10) \
              ORDER BY repo, day",
         )
@@ -263,6 +266,7 @@ impl Store for SqliteStore {
                 failed: row.try_get::<i64, _>("failed").map_err(decode)? as u64,
                 killed: row.try_get::<i64, _>("killed").map_err(decode)? as u64,
                 crashed: row.try_get::<i64, _>("crashed").map_err(decode)? as u64,
+                timed_out: row.try_get::<i64, _>("timed_out").map_err(decode)? as u64,
             });
         }
         Ok(out)

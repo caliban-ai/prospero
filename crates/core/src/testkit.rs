@@ -39,6 +39,10 @@ struct FakeState {
     lists: u32,
     /// Set to `true` after the first `Shutdown`; the accept loop exits.
     should_stop: bool,
+    /// Every agent id a `Kill` request has named, in order — so a test can
+    /// prove a policy actually killed the agent, not merely logged that it
+    /// meant to (#221).
+    killed_ids: Vec<String>,
 }
 
 /// A running fake caliband daemon. Aborts its listener tasks on drop.
@@ -249,6 +253,11 @@ impl FakeCaliband {
         self.state.lock().unwrap().lists
     }
 
+    /// Agent ids this fake has been asked to `Kill`, in order (#221).
+    pub fn killed_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().killed_ids.clone()
+    }
+
     /// Set an agent's status (to simulate lifecycle transitions across polls).
     ///
     /// Takes prospero's domain status — what a test is reasoning about — and
@@ -429,6 +438,7 @@ async fn handle_control_conn(
                 }
             }
             CtlRequest::Kill { id } => {
+                st.killed_ids.push(id.clone());
                 if let Some(a) = st.agents.get_mut(&id) {
                     a.status = AgentStatus::Killed;
                     (CtlReply::Killed, None)
@@ -1002,6 +1012,33 @@ pub async fn store_usage_conformance(store: &dyn crate::store::Store) {
         .await
         .unwrap();
 
+    // #221: a run prospero killed for passing its deadline. It is *also* a
+    // `killed` transition — the kill is real — but the timeout is what an
+    // operator needs to see separately, since it is policy rather than someone
+    // intervening.
+    store
+        .append(&ev(
+            1,
+            "2026-08-01T13:00:00+00:00",
+            "beta",
+            "b2",
+            EventKind::AgentTimedOut {
+                deadline: "2026-08-01T13:00:00+00:00".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&ev(
+            2,
+            "2026-08-01T13:00:01+00:00",
+            "beta",
+            "b2",
+            moved_to(AgentStatus::Killed),
+        ))
+        .await
+        .unwrap();
+
     let rows = store
         .usage("2026-08-01T00:00:00+00:00", "2026-08-03T00:00:00+00:00")
         .await
@@ -1025,6 +1062,8 @@ pub async fn store_usage_conformance(store: &dyn crate::store::Store) {
     assert_eq!(a1.killed, 0);
     assert_eq!(a1.crashed, 0);
 
+    assert_eq!(a1.timed_out, 0, "a day with no timeout must not report one");
+
     let a2 = find("alpha", "2026-08-02");
     assert!((a2.cost_usd - 1.00).abs() < 1e-9);
     assert_eq!(a2.turns, 2);
@@ -1035,7 +1074,11 @@ pub async fn store_usage_conformance(store: &dyn crate::store::Store) {
     let b = find("beta", "2026-08-01");
     assert_eq!(b.cost_usd, 0.0, "a killed agent never reported cost");
     assert_eq!(b.turns, 0);
-    assert_eq!(b.killed, 1);
+    assert_eq!(b.killed, 2, "both the manual kill and the timeout's kill");
+    assert_eq!(
+        b.timed_out, 1,
+        "the timeout is counted separately from the kill it caused (#221)"
+    );
     assert_eq!(
         b.done + b.failed + b.crashed,
         0,

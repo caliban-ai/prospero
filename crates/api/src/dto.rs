@@ -61,6 +61,7 @@ pub fn spawn_request(body: SpawnBody) -> SpawnRequest {
         frontmatter_path: body.frontmatter_path.map(std::path::PathBuf::from),
         provider_ref: body.provider_ref,
         permission_posture: body.permission_posture,
+        timeout_secs: body.timeout_secs,
     }
 }
 
@@ -112,6 +113,7 @@ pub fn usage_report(rows: Vec<UsageRow>, since: &str, until: &str) -> UsageRepor
         g.outcomes.failed += r.failed;
         g.outcomes.killed += r.killed;
         g.outcomes.crashed += r.crashed;
+        g.outcomes.timed_out += r.timed_out;
         g.series.push(UsageBucket {
             day: r.day,
             cost_usd: r.cost_usd,
@@ -121,6 +123,7 @@ pub fn usage_report(rows: Vec<UsageRow>, since: &str, until: &str) -> UsageRepor
                 failed: r.failed,
                 killed: r.killed,
                 crashed: r.crashed,
+                timed_out: r.timed_out,
             },
         });
     }
@@ -151,6 +154,7 @@ mod tests {
             failed: 0,
             killed: 0,
             crashed: 0,
+            timed_out: 0,
         }
     }
 

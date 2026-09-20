@@ -89,6 +89,10 @@ pub struct SpawnBody {
     /// `CalibanTask.providerRef`). `None` ⇒ the workspace's default (#142).
     #[serde(default)]
     pub provider_ref: Option<String>,
+    /// Kill the agent after this many seconds of wall-clock time (#221).
+    /// Absent ⇒ no limit. Enforced by prospero, not by the agent.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// How this session handles tool calls needing permission (#238). Absent ⇒
     /// [`PermissionPosture::Supervised`]. Asking for
     /// [`PermissionPosture::Unattended`] requires an `admin`-scope credential
@@ -226,6 +230,10 @@ pub struct OutcomeCounts {
     pub killed: u64,
     /// Supervisor restarted while active.
     pub crashed: u64,
+    /// Runs prospero killed for passing their wall-clock deadline (#221).
+    /// Also counted in `killed` — the kill is real; this says it was policy.
+    #[serde(default)]
+    pub timed_out: u64,
 }
 
 impl OutcomeCounts {
@@ -288,6 +296,17 @@ mod tests {
 
     /// #238: an old client's body has no posture; it must mean supervised, and
     /// a spawn body must be able to ask for unattended.
+    /// #221: a timeout is opt-in, and an old client's body simply has none.
+    #[test]
+    fn spawn_body_timeout_is_optional() {
+        let body: SpawnBody = serde_json::from_str(r#"{"prompt":"hi"}"#).unwrap();
+        assert_eq!(body.timeout_secs, None);
+
+        let capped: SpawnBody =
+            serde_json::from_str(r#"{"prompt":"hi","timeout_secs":3600}"#).unwrap();
+        assert_eq!(capped.timeout_secs, Some(3600));
+    }
+
     #[test]
     fn spawn_body_permission_posture_defaults_to_supervised() {
         let body: SpawnBody = serde_json::from_str(r#"{"prompt":"hi"}"#).unwrap();

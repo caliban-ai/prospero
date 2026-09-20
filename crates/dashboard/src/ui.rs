@@ -1053,6 +1053,9 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
             },
             interactive: interactive(),
             frontmatter_path: None,
+            // #221: no timeout control in the launch form yet — the CLI and API
+            // carry it, and a duration input needs its own design pass.
+            timeout_secs: None,
             provider_ref: non_empty(provider_ref()),
             // The control is admin-only, and the server re-checks the scope —
             // this signal can only be true for a session that may set it.
@@ -2182,7 +2185,13 @@ fn UsagePanel() -> Element {
                     // four status tones is separable in light mode, and one hue
                     // per facet means no two are ever adjacent.
                     div { class: "facets",
-                        for m in [Measure::Done, Measure::Killed, Measure::Failed, Measure::Crashed] {
+                        for m in [
+                            Measure::Done,
+                            Measure::Killed,
+                            Measure::Failed,
+                            Measure::Crashed,
+                            Measure::TimedOut,
+                        ] {
                             OutcomeFacet {
                                 key: "{m.label()}",
                                 measure: m,

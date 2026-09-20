@@ -106,6 +106,27 @@ pub enum EventKind {
         /// Rendered append error, for diagnosis.
         detail: String,
     },
+    /// The spawn carried a wall-clock timeout; this is the deadline it implies
+    /// (#221), recorded at spawn so it outlives the replica that set it.
+    ///
+    /// The durable log *is* the storage: a local timer dies with its replica,
+    /// while any replica taking the agent over can read this back.
+    DeadlineSet {
+        /// When the agent must be killed, RFC-3339.
+        deadline: String,
+    },
+    /// The agent hit its wall-clock deadline and prospero killed it (#221).
+    ///
+    /// Emitted **before** the kill, so the log says why the `killed` that
+    /// follows happened. A distinct kind rather than a new `AgentStatus`: the
+    /// status enum is matched exhaustively by clients (Ariel, the dashboard)
+    /// and by caliban's own vocabulary, whereas event kinds are the log's
+    /// established extension point.
+    AgentTimedOut {
+        /// The deadline it passed, RFC-3339 — the same value the spawn
+        /// recorded, so the log explains itself without a join.
+        deadline: String,
+    },
     /// A workspace's caliband health changed. (Variant name kept as `RepoHealth`
     /// for event-store wire compatibility; the payload type is the renamed
     /// `WorkspaceHealth`, whose serialization is unchanged.)
@@ -208,6 +229,19 @@ mod tests {
                 truncated: false,
             }
         );
+    }
+
+    /// #221: the timeout is its own event kind, so history says why an agent
+    /// was killed rather than leaving a bare `killed` to guess at.
+    #[test]
+    fn agent_timed_out_round_trips_with_its_deadline() {
+        let k = EventKind::AgentTimedOut {
+            deadline: "2026-09-20T12:00:00Z".into(),
+        };
+        let v = serde_json::to_value(&k).unwrap();
+        assert_eq!(v["kind"], "agent_timed_out");
+        assert_eq!(v["deadline"], "2026-09-20T12:00:00Z");
+        assert_eq!(serde_json::from_value::<EventKind>(v).unwrap(), k);
     }
 
     #[test]

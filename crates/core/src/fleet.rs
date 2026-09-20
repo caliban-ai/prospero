@@ -54,6 +54,12 @@ pub struct SpawnRequest {
     /// Optional agent-template / frontmatter markdown file, forwarded to
     /// caliband's `SpawnSpec.frontmatter_path`. `None` ⇒ no template (#6).
     pub frontmatter_path: Option<PathBuf>,
+    /// Kill the agent after this many seconds of wall-clock time (#221).
+    /// `None` ⇒ it runs until it finishes or someone stops it.
+    ///
+    /// Enforced by prospero, not caliband: the deadline is recorded in the
+    /// event log at spawn, so it survives the replica that set it.
+    pub timeout_secs: Option<u64>,
     /// Which of the target workspace's named providers to bind, under the k8s
     /// config plane (→ `CalibanTask.spec.providerRef`). `None` ⇒ the operator
     /// picks the workspace's `defaultProvider`. Ignored by `LocalFleet`, whose
@@ -80,6 +86,7 @@ impl SpawnRequest {
             frontmatter_path: None,
             provider_ref: None,
             permission_posture: PermissionPosture::Supervised,
+            timeout_secs: None,
         }
     }
 
@@ -430,6 +437,13 @@ struct Inner {
     /// snapshot has not caught up yet (#122). Entries are pruned once the poll
     /// observes the agent (snapshot becomes authoritative) or on `rm`.
     recent_spawns: Mutex<HashMap<String, String>>,
+    /// Wall-clock deadlines by agent id (#221), as RFC-3339.
+    ///
+    /// A cache of what the event log already says, not the record itself: an
+    /// agent this replica did not spawn is filled in from its history the first
+    /// time the poll loop sees it, which is what makes a deadline survive
+    /// failover.
+    deadlines: Mutex<HashMap<String, String>>,
     emitter: Emitter,
     ownership: Arc<dyn Ownership>,
     /// Broadcast shutdown signal: `true` once a graceful drain has begun. The
@@ -508,6 +522,7 @@ impl FleetManager {
                 clients: Mutex::new(HashMap::new()),
                 attached: Mutex::new(HashSet::new()),
                 recent_spawns: Mutex::new(HashMap::new()),
+                deadlines: Mutex::new(HashMap::new()),
                 emitter,
                 ownership,
                 shutdown: watch::channel(false).0,
@@ -822,6 +837,9 @@ impl FleetManager {
     ) -> Result<(String, Endpoint)> {
         self.validate_provider_env(repo).await?;
         let client = self.client_for(repo).await?;
+        // Read before `into_spec` consumes the request: the timeout is
+        // prospero's to enforce and never reaches caliband (#221).
+        let req_timeout_secs = req.timeout_secs;
         let mut spec = req.into_spec();
         // Select the provider via the wire spec (#93): the caliban worker reads
         // `SpawnSpec.provider`, not `CALIBAN_PROVIDER`, so carry the repo's
@@ -841,6 +859,21 @@ impl FleetManager {
             .emitter
             .emit(repo, &id, EventKind::AgentSpawned)
             .await;
+        // #221: record the deadline in the log *before* anything can go wrong
+        // with this replica. A timer here would die with the process; the log
+        // is what a survivor reads back.
+        if let Some(deadline) = crate::deadline::deadline_from(chrono::Utc::now(), req_timeout_secs)
+        {
+            self.inner
+                .deadlines
+                .lock()
+                .unwrap()
+                .insert(id.clone(), deadline.clone());
+            self.inner
+                .emitter
+                .emit(repo, &id, EventKind::DeadlineSet { deadline })
+                .await;
+        }
         self.start_attach(repo, &id, client).await;
         Ok((id, endpoint))
     }
@@ -1300,6 +1333,77 @@ impl FleetManager {
         for id in to_attach {
             self.start_attach(repo, &id, client.clone()).await;
         }
+
+        // #221: enforce wall-clock deadlines. Lease-gated like every other
+        // emission in this loop, so in a cluster exactly one replica acts on an
+        // expiry rather than all of them racing to kill the same agent.
+        if own_lifecycle {
+            self.enforce_deadlines(repo, &client).await;
+        }
+    }
+
+    /// Kill any agent in `repo` whose deadline has passed (#221).
+    ///
+    /// Deadlines this replica did not set are read back from the agent's own
+    /// history — the failover path, and the reason the deadline is a log entry
+    /// rather than a timer. The lookup happens once per agent: the miss is
+    /// cached as "no deadline" by simply not inserting, and an agent with a
+    /// deadline keeps it in the map afterwards.
+    async fn enforce_deadlines(&self, repo: &str, client: &CalibandClient) {
+        let agents: Vec<Agent> = {
+            let snap = self.inner.snapshot.read().await;
+            snap.workspaces
+                .iter()
+                .find(|r| r.name == repo)
+                .map(|r| r.agents.clone())
+                .unwrap_or_default()
+        };
+
+        // Fill in deadlines for live agents this replica has not seen before.
+        for agent in agents.iter().filter(|a| !a.status.is_terminal()) {
+            if self.inner.deadlines.lock().unwrap().contains_key(&agent.id) {
+                continue;
+            }
+            let key = crate::event::stream_key_for(repo, &agent.id);
+            let history = self
+                .inner
+                .emitter
+                .store
+                .replay(&key, 0)
+                .await
+                .unwrap_or_default();
+            if let Some(deadline) = crate::deadline::deadline_in(&history) {
+                self.inner
+                    .deadlines
+                    .lock()
+                    .unwrap()
+                    .insert(agent.id.clone(), deadline);
+            }
+        }
+
+        let due = {
+            let deadlines = self.inner.deadlines.lock().unwrap();
+            crate::deadline::expired(chrono::Utc::now(), &deadlines, agents.iter())
+        };
+        for (id, deadline) in due {
+            // Record the reason first: a `killed` with no explanation reads as
+            // an operator's doing.
+            self.inner
+                .emitter
+                .emit(repo, &id, EventKind::AgentTimedOut { deadline })
+                .await;
+            if let Err(e) = client.kill(&id).await {
+                tracing::warn!(
+                    target: "prospero_fleet", agent = %id, error = %e,
+                    "killing a timed-out agent failed; will retry next poll"
+                );
+                continue;
+            }
+            // Stop re-firing for an agent already killed; the poll that sees
+            // its terminal status would skip it anyway, but this avoids a
+            // second emit in the window before that.
+            self.inner.deadlines.lock().unwrap().remove(&id);
+        }
     }
 
     /// Start a per-agent attach task if one is not already running. The task
@@ -1514,6 +1618,11 @@ async fn event_to_change(mgr: &FleetManager, ev: FleetEvent) -> Option<FleetChan
         // Fleet-membership/health view only; per-agent output/tool/lifecycle
         // accounting stays on the per-agent SSE tail (`crate::api::sse`).
         EventKind::AgentSpawned
+        // #221: a deadline and its expiry are per-agent log detail. The fleet
+        // view learns of the outcome through the `killed` transition that
+        // follows, which is already a `StatusChanged`.
+        | EventKind::DeadlineSet { .. }
+        | EventKind::AgentTimedOut { .. }
         | EventKind::AgentInit { .. }
         | EventKind::Output { .. }
         | EventKind::ToolStarted { .. }
@@ -1897,6 +2006,106 @@ mod tests {
         assert!(
             mgr.cached_client_names().await.iter().all(|n| n != "p"),
             "cached client for the repo should be cleared after restart"
+        );
+    }
+
+    /// #221: a spawn with a timeout is killed once the deadline passes, and the
+    /// log says why — a bare `killed` would look like an operator did it.
+    #[tokio::test]
+    async fn a_spawn_with_a_timeout_is_killed_when_the_deadline_passes() {
+        use crate::testkit::FakeCaliband;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("local", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        let fake = FakeCaliband::start_at(&socket).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        let mgr = FleetManager::new(config, store.clone()).await.unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+
+        // A zero timeout is due the moment it is set — no sleeping in a test.
+        let mut req = SpawnRequest::new("run forever");
+        req.timeout_secs = Some(0);
+        let id = mgr.spawn_agent("p", req).await.unwrap();
+
+        // The deadline is in the durable log, not only in this replica's head:
+        // that is what lets another replica take the agent over.
+        let key = crate::event::stream_key_for("p", &id);
+        let history = store.replay(&key, 0).await.unwrap();
+        assert!(
+            crate::deadline::deadline_in(&history).is_some(),
+            "the spawn must record its deadline: {history:?}"
+        );
+
+        mgr.poll_repo_once("p").await;
+
+        let history = store.replay(&key, 0).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::AgentTimedOut { .. })),
+            "the expiry must be recorded: {history:?}"
+        );
+        assert!(
+            fake.killed_ids().iter().any(|k| k == &id),
+            "the agent must actually be killed, not just logged"
+        );
+    }
+
+    /// #221 failover: a replica that did not spawn the agent has no deadline in
+    /// memory, and must read it back from the shared log. A timer could not do
+    /// this — which is why the deadline is an event.
+    #[tokio::test]
+    async fn a_deadline_set_by_another_replica_is_recovered_from_the_log() {
+        use crate::model::AgentStatus;
+        use crate::testkit::{FakeCaliband, test_record};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FleetConfig::new("survivor", dir.path());
+        config.discovery_env.caliban_daemon_runtime_dir = Some(dir.path().to_path_buf());
+        config.ensure.autostart = false;
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = crate::discovery::resolve_socket(&root, &config.discovery_env).unwrap();
+
+        // The agent is live on caliband, as it would be after the replica that
+        // spawned it died.
+        let mut fake = FakeCaliband::start_at(&socket).await.unwrap();
+        fake.add_agent(
+            test_record("orphan", dir.path(), AgentStatus::Running, false),
+            vec![],
+        )
+        .await;
+
+        // Its deadline is in the shared store — written by the dead replica.
+        let store = std::sync::Arc::new(crate::store::JsonlStore::open(dir.path()).unwrap());
+        store
+            .append(&FleetEvent {
+                seq: 1,
+                ts: "2026-09-20T00:00:00Z".into(),
+                repo: "p".into(),
+                agent_id: "orphan".into(),
+                kind: EventKind::DeadlineSet {
+                    deadline: "2026-09-20T00:00:00+00:00".into(),
+                },
+                actor: None,
+            })
+            .await
+            .unwrap();
+
+        let mgr = FleetManager::new(config, store).await.unwrap();
+        mgr.add_repo("p", &root).await.unwrap();
+        mgr.poll_repo_once("p").await;
+
+        assert!(
+            fake.killed_ids().iter().any(|k| k == "orphan"),
+            "a deadline this replica never set must still be enforced: {:?}",
+            fake.killed_ids()
         );
     }
 
