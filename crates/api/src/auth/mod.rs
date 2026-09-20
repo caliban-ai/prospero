@@ -165,6 +165,10 @@ pub fn required_access(method: &Method, route: &str) -> Access {
             | "/api/agents/{id}/end-input",
         )
         | ("DELETE", "/api/agents/{id}") => Requires(Operate),
+        // #218: MCP is a *driving* surface — its tools spawn, steer and kill —
+        // so the whole endpoint sits at the scope those actions need rather
+        // than a second, per-tool authorization model inside the handler.
+        (_, "/mcp") => Requires(Operate),
         ("POST", "/api/workspaces")
         | ("DELETE", "/api/workspaces/{name}")
         | ("PUT", "/api/workspaces/{name}/config") => Requires(Admin),
