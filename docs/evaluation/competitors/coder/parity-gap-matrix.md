@@ -96,7 +96,7 @@ ADR-0010.
 | Capability (Coder) | Prospero | Notes |
 |---|---|---|
 | Workspace registry | ✅ | `GET/POST /api/workspaces`, `DELETE /api/workspaces/{name}` |
-| Heterogeneous agent products | 🟡 | Prospero drives caliban only (ADR-0003). Current Coder is **also** single-agent; legacy AgentAPI drove 11 CLIs — the capability Coder retired |
+| Heterogeneous agent products | 🟡 | Prospero drives caliban only (ADR-0003; [ADR-0011](../../../adr/0011-acp-as-a-second-drive-protocol.md) sets the ACP route). Current Coder is **also** single-agent; legacy AgentAPI drove 11 CLIs — the capability Coder retired |
 | Connect cloud-hosted agents to self-hosted workspaces | 🔴 | ⚠ Coder's Agent Relay is **Early Access**; Prospero has no remote/multi-host transport (#1) |
 | IDE integrations (Cursor / Zed / Devin) | 🔴 | none |
 

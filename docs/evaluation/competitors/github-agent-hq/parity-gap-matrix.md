@@ -98,7 +98,7 @@ shipped, `crates/api/src/auth/`, ADR-0010).
 
 | Capability (Agent HQ) | Prospero | Notes |
 |---|---|---|
-| Multiple agent products behind one control plane | 🔴 | caliban-only; Agent HQ drives Copilot + Claude + Codex *(preview)*. Prospero's wire-only coupling (ADR-0003) is the extension point |
+| Multiple agent products behind one control plane | 🔴 | caliban-only; Agent HQ drives Copilot + Claude + Codex *(preview)*. Prospero's wire-only coupling (ADR-0003) is the extension point; [ADR-0011](../../../adr/0011-acp-as-a-second-drive-protocol.md) makes ACP that second wire |
 | Custom agents | 🟡 | per-spawn agent templates via `frontmatter_path` (#6); no installable agent-app registry |
 | Admin policy over which agents may run | 🔴 | no policy surface; Agent HQ gates third-party agents by org/enterprise policy |
 | Multi-repo fleet | ✅ | workspace registry (`/api/workspaces`, `prospero workspace add`) |

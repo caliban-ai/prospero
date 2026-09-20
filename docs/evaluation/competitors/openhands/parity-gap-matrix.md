@@ -95,7 +95,7 @@ ADR-0010.
 
 | Capability (OpenHands) | Prospero | Notes |
 |---|---|---|
-| Drive several agent products (native + ACP: Claude Code, Codex, Gemini CLI) | 🔴 | caliban agents only, over caliban's NDJSON wire format (ADR-0003); no ACP or other-agent adapter |
+| Drive several agent products (native + ACP: Claude Code, Codex, Gemini CLI) | 🔴 | caliban agents only, over caliban's NDJSON wire format (ADR-0003); no ACP or other-agent adapter. Route decided in [ADR-0011](../../../adr/0011-acp-as-a-second-drive-protocol.md): an `AgentDriver` seam with an ACP driver, with foreign-harness *lifecycle* pushed to caliband rather than into prosperod |
 | One UI across multiple execution servers | 🔴 | no transport to remote prosperods (#1); clustered mode is HA for one control plane, not aggregation |
 
 ## G. Model / provider handling
