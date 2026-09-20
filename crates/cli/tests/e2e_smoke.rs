@@ -275,6 +275,7 @@ async fn cli_authenticates_against_an_auth_enabled_daemon() {
         Some(Arc::new(local)),
         manager.store(),
         manager.bus(),
+        None,
         AuthState::enabled(tokens, SessionKey::random(), false),
     );
     tokio::spawn(async move {

@@ -83,6 +83,12 @@ struct Args {
     #[arg(long, default_value_t = 2000)]
     poll_interval_ms: u64,
 
+    /// How often to check whether an automation's schedule has come due, in
+    /// milliseconds (#220). Cron resolves to whole minutes, so this only bounds
+    /// how late a fire can be, not how often one happens.
+    #[arg(long, default_value_t = 30_000)]
+    automation_interval_ms: u64,
+
     /// Do not auto-start caliband daemons for registered repos.
     #[arg(long)]
     no_autostart: bool,
@@ -424,12 +430,13 @@ async fn main() -> anyhow::Result<()> {
     // backend owns (poll loop, heartbeat, manager for graceful shutdown) — all
     // `None` under k8s, which starts none of them (#83).
     #[allow(clippy::type_complexity)]
-    let (fleet, admin, poll_handle, heartbeat_handle, manager_for_shutdown): (
+    let (fleet, admin, poll_handle, heartbeat_handle, manager_for_shutdown, automation_config): (
         Arc<dyn prospero_core::FleetProvider>,
         Option<Arc<dyn prospero_core::FleetAdmin>>,
         Option<JoinHandle<()>>,
         Option<JoinHandle<()>>,
         Option<FleetManager>,
+        Option<Arc<dyn ConfigStore>>,
     ) = match args.fleet_backend {
         FleetBackend::Local => {
             // Per-topology registry + ownership seams (clustered adds a lease
@@ -488,6 +495,9 @@ async fn main() -> anyhow::Result<()> {
                 )
             };
 
+            // Kept for the automation engine, which needs the *same* shared
+            // store: its per-tick claim is what stops replicas double-firing.
+            let automation_config = config_store.clone();
             let manager = FleetManager::with_seams(
                 config,
                 store.clone(),
@@ -507,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(poll_handle),
                 heartbeat_handle,
                 Some(manager),
+                Some(automation_config),
             )
         }
         #[cfg(feature = "k8s")]
@@ -525,6 +536,21 @@ async fn main() -> anyhow::Result<()> {
             // (#149/#151) so the fleet snapshot (`GET /api/fleet`) surfaces the
             // registered `Workspace` CRs instead of a synthetic 'k8s' entry —
             // keeping `/api/fleet` and `/api/workspaces` in agreement.
+            // Automations (#220) need a store shared by every replica, because
+            // the per-tick claim is what arbitrates between them. Under k8s
+            // that means Postgres; without it, automations stay off rather
+            // than silently firing once per pod.
+            let automation_config: Option<Arc<dyn ConfigStore>> =
+                if let Some(url) = args.database_url.clone() {
+                    Some(Arc::new(
+                        PostgresConfigStore::connect(&url)
+                            .await
+                            .with_context(|| "connecting config store for automations (k8s)")?,
+                    ))
+                } else {
+                    None
+                };
+
             let workspace_api = Arc::new(prospero_core::KubeWorkspaceApi::new(client, &ns));
             let workspace_admin =
                 Arc::new(prospero_core::K8sWorkspaceAdmin::new(workspace_api.clone()));
@@ -609,6 +635,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 heartbeat_handle,
                 None,
+                automation_config,
             )
         }
         #[cfg(not(feature = "k8s"))]
@@ -640,7 +667,36 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = prospero_api::router_with_auth(fleet, admin, store.clone(), bus.clone(), auth);
+    // The automation engine (#220): one loop per replica, arbitrated by the
+    // store's per-tick claim rather than by a lease, so a scheduled spawn
+    // still happens when the lease holder is the replica that just died.
+    let (automation_stop, automation_stop_rx) = tokio::sync::watch::channel(false);
+    let (automations, automation_handle) = match automation_config {
+        Some(config_store) => {
+            let engine = Arc::new(prospero_core::automation::AutomationEngine::new(
+                config_store,
+                fleet.clone(),
+            ));
+            let interval = Duration::from_millis(args.automation_interval_ms);
+            let handle = tokio::spawn(engine.clone().run(interval, automation_stop_rx));
+            tracing::info!(
+                target: "prosperod",
+                interval_ms = args.automation_interval_ms,
+                "automation scheduler active"
+            );
+            (Some(engine), Some(handle))
+        }
+        None => {
+            tracing::info!(
+                target: "prosperod",
+                "automations disabled (no shared config store)"
+            );
+            (None, None)
+        }
+    };
+
+    let app =
+        prospero_api::router_with_auth(fleet, admin, store.clone(), bus.clone(), automations, auth);
     let listener = tokio::net::TcpListener::bind(args.addr)
         .await
         .with_context(|| format!("binding {}", args.addr))?;
@@ -660,6 +716,10 @@ async fn main() -> anyhow::Result<()> {
     // HTTP has drained; now drain whatever background work this backend started.
     // Only the local arm builds a poll loop / heartbeat — under k8s there's
     // nothing to drain (#83).
+    let _ = automation_stop.send(true);
+    if let Some(handle) = automation_handle {
+        let _ = handle.await;
+    }
     if let Some(manager) = &manager_for_shutdown {
         manager.begin_shutdown();
     }

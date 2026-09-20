@@ -201,6 +201,7 @@ async fn k8s_backend_enforces_auth_and_scopes() {
         None,
         store,
         bus,
+        None,
         AuthState::enabled(tokens, SessionKey::random(), false),
     );
 

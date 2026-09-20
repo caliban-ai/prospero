@@ -1860,6 +1860,35 @@ mod tests {
             v.retain(|e| e.name != name);
             Ok(v.len() != before)
         }
+        // This double exists solely to widen the `list_repos` read window; the
+        // automation half of the trait is never exercised through it. Panicking
+        // rather than returning an empty result keeps a future test that *does*
+        // reach here from quietly passing against a store that holds nothing.
+        async fn list_automations(&self) -> Result<Vec<crate::automation::StoredAutomation>> {
+            unimplemented!("SlowListConfigStore only models list_repos")
+        }
+        async fn upsert_automation(
+            &self,
+            _automation: &crate::automation::StoredAutomation,
+        ) -> Result<()> {
+            unimplemented!("SlowListConfigStore only models list_repos")
+        }
+        async fn delete_automation(&self, _id: &str) -> Result<bool> {
+            unimplemented!("SlowListConfigStore only models list_repos")
+        }
+        async fn claim_automation_fire(&self, _id: &str, _fire_at: &str) -> Result<bool> {
+            unimplemented!("SlowListConfigStore only models list_repos")
+        }
+        async fn record_run(&self, _run: &crate::automation::AutomationRun) -> Result<()> {
+            unimplemented!("SlowListConfigStore only models list_repos")
+        }
+        async fn list_runs(
+            &self,
+            _automation_id: &str,
+            _limit: usize,
+        ) -> Result<Vec<crate::automation::AutomationRun>> {
+            unimplemented!("SlowListConfigStore only models list_repos")
+        }
     }
 
     #[tokio::test]

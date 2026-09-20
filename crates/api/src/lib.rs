@@ -6,6 +6,7 @@
 //! talk to this one surface.
 
 pub mod auth;
+pub mod automations;
 pub mod dashboard;
 pub mod dto;
 pub mod error;
@@ -38,6 +39,10 @@ pub struct AppState {
     pub bus: Arc<dyn EventBus>,
     /// Inbound auth configuration (#2).
     pub auth: Arc<auth::AuthState>,
+    /// The automation runtime (#220). `None` when the backend has no shared
+    /// config store to hold automations in — those routes then 405 rather
+    /// than pretending to schedule something nothing will fire.
+    pub automations: Option<Arc<prospero_core::automation::AutomationEngine>>,
 }
 
 /// Build the application router over the backend seams (constructed once, at the
@@ -47,6 +52,7 @@ pub fn router_with_auth(
     admin: Option<Arc<dyn FleetAdmin>>,
     store: Arc<dyn Store>,
     bus: Arc<dyn EventBus>,
+    automations: Option<Arc<prospero_core::automation::AutomationEngine>>,
     auth: auth::AuthState,
 ) -> Router {
     let auth = Arc::new(auth);
@@ -59,6 +65,7 @@ pub fn router_with_auth(
         store,
         bus,
         auth: auth.clone(),
+        automations,
     };
     Router::new()
         // The dashboard (Dioxus/WASM, #97) is the only UI: the document at
@@ -116,6 +123,22 @@ pub fn router_with_auth(
             "/api/agents/{id}/end-input",
             post(handlers::agent_end_input),
         )
+        // Automations (#220).
+        .route(
+            "/api/automations",
+            get(automations::list_automations).post(automations::create_automation),
+        )
+        .route(
+            "/api/automations/{id}",
+            delete(automations::delete_automation),
+        )
+        .route(
+            "/api/automations/{id}/enabled",
+            put(automations::set_enabled),
+        )
+        .route("/api/automations/{id}/runs", get(automations::list_runs))
+        .route("/api/automations/{id}/run", post(automations::run_now))
+        .route("/api/automations/{id}/trigger", post(automations::trigger))
         .route_layer(axum::middleware::from_fn_with_state(auth, auth::middleware))
         .with_state(state)
 }
@@ -127,5 +150,23 @@ pub fn router(
     store: Arc<dyn Store>,
     bus: Arc<dyn EventBus>,
 ) -> Router {
-    router_with_auth(fleet, admin, store, bus, auth::AuthState::disabled())
+    router_with_auth(fleet, admin, store, bus, None, auth::AuthState::disabled())
+}
+
+/// Build the router with automations wired and authentication disabled.
+pub fn router_with_automations(
+    fleet: Arc<dyn FleetProvider>,
+    admin: Option<Arc<dyn FleetAdmin>>,
+    store: Arc<dyn Store>,
+    bus: Arc<dyn EventBus>,
+    automations: Arc<prospero_core::automation::AutomationEngine>,
+) -> Router {
+    router_with_auth(
+        fleet,
+        admin,
+        store,
+        bus,
+        Some(automations),
+        auth::AuthState::disabled(),
+    )
 }

@@ -1152,6 +1152,190 @@ pub async fn config_store_conformance(store: &dyn crate::config_store::ConfigSto
     assert_eq!(names, vec!["a".to_string(), "z".to_string()]);
 }
 
+/// A minimal automation for the conformance battery.
+#[cfg(any(test, feature = "testkit"))]
+fn sample_automation(id: &str) -> crate::automation::StoredAutomation {
+    use crate::automation::{Automation, SpawnTemplate, StoredAutomation, Trigger};
+    StoredAutomation {
+        automation: Automation {
+            id: id.to_string(),
+            workspace: "w".into(),
+            trigger: Trigger::Cron {
+                schedule: "*/5 * * * *".into(),
+            },
+            template: SpawnTemplate {
+                task: "do the thing".into(),
+                ..Default::default()
+            },
+            enabled: true,
+            created_at: "2026-09-20T10:00:00Z".into(),
+            last_fired_at: None,
+        },
+        webhook_secret: None,
+    }
+}
+
+/// Behavioral contract every [`crate::config_store::ConfigStore`] must satisfy
+/// for automations (#220): CRUD round-trips, `last_fired_at` stays under the
+/// claim's control, run history is newest-first and bounded, and deleting an
+/// automation takes its runs with it.
+pub async fn automation_store_conformance(store: &dyn crate::config_store::ConfigStore) {
+    use crate::automation::{AutomationRun, RUN_HISTORY_LIMIT, RunSource};
+
+    assert!(store.list_automations().await.unwrap().is_empty());
+
+    let a = sample_automation("nightly");
+    store.upsert_automation(&a).await.unwrap();
+    let stored = store.list_automations().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0], a, "an automation must round-trip unchanged");
+
+    // A webhook secret survives the round trip — it is the credential, so
+    // losing it silently would lock every sender out.
+    let mut hooked = sample_automation("hooked");
+    hooked.automation.trigger = crate::automation::Trigger::Webhook;
+    hooked.webhook_secret = Some("s3cret".into());
+    store.upsert_automation(&hooked).await.unwrap();
+    let got = store.list_automations().await.unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].automation.id, "hooked", "list is ordered by id");
+    assert_eq!(got[0].webhook_secret.as_deref(), Some("s3cret"));
+
+    // Editing an automation must not move its fire clock.
+    store
+        .claim_automation_fire("nightly", "2026-09-20T10:05:00Z")
+        .await
+        .unwrap();
+    let mut edited = a.clone();
+    edited.automation.template.task = "do another thing".into();
+    store.upsert_automation(&edited).await.unwrap();
+    let after = store.list_automations().await.unwrap();
+    let nightly = after.iter().find(|s| s.automation.id == "nightly").unwrap();
+    assert_eq!(nightly.automation.template.task, "do another thing");
+    assert_eq!(
+        nightly.automation.last_fired_at.as_deref(),
+        Some("2026-09-20T10:05:00Z"),
+        "an ordinary edit must not rewind or advance the fire clock"
+    );
+
+    // Run history: newest first.
+    for (i, at) in ["10:05:00", "10:10:00", "10:15:00"].iter().enumerate() {
+        store
+            .record_run(&AutomationRun {
+                automation_id: "nightly".into(),
+                fired_at: format!("2026-09-20T{at}Z"),
+                source: RunSource::Schedule,
+                agent_id: Some(format!("agent-{i}")),
+                error: None,
+            })
+            .await
+            .unwrap();
+    }
+    let runs = store.list_runs("nightly", 10).await.unwrap();
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].fired_at, "2026-09-20T10:15:00Z");
+    assert_eq!(runs[0].agent_id.as_deref(), Some("agent-2"));
+    assert_eq!(runs[2].fired_at, "2026-09-20T10:05:00Z");
+    assert!(store.list_runs("nightly", 2).await.unwrap().len() == 2);
+    assert!(store.list_runs("hooked", 10).await.unwrap().is_empty());
+
+    // A failed run is recorded too — an automation that quietly stops working
+    // is exactly what this history exists to make visible.
+    store
+        .record_run(&AutomationRun {
+            automation_id: "hooked".into(),
+            fired_at: "2026-09-20T11:00:00Z".into(),
+            source: RunSource::Webhook,
+            agent_id: None,
+            error: Some("workspace 'w' is unreachable".into()),
+        })
+        .await
+        .unwrap();
+    let failed = store.list_runs("hooked", 10).await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].source, RunSource::Webhook);
+    assert!(failed[0].agent_id.is_none());
+    assert_eq!(
+        failed[0].error.as_deref(),
+        Some("workspace 'w' is unreachable")
+    );
+
+    // Deleting takes the run history with it, rather than orphaning rows that
+    // a later automation reusing the id would inherit.
+    assert!(store.delete_automation("nightly").await.unwrap());
+    assert!(!store.delete_automation("nightly").await.unwrap());
+    assert!(store.list_runs("nightly", 10).await.unwrap().is_empty());
+    assert_eq!(store.list_automations().await.unwrap().len(), 1);
+
+    // History is bounded: a busy automation must not grow the config DB
+    // without limit.
+    for i in 0..(RUN_HISTORY_LIMIT + 25) {
+        store
+            .record_run(&AutomationRun {
+                automation_id: "hooked".into(),
+                fired_at: format!("2026-09-21T{:02}:{:02}:00Z", i / 60, i % 60),
+                source: RunSource::Schedule,
+                agent_id: Some(format!("a{i}")),
+                error: None,
+            })
+            .await
+            .unwrap();
+    }
+    let kept = store
+        .list_runs("hooked", RUN_HISTORY_LIMIT * 2)
+        .await
+        .unwrap();
+    assert_eq!(kept.len(), RUN_HISTORY_LIMIT);
+    assert_eq!(
+        kept[0].agent_id.as_deref(),
+        Some(format!("a{}", RUN_HISTORY_LIMIT + 24).as_str()),
+        "trimming must drop the oldest runs, not the newest"
+    );
+}
+
+/// The exactly-once contract behind scheduled spawns (#220, acceptance
+/// criterion 3): when several replicas see the same due tick, the store hands
+/// the fire to exactly one of them.
+pub async fn automation_claim_conformance(store: &dyn crate::config_store::ConfigStore) {
+    store
+        .upsert_automation(&sample_automation("nightly"))
+        .await
+        .unwrap();
+
+    // Three replicas racing on one tick.
+    let tick = "2026-09-20T10:05:00Z";
+    let mut wins = 0;
+    for _ in 0..3 {
+        if store.claim_automation_fire("nightly", tick).await.unwrap() {
+            wins += 1;
+        }
+    }
+    assert_eq!(wins, 1, "exactly one replica may fire a given tick");
+
+    // The next tick is claimable exactly once again.
+    let next = "2026-09-20T10:10:00Z";
+    assert!(store.claim_automation_fire("nightly", next).await.unwrap());
+    assert!(!store.claim_automation_fire("nightly", next).await.unwrap());
+
+    // A late replica still holding the *previous* tick must not re-fire it.
+    assert!(
+        !store.claim_automation_fire("nightly", tick).await.unwrap(),
+        "an older tick must never win after a newer one has fired"
+    );
+
+    // Claiming an automation that does not exist is a loss, not an error or a
+    // phantom row.
+    assert!(!store.claim_automation_fire("ghost", next).await.unwrap());
+    assert!(
+        store
+            .list_automations()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.automation.id != "ghost")
+    );
+}
+
 /// Behavioral contract every [`crate::fleet_provider::FleetProvider`] backend
 /// must satisfy: `ensure_agent` provisions an attachable handle and its spec
 /// reaches the backend; `watch_fleet` observes the new agent (`Discovered`);
