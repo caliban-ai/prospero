@@ -57,6 +57,17 @@ pub enum CoreError {
     #[error("workspace not registered: {0}")]
     WorkspaceNotFound(String),
 
+    /// No automation is configured under that id (#220).
+    #[error("automation not found: {0}")]
+    AutomationNotFound(String),
+
+    /// A request failed to prove it was allowed to make it — today, a webhook
+    /// whose HMAC signature is absent or wrong (#220). Distinct from
+    /// [`CoreError::Conflict`] and the not-found variants so the API answers
+    /// `401` instead of implying the request was merely malformed.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
     /// A request conflicts with existing state and can never succeed as-is —
     /// e.g. registering a workspace name/root that is already taken. Distinct
     /// from [`CoreError::Discovery`] (a *transient* reachability failure) so the

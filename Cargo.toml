@@ -44,6 +44,10 @@ base64 = "0.22"
 rand = "0.8"
 hmac = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Cron expression parsing for scheduled automations (#220). Its own syntax is
+# 6-field (seconds first); `automation::normalize_schedule` accepts the 5-field
+# form operators actually write and adapts it.
+cron = "0.17"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace", "fs"] }
 clap = { version = "4", features = ["derive", "env"] }

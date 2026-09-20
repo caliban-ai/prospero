@@ -64,9 +64,10 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg),
             ApiError::Core(e) => {
                 let (status, kind) = match &e {
-                    CoreError::AgentNotFound(_) | CoreError::WorkspaceNotFound(_) => {
-                        (StatusCode::NOT_FOUND, "not_found")
-                    }
+                    CoreError::AgentNotFound(_)
+                    | CoreError::WorkspaceNotFound(_)
+                    | CoreError::AutomationNotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
+                    CoreError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
                     CoreError::InvalidState { .. } => (StatusCode::CONFLICT, "invalid_state"),
                     CoreError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
                     CoreError::ProviderMisconfigured(_) => {

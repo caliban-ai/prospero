@@ -8,6 +8,7 @@
 
 mod api;
 mod auth;
+mod automation;
 mod event;
 mod model;
 
@@ -17,6 +18,10 @@ pub use api::{
     WorkspaceSummary,
 };
 pub use auth::{Scope, SessionInfo, SignInBody};
+pub use automation::{
+    Automation, AutomationRun, CreateAutomationBody, CreatedAutomationResponse, FiredResponse,
+    RunSource, SetEnabledBody, SpawnTemplate, Trigger,
+};
 pub use event::{EventKind, FleetEvent, OutputStream, stream_key_for};
 pub use model::{
     Agent, AgentId, AgentStatus, CredentialsRef, FleetSnapshot, IsolationConfig, PermissionPosture,

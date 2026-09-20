@@ -53,11 +53,82 @@ enum Command {
     Send(SendArgs),
     /// Signal end-of-input to an interactive agent (it finishes after).
     EndInput(AgentRef),
+    /// Manage automations: scheduled and webhook-triggered spawns.
+    #[command(subcommand)]
+    Automation(AutomationCmd),
     /// Manage API tokens (offline).
     #[command(subcommand)]
     Token(TokenCmd),
     /// Show which token this CLI is using and its scope.
     Whoami,
+}
+
+#[derive(Debug, Subcommand)]
+enum AutomationCmd {
+    /// Create an automation. Exactly one of --schedule or --webhook.
+    Add(AutomationAddArgs),
+    /// List configured automations.
+    Ls,
+    /// Fire one now, whatever its trigger.
+    Run {
+        /// Automation id.
+        id: String,
+    },
+    /// Show an automation's recent runs, newest first.
+    Runs {
+        /// Automation id.
+        id: String,
+        /// How many runs to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Stop an automation firing, without deleting it.
+    Disable {
+        /// Automation id.
+        id: String,
+    },
+    /// Let a disabled automation fire again.
+    Enable {
+        /// Automation id.
+        id: String,
+    },
+    /// Delete an automation and its run history.
+    Rm {
+        /// Automation id.
+        id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct AutomationAddArgs {
+    /// Automation id (unique).
+    id: String,
+    /// Workspace to spawn into.
+    workspace: String,
+    /// The agent's task. With --webhook it may contain `{{ dotted.path }}`
+    /// placeholders filled from the request payload.
+    task: String,
+    /// Cron schedule, e.g. "0 3 * * *" (5-field, UTC).
+    #[arg(long, conflicts_with = "webhook")]
+    schedule: Option<String>,
+    /// Trigger by signed webhook instead of a schedule.
+    #[arg(long, conflicts_with = "schedule")]
+    webhook: bool,
+    /// Optional label for spawned agents.
+    #[arg(long)]
+    label: Option<String>,
+    /// Optional model override.
+    #[arg(long)]
+    model: Option<String>,
+    /// Kill each spawned agent after this many seconds.
+    #[arg(long)]
+    timeout_secs: Option<u64>,
+    /// Run in the shared checkout instead of an isolated worktree.
+    #[arg(long)]
+    shared_tree: bool,
+    /// Create it disabled.
+    #[arg(long)]
+    disabled: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -280,6 +351,81 @@ fn main() -> Result<()> {
             client.delete(&format!("/api/workspaces/{name}"))?;
             println!("unregistered workspace '{name}'");
         }
+        Command::Automation(AutomationCmd::Add(a)) => {
+            let trigger = match (&a.schedule, a.webhook) {
+                (Some(schedule), false) => {
+                    serde_json::json!({ "kind": "cron", "schedule": schedule })
+                }
+                (None, true) => serde_json::json!({ "kind": "webhook" }),
+                _ => anyhow::bail!("pass exactly one of --schedule <CRON> or --webhook"),
+            };
+            let mut template = serde_json::json!({
+                "task": a.task,
+                "isolation_worktree": !a.shared_tree,
+            });
+            if let Some(label) = &a.label {
+                template["label"] = label.clone().into();
+            }
+            if let Some(model) = &a.model {
+                template["model"] = model.clone().into();
+            }
+            if let Some(secs) = a.timeout_secs {
+                template["timeout_secs"] = secs.into();
+            }
+            let body = serde_json::json!({
+                "id": a.id,
+                "workspace": a.workspace,
+                "trigger": trigger,
+                "template": template,
+                "enabled": !a.disabled,
+            });
+            let created = client.post_json("/api/automations", body)?;
+            println!("created automation '{}'", a.id);
+            if let Some(secret) = created["webhook_secret"].as_str() {
+                println!();
+                println!("  webhook URL:  POST /api/automations/{}/trigger", a.id);
+                println!("  signing key:  {secret}");
+                println!();
+                println!("Sign the raw request body with HMAC-SHA256 and send it as");
+                println!("  X-Prospero-Signature: sha256=<hex>");
+                println!("This key is shown once and is not recoverable — store it now.");
+            }
+        }
+        Command::Automation(AutomationCmd::Ls) => {
+            let list = client.get_json("/api/automations")?;
+            print_automations(&list);
+        }
+        Command::Automation(AutomationCmd::Run { id }) => {
+            let fired =
+                client.post_json(&format!("/api/automations/{id}/run"), serde_json::json!({}))?;
+            print_run(&fired["run"]);
+        }
+        Command::Automation(AutomationCmd::Runs { id, limit }) => {
+            let runs = client.get_json(&format!("/api/automations/{id}/runs?limit={limit}"))?;
+            match runs.as_array() {
+                Some(rows) if rows.is_empty() => println!("no runs recorded for '{id}'"),
+                Some(rows) => rows.iter().for_each(print_run),
+                None => println!("no runs recorded for '{id}'"),
+            }
+        }
+        Command::Automation(AutomationCmd::Disable { id }) => {
+            client.put_json(
+                &format!("/api/automations/{id}/enabled"),
+                serde_json::json!({ "enabled": false }),
+            )?;
+            println!("disabled automation '{id}'");
+        }
+        Command::Automation(AutomationCmd::Enable { id }) => {
+            client.put_json(
+                &format!("/api/automations/{id}/enabled"),
+                serde_json::json!({ "enabled": true }),
+            )?;
+            println!("enabled automation '{id}'");
+        }
+        Command::Automation(AutomationCmd::Rm { id }) => {
+            client.delete(&format!("/api/automations/{id}"))?;
+            println!("removed automation '{id}'");
+        }
         Command::Spawn(a) => {
             let mut body = serde_json::json!({ "prompt": a.prompt });
             if let Some(label) = a.label {
@@ -388,6 +534,48 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One line per automation: id, what fires it, where, and its last run.
+fn print_automations(list: &serde_json::Value) {
+    let Some(arr) = list.as_array() else {
+        return;
+    };
+    if arr.is_empty() {
+        println!("(no automations configured)");
+        return;
+    }
+    for a in arr {
+        let id = a["id"].as_str().unwrap_or("?");
+        let workspace = a["workspace"].as_str().unwrap_or("?");
+        let trigger = match a["trigger"]["kind"].as_str() {
+            Some("cron") => a["trigger"]["schedule"].as_str().unwrap_or("?").to_string(),
+            Some("webhook") => "webhook".to_string(),
+            _ => "?".to_string(),
+        };
+        // Disabled is the exception worth calling out; enabled is the norm.
+        let state = if a["enabled"].as_bool().unwrap_or(true) {
+            ""
+        } else {
+            "  (disabled)"
+        };
+        let last = a["last_fired_at"]
+            .as_str()
+            .map(|t| format!("  last {t}"))
+            .unwrap_or_else(|| "  never fired".to_string());
+        println!("{id:<20} {trigger:<16} {workspace}{last}{state}");
+    }
+}
+
+/// One line for a recorded run, leading with whether it worked.
+fn print_run(run: &serde_json::Value) {
+    let at = run["fired_at"].as_str().unwrap_or("?");
+    let source = run["source"].as_str().unwrap_or("?");
+    match (run["agent_id"].as_str(), run["error"].as_str()) {
+        (Some(agent), _) => println!("{at}  {source:<9} ok      {agent}"),
+        (None, Some(err)) => println!("{at}  {source:<9} FAILED  {err}"),
+        (None, None) => println!("{at}  {source:<9} ?"),
+    }
 }
 
 fn print_workspaces(workspaces: &serde_json::Value) {
@@ -504,6 +692,50 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// #220: --schedule and --webhook are alternatives, and clap must enforce
+    /// that rather than the daemon discovering a trigger-less automation.
+    #[test]
+    fn an_automation_takes_exactly_one_trigger() {
+        let cli = Cli::parse_from([
+            "prospero",
+            "automation",
+            "add",
+            "nightly",
+            "myrepo",
+            "sweep the logs",
+            "--schedule",
+            "0 3 * * *",
+        ]);
+        match cli.command {
+            Command::Automation(AutomationCmd::Add(a)) => {
+                assert_eq!(a.id, "nightly");
+                assert_eq!(a.workspace, "myrepo");
+                assert_eq!(a.task, "sweep the logs");
+                assert_eq!(a.schedule.as_deref(), Some("0 3 * * *"));
+                assert!(!a.webhook);
+                assert!(!a.shared_tree, "worktree isolation stays the default");
+                assert!(!a.disabled);
+            }
+            other => panic!("expected automation add, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "prospero",
+                "automation",
+                "add",
+                "x",
+                "r",
+                "t",
+                "--schedule",
+                "0 3 * * *",
+                "--webhook",
+            ])
+            .is_err(),
+            "--schedule and --webhook must conflict"
+        );
     }
 
     #[test]

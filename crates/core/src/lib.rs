@@ -7,6 +7,7 @@
 
 pub mod actor;
 pub mod auth;
+pub mod automation;
 pub mod bus;
 pub mod caliband;
 pub mod config_store;

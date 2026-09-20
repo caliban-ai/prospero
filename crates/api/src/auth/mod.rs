@@ -142,6 +142,13 @@ pub fn required_access(method: &Method, route: &str) -> Access {
     use Scope::{Admin, Operate, Read};
     match (method.as_str(), route) {
         (_, "/healthz" | "/readyz" | "/" | "/assets/{*path}" | "/api/session") => Open,
+        // #220: a webhook trigger authenticates with an HMAC signature over the
+        // request body, checked against the one automation's own key. That
+        // signature *is* the credential, and it authorizes firing exactly that
+        // automation — so the route carries no scope. It is `Open` only in the
+        // sense that this table does not gate it; the handler rejects any
+        // request whose signature does not verify.
+        ("POST", "/api/automations/{id}/trigger") => Open,
         (
             "GET" | "HEAD",
             "/api/metrics"
@@ -154,7 +161,11 @@ pub fn required_access(method: &Method, route: &str) -> Access {
             | "/api/workspaces/{workspace}/agents"
             | "/api/agents/{id}"
             | "/api/agents/{id}/events"
-            | "/api/agents/{id}/stream",
+            | "/api/agents/{id}/stream"
+            // #220: reading automations and their run history is a read of
+            // fleet configuration; neither response carries a signing key.
+            | "/api/automations"
+            | "/api/automations/{id}/runs",
         ) => Requires(Read),
         (
             "POST",
@@ -162,13 +173,23 @@ pub fn required_access(method: &Method, route: &str) -> Access {
             | "/api/agents/{id}/kill"
             | "/api/agents/{id}/respawn"
             | "/api/agents/{id}/input"
-            | "/api/agents/{id}/end-input",
+            | "/api/agents/{id}/end-input"
+            // #220: firing an automation by hand spawns an agent, which is
+            // exactly what `operate` covers.
+            | "/api/automations/{id}/run",
         )
         | ("DELETE", "/api/agents/{id}") => Requires(Operate),
         // #218: MCP is a *driving* surface — its tools spawn, steer and kill —
         // so the whole endpoint sits at the scope those actions need rather
         // than a second, per-tool authorization model inside the handler.
         (_, "/mcp") => Requires(Operate),
+        // #220: creating an automation mints a credential and can grant an
+        // unattended permission posture; editing or deleting one changes what
+        // the fleet does with nobody watching. All three are `admin`, the same
+        // bar #238 set for choosing `Unattended` on a manual spawn.
+        ("POST", "/api/automations")
+        | ("DELETE", "/api/automations/{id}")
+        | ("PUT", "/api/automations/{id}/enabled") => Requires(Admin),
         ("POST", "/api/workspaces")
         | ("DELETE", "/api/workspaces/{name}")
         | ("PUT", "/api/workspaces/{name}/config") => Requires(Admin),
@@ -266,6 +287,52 @@ mod tests {
             Access::Requires(Scope::Admin)
         );
         assert_eq!(required_access(&Method::GET, "/healthz"), Access::Open);
+    }
+
+    /// #220: the automation surface sits at three different scopes, and
+    /// getting any of them wrong is a real privilege bug — creating an
+    /// automation mints a credential, so it must not be reachable at
+    /// `operate`, and the signed-webhook route must not demand a token it
+    /// was never meant to need.
+    #[test]
+    fn automation_routes_sit_at_their_intended_scopes() {
+        use Access::{Open, Requires};
+        use Scope::{Admin, Operate, Read};
+
+        assert_eq!(
+            required_access(&Method::GET, "/api/automations"),
+            Requires(Read)
+        );
+        assert_eq!(
+            required_access(&Method::GET, "/api/automations/{id}/runs"),
+            Requires(Read)
+        );
+        assert_eq!(
+            required_access(&Method::POST, "/api/automations/{id}/run"),
+            Requires(Operate)
+        );
+        assert_eq!(
+            required_access(&Method::POST, "/api/automations"),
+            Requires(Admin)
+        );
+        assert_eq!(
+            required_access(&Method::DELETE, "/api/automations/{id}"),
+            Requires(Admin)
+        );
+        assert_eq!(
+            required_access(&Method::PUT, "/api/automations/{id}/enabled"),
+            Requires(Admin)
+        );
+        // The HMAC signature is this route's credential.
+        assert_eq!(
+            required_access(&Method::POST, "/api/automations/{id}/trigger"),
+            Open
+        );
+        // …and only for POST. Nothing else on that path is open.
+        assert_eq!(
+            required_access(&Method::GET, "/api/automations/{id}/trigger"),
+            Requires(Admin)
+        );
     }
 
     #[test]

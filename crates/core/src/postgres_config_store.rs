@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::postgres::PgPool;
 
+use crate::automation::{AutomationRun, RUN_HISTORY_LIMIT, StoredAutomation};
 use crate::config_store::ConfigStore;
 use crate::error::{CoreError, Result};
 use crate::registry::RegisteredWorkspace;
@@ -16,6 +17,25 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS repos (\
     root   TEXT NOT NULL,\
     config TEXT NOT NULL\
 )";
+
+/// Mirrors the sqlite schema; see `config_store::AUTOMATIONS_SCHEMA` for why
+/// `last_fired_at` is a column rather than a field inside `spec`.
+const AUTOMATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS automations (\
+    id             TEXT PRIMARY KEY,\
+    spec           TEXT NOT NULL,\
+    webhook_secret TEXT,\
+    last_fired_at  TEXT\
+)";
+
+const RUNS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS automation_runs (\
+    automation_id TEXT NOT NULL,\
+    fired_at      TEXT NOT NULL,\
+    source        TEXT NOT NULL,\
+    agent_id      TEXT,\
+    error         TEXT\
+)";
+
+const RUNS_INDEX: &str = "CREATE INDEX IF NOT EXISTS automation_runs_by_time ON automation_runs (automation_id, fired_at DESC)";
 
 /// sqlx/Postgres-backed config store (clustered tier).
 pub struct PostgresConfigStore {
@@ -27,13 +47,16 @@ impl PostgresConfigStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = crate::pg::connect(url).await?;
         crate::pg::ensure_schema(&pool, SCHEMA, "repos table").await?;
+        crate::pg::ensure_schema(&pool, AUTOMATIONS_SCHEMA, "automations table").await?;
+        crate::pg::ensure_schema(&pool, RUNS_SCHEMA, "automation_runs table").await?;
+        crate::pg::ensure_schema(&pool, RUNS_INDEX, "automation_runs index").await?;
         Ok(Self { pool })
     }
 
     /// Truncate all repos. Test-only.
     #[cfg(any(test, feature = "testkit"))]
     pub async fn reset_for_tests(&self) -> Result<()> {
-        sqlx::query("TRUNCATE repos")
+        sqlx::query("TRUNCATE repos, automations, automation_runs")
             .execute(&self.pool)
             .await
             .map_err(|e| CoreError::Store(format!("reset: {e}")))?;
@@ -90,11 +113,120 @@ impl ConfigStore for PostgresConfigStore {
             .map_err(|e| CoreError::Store(format!("delete_repo: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
+
+    async fn list_automations(&self) -> Result<Vec<StoredAutomation>> {
+        let rows =
+            sqlx::query("SELECT spec, webhook_secret, last_fired_at FROM automations ORDER BY id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| CoreError::Store(format!("list_automations: {e}")))?;
+        rows.iter()
+            .map(crate::config_store::decode_automation)
+            .collect()
+    }
+
+    async fn upsert_automation(&self, automation: &StoredAutomation) -> Result<()> {
+        let spec = crate::config_store::encode_spec(automation)?;
+        sqlx::query(
+            "INSERT INTO automations (id, spec, webhook_secret, last_fired_at) \
+             VALUES ($1, $2, $3, NULL) \
+             ON CONFLICT (id) DO UPDATE SET spec = excluded.spec, \
+             webhook_secret = excluded.webhook_secret",
+        )
+        .bind(&automation.automation.id)
+        .bind(spec)
+        .bind(&automation.webhook_secret)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("upsert_automation: {e}")))?;
+        Ok(())
+    }
+
+    async fn delete_automation(&self, id: &str) -> Result<bool> {
+        sqlx::query("DELETE FROM automation_runs WHERE automation_id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Store(format!("delete_automation runs: {e}")))?;
+        let res = sqlx::query("DELETE FROM automations WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Store(format!("delete_automation: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn claim_automation_fire(&self, id: &str, fire_at: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE automations SET last_fired_at = $1 \
+             WHERE id = $2 AND (last_fired_at IS NULL OR last_fired_at < $1)",
+        )
+        .bind(fire_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("claim_automation_fire: {e}")))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn record_run(&self, run: &AutomationRun) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO automation_runs (automation_id, fired_at, source, agent_id, error) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&run.automation_id)
+        .bind(&run.fired_at)
+        .bind(crate::config_store::encode_source(run.source)?)
+        .bind(&run.agent_id)
+        .bind(&run.error)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("record_run: {e}")))?;
+
+        // `ctid` is Postgres' physical row identifier — the equivalent of
+        // sqlite's `rowid` here, and the reason the trim can address individual
+        // rows even when two runs share a `fired_at`.
+        sqlx::query(
+            "DELETE FROM automation_runs WHERE automation_id = $1 AND ctid NOT IN \
+             (SELECT ctid FROM automation_runs WHERE automation_id = $1 \
+              ORDER BY fired_at DESC LIMIT $2)",
+        )
+        .bind(&run.automation_id)
+        .bind(RUN_HISTORY_LIMIT as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("trim runs: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_runs(&self, automation_id: &str, limit: usize) -> Result<Vec<AutomationRun>> {
+        let rows = sqlx::query(
+            "SELECT automation_id, fired_at, source, agent_id, error FROM automation_runs \
+             WHERE automation_id = $1 ORDER BY fired_at DESC LIMIT $2",
+        )
+        .bind(automation_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("list_runs: {e}")))?;
+        rows.iter().map(crate::config_store::decode_run).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialize the Postgres-gated config-store tests against each other.
+    /// They share one database and each one starts by TRUNCATE-ing it, so run
+    /// in parallel a sibling's reset deletes the rows this test just wrote —
+    /// and, worse, a sibling claiming the same tick makes the exactly-once
+    /// assertion fail for a reason that has nothing to do with the code under
+    /// test. Distinct ids would not help: the reset is what collides. Held
+    /// across awaits, so it must be a `tokio` mutex; taken right after the
+    /// `DATABASE_URL` guard, since an unset-DB skip never contends. Mirrors
+    /// `distributed_bus`'s `BUS_TEST_SERIAL`.
+    static CONFIG_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn postgres_config_store_satisfies_conformance() {
@@ -102,8 +234,35 @@ mod tests {
             eprintln!("SKIP postgres_config_store_satisfies_conformance: DATABASE_URL unset");
             return;
         };
+        let _serial = CONFIG_TEST_SERIAL.lock().await;
         let store = PostgresConfigStore::connect(&url).await.unwrap();
         store.reset_for_tests().await.unwrap();
         crate::testkit::config_store_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_config_store_satisfies_automation_conformance() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "SKIP postgres_config_store_satisfies_automation_conformance: DATABASE_URL unset"
+            );
+            return;
+        };
+        let _serial = CONFIG_TEST_SERIAL.lock().await;
+        let store = PostgresConfigStore::connect(&url).await.unwrap();
+        store.reset_for_tests().await.unwrap();
+        crate::testkit::automation_store_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_config_store_claims_a_tick_once() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP postgres_config_store_claims_a_tick_once: DATABASE_URL unset");
+            return;
+        };
+        let _serial = CONFIG_TEST_SERIAL.lock().await;
+        let store = PostgresConfigStore::connect(&url).await.unwrap();
+        store.reset_for_tests().await.unwrap();
+        crate::testkit::automation_claim_conformance(&store).await;
     }
 }

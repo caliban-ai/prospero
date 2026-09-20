@@ -66,6 +66,7 @@ pub async fn setup() -> Harness {
         Some(Arc::new(local)),
         manager.store(),
         manager.bus(),
+        None,
         auth,
     );
     Harness {
