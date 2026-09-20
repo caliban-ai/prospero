@@ -2122,6 +2122,16 @@ mod tests {
         async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
             self.inner.replay(stream_key, from_seq).await
         }
+        async fn replay_fleet(
+            &self,
+            after_cursor: u64,
+            limit: usize,
+        ) -> Result<Vec<crate::store::CursoredEvent>> {
+            self.inner.replay_fleet(after_cursor, limit).await
+        }
+        async fn latest_fleet_cursor(&self) -> Result<u64> {
+            self.inner.latest_fleet_cursor().await
+        }
         async fn high_water(&self, stream_key: &str) -> Result<u64> {
             self.inner.high_water(stream_key).await
         }

@@ -115,6 +115,20 @@ pub(crate) fn aggregate_usage<'a>(events: impl Iterator<Item = &'a FleetEvent>) 
     rows.into_values().collect()
 }
 
+/// One stored event with its fleet-wide cursor (#219).
+///
+/// The cursor is the backend's durable insertion order — the only total order
+/// that exists across streams — and is what a client resuming
+/// `GET /api/fleet/stream` hands back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursoredEvent {
+    /// Fleet-wide position of this event. Strictly increasing, stable once
+    /// written, and meaningful only to the backend that issued it.
+    pub cursor: u64,
+    /// The event itself.
+    pub event: FleetEvent,
+}
+
 /// A durable, append-only event log keyed by stream.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -123,6 +137,23 @@ pub trait Store: Send + Sync {
 
     /// Replay events for one stream with `seq >= from_seq`, in `seq` order.
     async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>>;
+
+    /// Replay **every** stream's events after `after_cursor`, in durable
+    /// insertion order, at most `limit` of them (#219).
+    ///
+    /// Per-stream `seq` cannot order a fleet — two agents both have a `seq` 1 —
+    /// so each event carries a fleet-wide [`CursoredEvent::cursor`], the
+    /// backend's own insertion order. That cursor is what a resuming client
+    /// hands back, so it is exclusive on `after_cursor`, strictly increasing,
+    /// and stable once written. `limit` bounds the batch so a long history
+    /// resumes in chunks rather than one unbounded read.
+    async fn replay_fleet(&self, after_cursor: u64, limit: usize) -> Result<Vec<CursoredEvent>>;
+
+    /// The newest fleet cursor, or 0 when nothing is stored (#219).
+    ///
+    /// This is where a `from=now` subscriber starts: it wants what happens
+    /// next, not the history, and `replay_fleet` is exclusive on its argument.
+    async fn latest_fleet_cursor(&self) -> Result<u64>;
 
     /// The highest `seq` ever persisted for `stream_key` (0 if none). Used to
     /// resume that stream's sequence counter across daemon restarts.
@@ -234,6 +265,29 @@ impl Store for JsonlStore {
             .collect();
         events.sort_by_key(|e| e.seq);
         Ok(events)
+    }
+
+    /// The cursor is the event's 1-based line number in the log. The file is
+    /// append-only, so a written line's position never moves — which is exactly
+    /// the stability the cursor contract requires. (Pruning rewrites the file
+    /// and does renumber, but it only ever removes a prefix by age; a client
+    /// resuming from a pruned cursor asks for history that is gone either way.)
+    async fn replay_fleet(&self, after_cursor: u64, limit: usize) -> Result<Vec<CursoredEvent>> {
+        Ok(self
+            .read_all()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, event)| CursoredEvent {
+                cursor: i as u64 + 1,
+                event,
+            })
+            .filter(|c| c.cursor > after_cursor)
+            .take(limit)
+            .collect())
+    }
+
+    async fn latest_fleet_cursor(&self) -> Result<u64> {
+        Ok(self.read_all()?.len() as u64)
     }
 
     async fn high_water(&self, stream_key: &str) -> Result<u64> {
@@ -420,6 +474,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::open(dir.path()).unwrap();
         crate::testkit::store_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn jsonl_store_satisfies_fleet_replay_conformance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::open(dir.path()).unwrap();
+        crate::testkit::store_fleet_replay_conformance(&store).await;
     }
 
     #[tokio::test]

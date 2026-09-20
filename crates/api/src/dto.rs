@@ -21,6 +21,17 @@ pub use prospero_types::{
     WorkspaceSummary,
 };
 
+/// Query params for `GET /api/fleet/stream` (#219).
+///
+/// `from` is a *string* rather than a number because `now` is a legal value:
+/// "tail only what happens next". A number resumes after that fleet cursor.
+#[derive(Debug, Deserialize)]
+pub struct FleetFrom {
+    /// `<cursor>` | `now`. Absent replays from the beginning.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
 /// Query params for `GET /api/agents/{id}/events` and `/stream`.
 ///
 /// Stays here: this is an axum extractor for a URL query string, not part of the

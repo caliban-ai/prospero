@@ -80,6 +80,7 @@ pub fn router_with_auth(
         .route("/api/capabilities", get(handlers::get_capabilities))
         // Fleet + workspaces.
         .route("/api/fleet", get(handlers::get_fleet))
+        .route("/api/fleet/stream", get(sse::fleet_stream))
         .route("/api/usage", get(handlers::get_usage))
         .route(
             "/api/workspaces",

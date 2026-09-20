@@ -40,6 +40,7 @@ Errors come back as `{"error": "<message>", "kind": "<kind>"}`:
 | GET | `/api/capabilities` | read | What the active backend supports |
 | GET | `/api/metrics` | read | Operational counters |
 | GET | `/api/fleet` | read | Fleet snapshot: every workspace and its agents |
+| GET | `/api/fleet/stream?from=N\|now` | read | Every stream's events, replay then tail (SSE) |
 | GET | `/api/usage` | read | Cost, turns and outcomes per workspace per day |
 | GET | `/api/workspaces` | read | Workspaces with health, sources, agent count and config |
 | POST | `/api/workspaces` | admin | Register a workspace |
@@ -143,6 +144,33 @@ instead of starting a new one. Spawning is idempotent under k8s.
 `POST /api/agents/{id}/respawn` returns `{"agent_id": "<new id>"}`. The old id
 leaves `/api/fleet` and `/api/agents/{id}`, but its history is still available
 from `/api/agents/{old id}/events`.
+
+### The fleet stream
+
+`GET /api/fleet/stream` is one SSE connection carrying **every** agent's events,
+for a consumer that wants the whole fleet rather than one agent — a notifier, a
+dashboard, an external bridge. Without it, watching a fleet meant one connection
+per agent, and no way to learn about an agent you had not seen yet.
+
+Each event arrives as JSON with its **fleet cursor** in the SSE `id:` field:
+
+    id: 4821
+    data: {"seq":7,"ts":"…","repo":"myproj","agent_id":"a1","kind":{…}}
+
+- `?from=<cursor>` resumes **after** that cursor: no gap, no repeat.
+- `?from=now` skips history and delivers only what happens next — what a
+  notifier wants on restart, so it does not re-announce everything it already
+  handled.
+- Omitted replays from the beginning of the store.
+
+The cursor is durable insertion order across all streams, which is the only
+total order a fleet has: a per-agent `seq` cannot order two different agents,
+since both start at 1.
+
+Events are read from the durable store rather than from the live bus, so a
+clustered deployment delivers each event exactly once no matter which replica
+produced it, and a slow client cannot be skipped past — the per-agent stream's
+`gap` signal has no counterpart here because there is nothing to miss.
 
 ### Why an agent is in its state
 

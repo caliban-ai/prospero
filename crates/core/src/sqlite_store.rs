@@ -127,6 +127,59 @@ impl Store for SqliteStore {
         Ok(events)
     }
 
+    /// The cursor is `global_ordinal` — the rowid, i.e. durable insertion
+    /// order (#219).
+    async fn replay_fleet(
+        &self,
+        after_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::store::CursoredEvent>> {
+        let rows = sqlx::query(
+            "SELECT global_ordinal, seq, ts, repo, agent_id, kind, actor FROM events \
+             WHERE global_ordinal > ? ORDER BY global_ordinal LIMIT ?",
+        )
+        .bind(after_cursor as i64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(format!("replay_fleet: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let decode = |e: sqlx::Error| CoreError::Store(format!("replay_fleet decode: {e}"));
+            let cursor: i64 = row.try_get("global_ordinal").map_err(decode)?;
+            let seq: i64 = row.try_get("seq").map_err(decode)?;
+            let ts: String = row.try_get("ts").map_err(decode)?;
+            let repo: String = row.try_get("repo").map_err(decode)?;
+            let agent_id: String = row.try_get("agent_id").map_err(decode)?;
+            let kind_json: String = row.try_get("kind").map_err(decode)?;
+            let actor: Option<String> = row.try_get("actor").map_err(decode)?;
+            out.push(crate::store::CursoredEvent {
+                cursor: cursor as u64,
+                event: FleetEvent {
+                    seq: seq as u64,
+                    ts,
+                    repo,
+                    agent_id,
+                    kind: serde_json::from_str(&kind_json)?,
+                    actor,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    async fn latest_fleet_cursor(&self) -> Result<u64> {
+        let row = sqlx::query("SELECT COALESCE(MAX(global_ordinal), 0) AS head FROM events")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CoreError::Store(format!("latest_fleet_cursor: {e}")))?;
+        let head: i64 = row
+            .try_get("head")
+            .map_err(|e| CoreError::Store(format!("latest_fleet_cursor decode: {e}")))?;
+        Ok(head as u64)
+    }
+
     async fn high_water(&self, stream_key: &str) -> Result<u64> {
         let row =
             sqlx::query("SELECT COALESCE(MAX(seq), 0) AS hw FROM events WHERE stream_key = ?")
@@ -236,6 +289,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(dir.path()).await.unwrap();
         crate::testkit::store_conformance(&store).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_satisfies_fleet_replay_conformance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path()).await.unwrap();
+        crate::testkit::store_fleet_replay_conformance(&store).await;
     }
 
     #[tokio::test]
