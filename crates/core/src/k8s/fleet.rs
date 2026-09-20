@@ -420,6 +420,29 @@ fn recreated_names(
         .collect()
 }
 
+/// Why a task is in its current state, from the operator's `Ready` condition
+/// (#241).
+///
+/// Only an unready task has something to explain: the operator writes the cause
+/// there — `PostureNotPermitted` when a Workspace forbids the unattended posture
+/// the task asked for (caliban-operator#80), and it fails the task *before* any
+/// Sandbox exists, so there is no pod, no caliband and no agent-side error to
+/// find. Without this the dashboard shows a bare `failed` and the operator waits
+/// for a sandbox that is never coming. A `Ready=True` condition explains nothing
+/// and is reported as no reason at all.
+fn unready_reason(task: &CalibanTask) -> (Option<String>, Option<String>) {
+    let Some(cond) = task
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
+        .filter(|c| c.status != "True")
+    else {
+        return (None, None);
+    };
+    let reason = (!cond.reason.is_empty()).then(|| cond.reason.clone());
+    (reason, cond.message.clone())
+}
+
 #[must_use]
 pub fn agent_from_task(task: &CalibanTask) -> Agent {
     let name = task.metadata.name.clone().unwrap_or_default();
@@ -429,6 +452,7 @@ pub fn agent_from_task(task: &CalibanTask) -> Agent {
         .as_ref()
         .map(|s| s.phase.as_str())
         .unwrap_or_default();
+    let (reason, detail) = unready_reason(task);
     let started_at = task
         .metadata
         .creation_timestamp
@@ -451,6 +475,8 @@ pub fn agent_from_task(task: &CalibanTask) -> Agent {
             .as_ref()
             .and_then(|s| s.permission_posture)
             .unwrap_or(PermissionPosture::Supervised),
+        reason,
+        detail,
     }
 }
 
@@ -3076,6 +3102,54 @@ mod tests {
     }
 
     /// #238: an operator needs to see which posture a running agent was
+    /// #241: the operator refuses an unattended task whose Workspace forbids it
+    /// (`Failed` + `Ready=False/PostureNotPermitted`, no Sandbox ever created).
+    /// Prospero showed that as a bare `failed` agent, so the operator saw a
+    /// death with no cause and waited for a pod that was never coming.
+    #[test]
+    fn a_failed_task_carries_the_operators_reason() {
+        let mut ct = build_calibantask(&spec("repo-a", "p", None), "ct-1");
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            phase: "Failed".to_string(),
+            conditions: vec![crate::k8s::crd::Condition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "PostureNotPermitted".to_string(),
+                message: Some("workspace caliban-ai does not allow unattended runs".to_string()),
+            }],
+            ..Default::default()
+        });
+
+        let agent = agent_from_task(&ct);
+        assert_eq!(agent.status, AgentStatus::Failed);
+        assert_eq!(agent.reason.as_deref(), Some("PostureNotPermitted"));
+        assert_eq!(
+            agent.detail.as_deref(),
+            Some("workspace caliban-ai does not allow unattended runs")
+        );
+    }
+
+    /// A healthy task says nothing: a reason on every row would be noise, and
+    /// `Ready=True` is not a cause of anything.
+    #[test]
+    fn a_running_task_carries_no_reason() {
+        let mut ct = build_calibantask(&spec("repo-a", "p", None), "ct-2");
+        ct.status = Some(crate::k8s::crd::CalibanTaskStatus {
+            phase: "Running".to_string(),
+            conditions: vec![crate::k8s::crd::Condition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "Running".to_string(),
+                message: None,
+            }],
+            ..Default::default()
+        });
+
+        let agent = agent_from_task(&ct);
+        assert_eq!(agent.reason, None);
+        assert_eq!(agent.detail, None);
+    }
+
     /// admitted with, so the snapshot carries it — again the admitted one, not
     /// the requested one.
     #[test]

@@ -736,6 +736,19 @@ body {
   flex: none;
 }
 
+/* Why the backend put an agent in its state (#241). Sits under the agent line,
+   quiet but legible — it is often the only account of a task that failed before
+   it ever got a pod. */
+.agent-reason {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--tone-bad);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* An unattended agent runs every tool unasked (#238) — the one tag that has to
    catch the eye while scanning a fleet, so it borrows the bad tone. */
 .tag-warn {

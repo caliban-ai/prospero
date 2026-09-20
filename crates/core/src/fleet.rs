@@ -1201,6 +1201,11 @@ impl FleetManager {
                 isolated: rec.spec.isolation_worktree,
                 interactive: rec.spec.interactive,
                 session_dir: rec.session_dir.clone(),
+                // A local agent's state is caliband's own report, with no
+                // admission step above it to refuse the run — so there is never
+                // an external cause to explain (#241).
+                reason: None,
+                detail: None,
                 // caliband echoes back the spec it was spawned with, so this is
                 // the posture the agent is really running under (#238).
                 permission_posture: match rec.spec.permission_posture {

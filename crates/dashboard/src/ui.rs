@@ -17,8 +17,8 @@ use crate::theme::{STORAGE_KEY, Theme};
 use crate::timeline::{ResultView, Segment, ToolCall};
 use crate::view_model::{
     AgentControls, FleetTotals, SessionState, StatusCounts, awaits_input, basename, controls_for,
-    count_statuses, elapsed, health_reason, is_healthy, is_launchable, permits, posture_tag,
-    session_label, short_id, status_label, status_tone, totals,
+    count_statuses, elapsed, failure_note, health_reason, is_healthy, is_launchable, permits,
+    posture_tag, session_label, short_id, status_label, status_tone, totals,
 };
 
 /// Shared UI state, provided once by `App` and read by any component that needs
@@ -595,6 +595,12 @@ fn AgentRow(agent: Agent) -> Element {
                         span { class: "glyph tone-{tone}" }
                         "{status_label(agent.status)}"
                     }
+                }
+                // #241: why the backend put the agent in this state, when
+                // something above it decided. A task refused before its pod
+                // exists has no other account anywhere in the UI.
+                if let Some(note) = failure_note(&agent) {
+                    div { class: "agent-reason", title: "{note}", "{note}" }
                 }
                 div { class: "acts",
                     if can_operate {

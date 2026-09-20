@@ -309,6 +309,21 @@ pub enum SessionState {
 
 /// Whether the current session may perform an action needing `need`. The
 /// server enforces scopes; this only hides controls that would 403.
+/// What to show about *why* an agent is in its state (#241), or `None` when
+/// nothing decided it from outside.
+///
+/// The k8s backend sets this from the operator's `Ready` condition — a task
+/// refused as `PostureNotPermitted` never gets a pod, so this note is the only
+/// account of it anywhere in the UI.
+#[must_use]
+pub fn failure_note(agent: &Agent) -> Option<String> {
+    let reason = agent.reason.as_deref()?;
+    Some(match agent.detail.as_deref() {
+        Some(detail) if !detail.is_empty() => format!("{reason} — {detail}"),
+        _ => reason.to_string(),
+    })
+}
+
 /// The fleet-list tag for an agent's permission posture (#238), as
 /// `(label, tooltip)` — `None` for the ordinary supervised posture, which would
 /// otherwise tag every row and bury the one that matters.
@@ -353,6 +368,29 @@ mod tests {
             scope,
             expires_at: None,
         })
+    }
+
+    /// #241: a refusal the agent never saw — the operator failed the task
+    /// before any pod existed — has to reach the person reading the fleet.
+    #[test]
+    fn a_failure_reason_reads_as_code_then_detail() {
+        let mut a = agent("a1", AgentStatus::Failed);
+        a.reason = Some("PostureNotPermitted".into());
+        a.detail = Some("workspace ws does not allow unattended runs".into());
+        assert_eq!(
+            failure_note(&a).as_deref(),
+            Some("PostureNotPermitted — workspace ws does not allow unattended runs")
+        );
+    }
+
+    /// The code alone is still worth showing; a healthy agent gets nothing.
+    #[test]
+    fn a_reason_without_detail_still_shows_and_a_healthy_agent_does_not() {
+        let mut a = agent("a1", AgentStatus::Failed);
+        a.reason = Some("PostureNotPermitted".into());
+        assert_eq!(failure_note(&a).as_deref(), Some("PostureNotPermitted"));
+
+        assert_eq!(failure_note(&agent("a2", AgentStatus::Running)), None);
     }
 
     /// #238: an unattended agent runs with no permission gate, so it is called
@@ -407,6 +445,8 @@ mod tests {
             interactive: false,
             session_dir: "/s".into(),
             permission_posture: PermissionPosture::Supervised,
+            reason: None,
+            detail: None,
         }
     }
 

@@ -301,6 +301,17 @@ pub struct Agent {
     /// snapshot from an older prosperod still deserializes, as supervised.
     #[serde(default)]
     pub permission_posture: PermissionPosture,
+    /// Why the agent is in this state, when something other than the agent
+    /// itself decided it (#241). A machine-readable code from the backend —
+    /// e.g. `PostureNotPermitted` when the operator refused an unattended task
+    /// because its Workspace forbids one. `None` when there is nothing to
+    /// explain, which is the healthy case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Human-readable detail for [`Agent::reason`], when the backend supplied
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A managed workspace (root + its source checkouts) and the agents running
@@ -383,6 +394,24 @@ mod tests {
         assert_eq!(id.to_string(), "agent-abc");
     }
 
+    /// #241: a snapshot stored or served before these fields existed must still
+    /// deserialize, and a healthy agent must not carry empty keys.
+    #[test]
+    fn agent_reason_is_absent_by_default_and_omitted_when_unset() {
+        let json = serde_json::json!({
+            "id": "a1", "name": "x", "workspace": "ws", "status": "running",
+            "started_at": "t", "isolated": true, "interactive": false,
+            "session_dir": "/s"
+        });
+        let agent: Agent = serde_json::from_value(json).expect("pre-#241 agent parses");
+        assert_eq!(agent.reason, None);
+        assert_eq!(agent.detail, None);
+
+        let round = serde_json::to_value(&agent).unwrap();
+        assert!(round.get("reason").is_none(), "{round}");
+        assert!(round.get("detail").is_none(), "{round}");
+    }
+
     /// #238: the wire values are caliban's `PermissionPosture` and the
     /// `CalibanTask` CR enum; they must not drift.
     #[test]
@@ -457,6 +486,8 @@ mod tests {
                     interactive: false,
                     session_dir: "/s".into(),
                     permission_posture: PermissionPosture::Supervised,
+                    reason: None,
+                    detail: None,
                 }],
             }],
         };
