@@ -147,6 +147,8 @@ pub fn required_access(method: &Method, route: &str) -> Access {
             "/api/metrics"
             | "/api/capabilities"
             | "/api/fleet"
+            // #219: the fleet-wide event stream is a read of the same fleet.
+            | "/api/fleet/stream"
             | "/api/usage"
             | "/api/workspaces"
             | "/api/workspaces/{workspace}/agents"

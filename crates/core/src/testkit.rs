@@ -750,6 +750,107 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
     assert_eq!(store.prune("2026-03-01T00:00:00+00:00").await.unwrap(), 0);
 }
 
+/// Fleet-wide replay contract every [`crate::store::Store`] must satisfy
+/// (prospero #219): `replay_fleet(after, limit)` returns events from **every**
+/// stream in durable insertion order, each carrying a fleet-wide cursor.
+///
+/// Per-stream `seq` cannot order a fleet: two agents both have a `seq` 1, and
+/// nothing says which happened first. The cursor is the backend's own insertion
+/// order, which is the only total order that exists, and it is what a resuming
+/// client hands back — so it must be strictly increasing, exclusive on `after`,
+/// and stable for an event once written.
+pub async fn store_fleet_replay_conformance(store: &dyn crate::store::Store) {
+    use crate::event::{EventKind, FleetEvent, OutputStream};
+
+    fn ev(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
+        FleetEvent {
+            seq,
+            ts: "t".into(),
+            repo: "r".into(),
+            agent_id: agent.into(),
+            kind: EventKind::Output {
+                stream: OutputStream::Stdout,
+                chunk: chunk.into(),
+            },
+            actor: None,
+        }
+    }
+
+    assert!(
+        store.replay_fleet(0, 100).await.unwrap().is_empty(),
+        "an empty store replays nothing"
+    );
+    assert_eq!(
+        store.latest_fleet_cursor().await.unwrap(),
+        0,
+        "an empty store's head is 0, so `from=now` starts at the beginning"
+    );
+
+    // Interleaved across two agents: `seq` alone could not order these.
+    store.append(&ev(1, "a", "a1")).await.unwrap();
+    store.append(&ev(1, "b", "b1")).await.unwrap();
+    store.append(&ev(2, "a", "a2")).await.unwrap();
+
+    let all = store.replay_fleet(0, 100).await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|c| match &c.event.kind {
+                EventKind::Output { chunk, .. } => chunk.clone(),
+                other => panic!("unexpected kind {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec!["a1", "b1", "a2"],
+        "insertion order across streams, not per-stream seq order"
+    );
+
+    let cursors: Vec<u64> = all.iter().map(|c| c.cursor).collect();
+    assert!(
+        cursors.windows(2).all(|w| w[0] < w[1]),
+        "cursors must strictly increase: {cursors:?}"
+    );
+
+    // Exclusive on `after`: resuming from a cursor must not repeat that event.
+    let resumed = store.replay_fleet(cursors[0], 100).await.unwrap();
+    assert_eq!(
+        resumed.iter().map(|c| c.cursor).collect::<Vec<_>>(),
+        cursors[1..].to_vec(),
+        "replay_fleet(after) is exclusive"
+    );
+
+    // The cursor of an already-returned event does not move when more arrive.
+    store.append(&ev(2, "b", "b2")).await.unwrap();
+    let again = store.replay_fleet(0, 100).await.unwrap();
+    assert_eq!(
+        again.iter().take(3).map(|c| c.cursor).collect::<Vec<_>>(),
+        cursors,
+        "a written event's cursor is stable"
+    );
+    assert_eq!(again.len(), 4);
+
+    // `limit` caps the batch, so a long history resumes in bounded chunks.
+    let first_two = store.replay_fleet(0, 2).await.unwrap();
+    assert_eq!(first_two.len(), 2);
+    assert_eq!(
+        first_two.iter().map(|c| c.cursor).collect::<Vec<_>>(),
+        cursors[..2].to_vec()
+    );
+
+    // Past the end is empty, not an error.
+    let last = again.last().unwrap().cursor;
+    assert!(store.replay_fleet(last, 100).await.unwrap().is_empty());
+
+    // The head is the cursor a `from=now` client starts after: replaying from
+    // it yields nothing until something new is written.
+    assert_eq!(store.latest_fleet_cursor().await.unwrap(), last);
+    store.append(&ev(3, "a", "a3")).await.unwrap();
+    let after_head = store.replay_fleet(last, 100).await.unwrap();
+    assert_eq!(after_head.len(), 1, "only what arrived after the head");
+    assert_eq!(
+        store.latest_fleet_cursor().await.unwrap(),
+        after_head[0].cursor
+    );
+}
+
 /// Usage-aggregation contract every [`crate::store::Store`] must satisfy
 /// (prospero #180): `usage(since, until)` returns one row per
 /// (workspace, UTC day) that saw terminal activity, summing cost and turns from

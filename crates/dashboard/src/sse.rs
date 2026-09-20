@@ -98,6 +98,31 @@ pub async fn follow(agent_id: &str, from: u64, mut on_message: impl FnMut(Incomi
     on_message(Incoming::Ended);
 }
 
+/// Follow the fleet-wide stream (#219), calling `on_change` once per event
+/// until the connection ends.
+///
+/// Starts at `from=now`: the dashboard renders a fresh `/api/fleet` snapshot, so
+/// replaying the whole history would be a large download whose only effect is to
+/// ask for the refresh it is about to do anyway. The payload is deliberately
+/// ignored — this says *something moved*, and the snapshot fetch says what the
+/// fleet now looks like. That keeps one source of truth for what is rendered,
+/// instead of a second, divergent one assembled from events.
+///
+/// Returns when the stream ends so the caller can reconnect.
+pub async fn follow_fleet(mut on_change: impl FnMut()) {
+    let mut source = match EventSource::new("/api/fleet/stream?from=now") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let Ok(mut events) = source.subscribe("message") else {
+        return;
+    };
+    while events.next().await.is_some() {
+        on_change();
+    }
+    source.close();
+}
+
 /// Apply one incoming message to a session.
 pub fn apply(session: &mut StreamSession, incoming: Incoming) {
     match incoming {

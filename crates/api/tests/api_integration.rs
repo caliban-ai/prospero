@@ -30,6 +30,16 @@ impl Store for UnwritableStore {
     async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         self.0.replay(stream_key, from_seq).await
     }
+    async fn replay_fleet(
+        &self,
+        after_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<prospero_core::store::CursoredEvent>> {
+        self.0.replay_fleet(after_cursor, limit).await
+    }
+    async fn latest_fleet_cursor(&self) -> Result<u64> {
+        self.0.latest_fleet_cursor().await
+    }
     async fn high_water(&self, stream_key: &str) -> Result<u64> {
         self.0.high_water(stream_key).await
     }
@@ -1395,6 +1405,220 @@ async fn spawn_inside_an_actor_scope_stamps_agent_spawned() {
         .find(|e| matches!(e.kind, prospero_core::EventKind::AgentSpawned))
         .expect("AgentSpawned persisted");
     assert_eq!(spawned.actor.as_deref(), Some("alice"));
+}
+
+/// #219: one connection observes events from **every** agent, in the order they
+/// were stored, each carrying the fleet cursor a client resumes from. Per-agent
+/// `seq` cannot order this: both agents below have a `seq` 1.
+#[tokio::test]
+async fn fleet_stream_replays_every_stream_in_one_connection() {
+    let h = setup().await;
+    let store = h.manager.store();
+    for (seq, agent, chunk) in [(1, "a", "a1"), (1, "b", "b1"), (2, "a", "a2")] {
+        store.append(&out_event(seq, agent, chunk)).await.unwrap();
+    }
+
+    let got = read_sse_events(
+        &h.router,
+        "/api/fleet/stream?from=0",
+        3,
+        Duration::from_secs(5),
+    )
+    .await;
+    let chunks: Vec<String> = got
+        .iter()
+        .map(|(_, e)| e["kind"]["chunk"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        chunks,
+        vec!["a1", "b1", "a2"],
+        "insertion order across agents"
+    );
+
+    let cursors: Vec<u64> = got
+        .iter()
+        .map(|(id, _)| {
+            id.as_ref()
+                .expect("every event carries its cursor")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(cursors.windows(2).all(|w| w[0] < w[1]), "{cursors:?}");
+}
+
+/// Resuming from a cursor delivers what followed it — no gap, no repeat.
+#[tokio::test]
+async fn fleet_stream_resumes_from_a_cursor_without_duplicates() {
+    let h = setup().await;
+    let store = h.manager.store();
+    for (seq, agent, chunk) in [(1, "a", "a1"), (1, "b", "b1"), (2, "a", "a2")] {
+        store.append(&out_event(seq, agent, chunk)).await.unwrap();
+    }
+
+    let all = read_sse_events(
+        &h.router,
+        "/api/fleet/stream?from=0",
+        3,
+        Duration::from_secs(5),
+    )
+    .await;
+    let first = all[0].0.clone().unwrap();
+
+    let resumed = read_sse_events(
+        &h.router,
+        &format!("/api/fleet/stream?from={first}"),
+        2,
+        Duration::from_secs(5),
+    )
+    .await;
+    let chunks: Vec<String> = resumed
+        .iter()
+        .map(|(_, e)| e["kind"]["chunk"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        chunks,
+        vec!["b1", "a2"],
+        "resume is exclusive on the cursor"
+    );
+}
+
+/// `from=now` skips history — Ariel's restart case (caliban-ai/ariel#19): a
+/// notifier that re-posted every past event on restart would be worse than one
+/// that missed them.
+#[tokio::test]
+async fn fleet_stream_from_now_skips_history_and_tails_new_events() {
+    let h = setup().await;
+    let store = h.manager.store();
+    store.append(&out_event(1, "a", "old")).await.unwrap();
+
+    // Nothing historical arrives; the connection just waits.
+    let nothing = read_sse_events(
+        &h.router,
+        "/api/fleet/stream?from=now",
+        1,
+        Duration::from_millis(600),
+    )
+    .await;
+    assert!(nothing.is_empty(), "history must not replay: {nothing:?}");
+
+    // A new event, appended then published exactly as the emitter does, arrives.
+    let fresh = out_event(2, "a", "new");
+    store.append(&fresh).await.unwrap();
+    h.manager.bus().publish(fresh);
+
+    let live = read_sse_events(
+        &h.router,
+        "/api/fleet/stream?from=now",
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        live.is_empty(),
+        "a connection opened after the fact still starts at the new head: {live:?}"
+    );
+}
+
+/// A connection already open receives what happens next, without reconnecting.
+/// The bus doorbell drives a store read, so the event arrives on the wire with
+/// its cursor.
+#[tokio::test]
+async fn fleet_stream_delivers_a_live_event_to_an_open_connection() {
+    let h = setup().await;
+    let store = h.manager.store();
+    store.append(&out_event(1, "a", "old")).await.unwrap();
+    let head = store.latest_fleet_cursor().await.unwrap();
+
+    // Publish after the connection is open: exactly the emitter's order
+    // (append, then publish), from another task.
+    let bus = h.manager.bus();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let fresh = out_event(2, "a", "live");
+        store.append(&fresh).await.unwrap();
+        bus.publish(fresh);
+    });
+
+    let got = read_sse_events(
+        &h.router,
+        &format!("/api/fleet/stream?from={head}"),
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(got.len(), 1, "the live event must arrive: {got:?}");
+    assert_eq!(got[0].1["kind"]["chunk"], "live");
+    assert_eq!(
+        got[0].0.as_deref(),
+        Some((head + 1).to_string().as_str()),
+        "and carry the next cursor"
+    );
+}
+
+/// An output event for one agent, for the fleet-stream tests.
+fn out_event(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
+    FleetEvent {
+        seq,
+        ts: "2026-09-20T00:00:00Z".into(),
+        repo: "repo".into(),
+        agent_id: agent.into(),
+        kind: prospero_core::EventKind::Output {
+            stream: prospero_core::event::OutputStream::Stdout,
+            chunk: chunk.into(),
+        },
+        actor: None,
+    }
+}
+
+/// Read an SSE body until `want` `data:` payloads have arrived, or time out.
+///
+/// The fleet stream never terminates, so a test cannot collect the whole body
+/// the way the per-agent one does after its terminal event.
+async fn read_sse_events(
+    router: &Router,
+    uri: &str,
+    want: usize,
+    wait: Duration,
+) -> Vec<(Option<String>, serde_json::Value)> {
+    let resp = router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut body = resp.into_body();
+    let mut text = String::new();
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    while out.len() < want && tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(frame))) =
+            tokio::time::timeout(Duration::from_millis(500), body.frame()).await
+        else {
+            continue;
+        };
+        let Some(chunk) = frame.data_ref() else {
+            continue;
+        };
+        text.push_str(&String::from_utf8_lossy(chunk));
+        out.clear();
+        for block in text.split("\n\n") {
+            let mut id = None;
+            let mut data = None;
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("id:") {
+                    id = Some(v.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data = serde_json::from_str(v.trim()).ok();
+                }
+            }
+            if let Some(d) = data {
+                out.push((id, d));
+            }
+        }
+    }
+    out
 }
 
 /// Fetch `uri` and return its body as a string.

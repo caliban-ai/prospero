@@ -29,17 +29,23 @@ use ui::{
 };
 use view_model::SessionState;
 
-/// How often to re-poll `/api/fleet`. Per-agent SSE arrives with the stream
-/// viewer in a follow-on ticket; the overview only needs coarse freshness.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How long to wait before re-reading `/api/fleet` when **nothing** has arrived
+/// on the fleet stream (#219).
+///
+/// This is a reconcile fallback, not the freshness mechanism: the stream bumps
+/// `refresh` the moment anything happens, so a change shows up immediately and
+/// an idle fleet costs two requests a minute instead of twelve. It still runs
+/// because a dropped stream must not leave the screen frozen with no hint.
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How many fleet polls between forced usage refetches (#190).
+/// How long between forced usage refetches (#190).
 ///
 /// The activity key catches anything this replica can see. This heartbeat is
 /// for what it cannot: another replica's agents spending against the shared
-/// store while nothing here changes state. At [`POLL_INTERVAL`] that is one
-/// aggregate a minute — negligible next to the per-poll refetch #181 rejected.
-const USAGE_HEARTBEAT_POLLS: u32 = 12;
+/// store while nothing here changes state. Measured in *time*, not passes,
+/// since #219 made a pass event-driven — counting passes on a busy fleet would
+/// refetch far more often than intended, and on an idle one far less.
+const USAGE_HEARTBEAT: Duration = Duration::from_secs(60);
 
 fn main() {
     // Turn wasm panics into a readable console trace instead of a bare
@@ -119,7 +125,7 @@ fn App() -> Element {
             // observe (a peer writing to the shared store while nothing local
             // changes state).
             let mut last_key: Option<u64> = None;
-            let mut ticks: u32 = 0;
+            let mut last_usage_ms: f64 = 0.0;
             let mut caps_loaded = false;
             loop {
                 if !matches!(*ui.session.peek(), SessionState::SignedIn(_)) {
@@ -173,11 +179,38 @@ fn App() -> Element {
                 ui.now_ms.set(now_ms());
                 // Slow heartbeat (#190): bound how stale the usage panel can get
                 // when nothing in *this* replica's view of the fleet changes.
-                ticks = ticks.wrapping_add(1);
-                if ticks.is_multiple_of(USAGE_HEARTBEAT_POLLS) {
+                let now = now_ms();
+                if now - last_usage_ms >= USAGE_HEARTBEAT.as_millis() as f64 {
+                    last_usage_ms = now;
                     ui.activity += 1;
                 }
                 wait_for_tick(ui.refresh).await;
+            }
+        }
+    });
+
+    // Fleet stream (#219): what makes the view live. Each event bumps
+    // `refresh`, which short-circuits the reconcile wait above, so a spawn or a
+    // status change appears as soon as the server knows about it instead of up
+    // to a poll later. The event payload is not applied to the snapshot — the
+    // snapshot fetch remains the one source of what is rendered.
+    //
+    // Reconnect on end: an EventSource drops on a proxy timeout or a daemon
+    // restart, and without this the dashboard would silently fall back to the
+    // slow reconcile forever. `from=now` on each attempt, since the refresh it
+    // triggers reads the whole fleet anyway.
+    use_future(move || {
+        let mut ui = ui;
+        async move {
+            loop {
+                if !matches!(*ui.session.peek(), SessionState::SignedIn(_)) {
+                    gloo_timers::future::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+                sse::follow_fleet(|| ui.refresh += 1).await;
+                // Don't spin if the endpoint is unreachable (an old daemon
+                // without the route answers immediately).
+                gloo_timers::future::sleep(Duration::from_secs(3)).await;
             }
         }
     });
