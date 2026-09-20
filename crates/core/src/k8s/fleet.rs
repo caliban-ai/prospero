@@ -221,11 +221,17 @@ fn spawn_spec_from_task(task: &CalibanTask) -> SpawnSpec {
         // never checked the Workspace's `agentPolicy`, so absent ⇒ supervised
         // keeps an old operator from being talked past. `PostureNotPermitted`
         // tasks never reach here: the operator fails them before any Sandbox.
-        permission_posture: task
-            .status
-            .as_ref()
-            .and_then(|s| s.permission_posture)
-            .unwrap_or(PermissionPosture::Supervised),
+        permission_posture: crate::caliband::wire::wire_posture(
+            task.status
+                .as_ref()
+                .and_then(|s| s.permission_posture)
+                .unwrap_or(PermissionPosture::Supervised),
+        ),
+        // See `SpawnRequest::into_spec` — prospero uses none of these.
+        inherited_hooks_config: None,
+        source: None,
+        resume_session: None,
+        drive_protocol: crate::caliband::wire::DriveProtocol::Ndjson,
     }
 }
 
@@ -266,7 +272,10 @@ async fn ensure_pod_agent(
     spec: Option<&SpawnSpec>,
 ) -> std::result::Result<String, PodAgentError> {
     let agents = client.list().await.map_err(PodAgentError::Transient)?;
-    if let Some(rec) = agents.iter().find(|rec| !rec.status.is_terminal()) {
+    if let Some(rec) = agents
+        .iter()
+        .find(|rec| !crate::caliband::wire::domain_status(rec.status).is_terminal())
+    {
         return Ok(rec.id.clone());
     }
     if let Some(rec) = agents.first() {
@@ -1587,8 +1596,9 @@ async fn overlay_pod_status(
     for agent in agents.iter_mut() {
         if let Some(rec) = agent_endpoint.get(&agent.id).and_then(|a| records.get(a)) {
             agent.interactive = rec.spec.interactive;
-            agent.status = rec.status;
-            refreshed.insert(agent.id.clone(), rec.status);
+            let status = crate::caliband::wire::domain_status(rec.status);
+            agent.status = status;
+            refreshed.insert(agent.id.clone(), status);
         }
     }
     refreshed
@@ -3050,7 +3060,7 @@ mod tests {
 
         assert_eq!(
             spawn_spec_from_task(&ct).permission_posture,
-            PermissionPosture::Supervised,
+            crate::caliband::wire::WirePermissionPosture::Supervised,
             "an unadmitted request must not run unattended"
         );
 
@@ -3060,7 +3070,7 @@ mod tests {
         });
         assert_eq!(
             spawn_spec_from_task(&ct).permission_posture,
-            PermissionPosture::Unattended,
+            crate::caliband::wire::WirePermissionPosture::Unattended,
             "the operator-admitted posture must be honored"
         );
     }

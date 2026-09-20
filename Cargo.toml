@@ -18,6 +18,12 @@ prospero-core = { path = "crates/core" }
 prospero-api = { path = "crates/api" }
 prospero-types = { path = "crates/types" }
 
+# caliban's published contract crate (#239, ADR-0011 §3): the single definition
+# of caliband's control-plane wire types. Serde-only — no daemon internals — so
+# it is not the wide coupling ADR-0003 rejected. Pinned exactly, as the crate's
+# own description asks, because it *is* the wire contract.
+caliban-contract = "=0.14.0"
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"

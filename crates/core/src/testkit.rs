@@ -14,8 +14,8 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 use crate::caliband::wire::{
-    AgentRecord, AgentStatus, CtlReply, CtlRequest, DaemonStatus, Endpoint, PermissionPosture,
-    SpawnSpec, SupervisorError,
+    AgentRecord, CtlReply, CtlRequest, DaemonStatus, Endpoint, EndpointExt, SpawnSpec,
+    SupervisorError, WireAgentStatus as AgentStatus, WirePermissionPosture as PermissionPosture,
 };
 
 /// Shared mutable state inside a running fake.
@@ -160,7 +160,12 @@ impl FakeCaliband {
             .clone()
             .expect("add_agent_tcp requires a TCP+TLS fake (start_tcp_tls)");
         let (addr, task) = spawn_tcp_stream_listener(script, &cert_pem, &key_pem).await;
-        let mut record = test_record(id, Path::new("/tmp"), AgentStatus::Running, false);
+        let mut record = test_record(
+            id,
+            Path::new("/tmp"),
+            crate::model::AgentStatus::Running,
+            false,
+        );
         record.endpoint = Endpoint::Tcp { addr };
         self.state
             .lock()
@@ -245,9 +250,13 @@ impl FakeCaliband {
     }
 
     /// Set an agent's status (to simulate lifecycle transitions across polls).
-    pub fn set_status(&self, id: &str, status: AgentStatus) {
+    ///
+    /// Takes prospero's domain status — what a test is reasoning about — and
+    /// converts to the wire status the fake stores, so call sites didn't have
+    /// to learn caliban's enum when the contract crate landed (#239).
+    pub fn set_status(&self, id: &str, status: crate::model::AgentStatus) {
         if let Some(a) = self.state.lock().unwrap().agents.get_mut(id) {
-            a.status = status;
+            a.status = crate::caliband::wire::wire_status(status);
         }
     }
 
@@ -387,6 +396,7 @@ async fn handle_control_conn(
                     endpoint: Endpoint::Unix {
                         path: socket_path.clone(),
                     },
+                    working_dir: dir.clone(),
                     spec: spec.clone(),
                 };
                 st.scripts.insert(id.clone(), script.clone());
@@ -472,6 +482,31 @@ async fn handle_control_conn(
                 st.shutdowns += 1;
                 st.should_stop = true;
                 (CtlReply::ShutdownAck, None)
+            }
+            // Control requests the contract carries that prospero never sends
+            // (#239). Answered plausibly rather than ignored, so a future
+            // prospero that does send one sees a real reply here first. `Drain`
+            // checkpoints every live agent (caliban ADR 0057); `ReportStatus`
+            // is a worker reporting its own Running/Idle transition.
+            CtlRequest::Drain { .. } => {
+                let drained: Vec<_> = st
+                    .agents
+                    .values()
+                    .map(|rec| crate::caliband::wire::DrainedAgent {
+                        id: rec.id.clone(),
+                        session_dir: rec.session_dir.clone(),
+                    })
+                    .collect();
+                for rec in st.agents.values_mut() {
+                    rec.status = AgentStatus::Drained;
+                }
+                (CtlReply::Drained { agents: drained }, None)
+            }
+            CtlRequest::ReportStatus { id, status } => {
+                if let Some(rec) = st.agents.get_mut(&id) {
+                    rec.status = status;
+                }
+                (CtlReply::StatusReported, None)
             }
         }
     };
@@ -1109,16 +1144,23 @@ pub async fn fleet_provider_conformance(
 }
 
 /// Build a minimal `AgentRecord` for tests.
-pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) -> AgentRecord {
+pub fn test_record(
+    id: &str,
+    dir: &Path,
+    status: crate::model::AgentStatus,
+    isolated: bool,
+) -> AgentRecord {
     AgentRecord {
         id: id.into(),
         name: id.into(),
-        status,
+        // Tests reason in prospero's vocabulary; the fake stores caliban's (#239).
+        status: crate::caliband::wire::wire_status(status),
         started_at: "1970-01-01T00:00:00Z".into(),
         session_dir: dir.join(id),
         endpoint: Endpoint::Unix {
             path: dir.join(format!("{id}.sock")),
         },
+        working_dir: dir.to_path_buf(),
         spec: SpawnSpec {
             label: Some(id.into()),
             frontmatter_path: None,
@@ -1130,6 +1172,10 @@ pub fn test_record(id: &str, dir: &Path, status: AgentStatus, isolated: bool) ->
             inherit_hooks: true,
             interactive: false,
             permission_posture: PermissionPosture::Supervised,
+            inherited_hooks_config: None,
+            source: None,
+            resume_session: None,
+            drive_protocol: crate::caliband::wire::DriveProtocol::Ndjson,
         },
     }
 }

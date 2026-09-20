@@ -46,6 +46,7 @@ where
 mod tests {
     use super::*;
     use crate::caliband::wire::CtlRequest;
+    use serde_json::json;
     use tokio::io::BufReader;
 
     #[tokio::test]
@@ -57,7 +58,8 @@ mod tests {
 
         let mut reader = BufReader::new(&buf[..]);
         let req: CtlRequest = read_frame(&mut reader).await.unwrap();
-        assert_eq!(req, CtlRequest::List);
+        // The contract's enums derive no PartialEq; the wire form is the contract.
+        assert_eq!(serde_json::to_value(&req).unwrap(), json!({"kind": "list"}));
     }
 
     #[tokio::test]
