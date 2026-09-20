@@ -8,6 +8,7 @@ mod client;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use client::DaemonClient;
+use prospero_core::model::PermissionPosture;
 
 /// Prospero control-plane CLI.
 #[derive(Debug, Parser)]
@@ -166,6 +167,29 @@ struct SpawnArgs {
     /// Path to an agent-template / frontmatter markdown file for the agent.
     #[arg(long = "frontmatter", value_name = "PATH")]
     frontmatter: Option<String>,
+    /// How tool calls needing permission are handled: `supervised` (a human
+    /// approves them; the default) or `unattended` (no permission gate — needs
+    /// an admin-scope token, and in-cluster a workspace that allows it).
+    #[arg(
+        long = "permission-posture",
+        value_name = "POSTURE",
+        default_value = "supervised",
+        value_parser = parse_permission_posture
+    )]
+    permission_posture: PermissionPosture,
+}
+
+/// Parse the `--permission-posture` value. Hand-written rather than clap's
+/// `ValueEnum` because the enum lives in `prospero-types`, which carries no
+/// clap dependency; the accepted strings are the wire values.
+fn parse_permission_posture(s: &str) -> Result<PermissionPosture, String> {
+    match s {
+        "supervised" => Ok(PermissionPosture::Supervised),
+        "unattended" => Ok(PermissionPosture::Unattended),
+        other => Err(format!(
+            "unknown posture '{other}' (expected 'supervised' or 'unattended')"
+        )),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -269,6 +293,9 @@ fn main() -> Result<()> {
             }
             if let Some(frontmatter) = a.frontmatter {
                 body["frontmatter_path"] = frontmatter.into();
+            }
+            if a.permission_posture != PermissionPosture::Supervised {
+                body["permission_posture"] = serde_json::to_value(a.permission_posture)?;
             }
             let resp =
                 client.post_json(&format!("/api/workspaces/{}/agents", a.workspace), body)?;
@@ -567,6 +594,43 @@ mod tests {
             ),
             other => panic!("expected spawn, got {other:?}"),
         }
+    }
+
+    /// #238: the posture is a typed choice, and omitting it means supervised —
+    /// a typo must fail at parse time rather than silently spawn supervised.
+    #[test]
+    fn spawn_permission_posture_parses_and_defaults_to_supervised() {
+        let cli = Cli::parse_from(["prospero", "spawn", "r", "p"]);
+        match cli.command {
+            Command::Spawn(a) => assert_eq!(a.permission_posture, PermissionPosture::Supervised),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from([
+            "prospero",
+            "spawn",
+            "r",
+            "p",
+            "--permission-posture",
+            "unattended",
+        ]);
+        match cli.command {
+            Command::Spawn(a) => assert_eq!(a.permission_posture, PermissionPosture::Unattended),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "prospero",
+                "spawn",
+                "r",
+                "p",
+                "--permission-posture",
+                "yolo"
+            ])
+            .is_err(),
+            "an unknown posture must be rejected, not defaulted"
+        );
     }
 
     #[test]

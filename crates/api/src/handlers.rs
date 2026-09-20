@@ -1,12 +1,16 @@
 //! REST endpoint handlers over the `FleetManager`.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use prospero_core::AttachInbound;
-use prospero_core::model::{Agent, AgentId, DrainPolicy, FleetSnapshot, TaskSpec};
+use prospero_core::model::{
+    Agent, AgentId, DrainPolicy, FleetSnapshot, PermissionPosture, TaskSpec,
+};
+use prospero_types::Scope;
 
 use crate::AppState;
+use crate::auth::Principal;
 use crate::dto::{
     AddWorkspaceBody, AgentInputBody, FromSeq, RespawnedResponse, SetConfigBody, SpawnBody,
     SpawnedResponse, UsageQuery, UsageReport, WorkspaceSummary,
@@ -204,11 +208,36 @@ pub async fn get_workspace_agents(
 /// Routed through the `FleetProvider` seam: `LocalFleet::ensure_agent`
 /// delegates to the same `FleetManager::spawn_agent` this handler called
 /// directly before, so behavior is unchanged.
+/// `unattended` (#238) runs the agent with no permission gate, so it takes the
+/// `admin` scope (ADR-0010) rather than the `operate` a spawn otherwise needs —
+/// a per-field rule the route-level scope table can't express. The principal is
+/// absent only when auth is disabled entirely, which is already a trusted
+/// loopback deployment, so that case is allowed and still audited.
 pub async fn spawn_agent(
     State(st): State<AppState>,
     Path(workspace): Path<String>,
+    principal: Option<Extension<Principal>>,
     Json(body): Json<SpawnBody>,
 ) -> Result<(StatusCode, Json<SpawnedResponse>), ApiError> {
+    if body.permission_posture == PermissionPosture::Unattended {
+        if let Some(Extension(p)) = &principal
+            && p.scope < Scope::Admin
+        {
+            tracing::debug!(
+                target: "prospero_auth", token = %p.token_name, have = p.scope.as_str(),
+                "rejected: unattended spawn requires admin scope"
+            );
+            return Err(ApiError::Forbidden(
+                "unattended requires admin scope".to_string(),
+            ));
+        }
+        tracing::info!(
+            target: "prospero_audit",
+            actor = principal.as_ref().map_or("-", |Extension(p)| p.token_name.as_str()),
+            workspace = %workspace,
+            "spawn: unattended permission posture granted"
+        );
+    }
     let req = crate::dto::spawn_request(body);
     let isolated = req.isolation_worktree;
     let handle = st

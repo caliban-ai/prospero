@@ -4,8 +4,8 @@
 
 use dioxus::prelude::*;
 use prospero_types::{
-    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetSnapshot, Scope, SpawnBody, Workspace,
-    WorkspaceSummary,
+    AddWorkspaceBody, Agent, Capabilities, EventKind, FleetSnapshot, PermissionPosture, Scope,
+    SpawnBody, Workspace, WorkspaceSummary,
 };
 
 use crate::actions::Action;
@@ -17,8 +17,8 @@ use crate::theme::{STORAGE_KEY, Theme};
 use crate::timeline::{ResultView, Segment, ToolCall};
 use crate::view_model::{
     AgentControls, FleetTotals, SessionState, StatusCounts, awaits_input, basename, controls_for,
-    count_statuses, elapsed, health_reason, is_healthy, is_launchable, permits, session_label,
-    short_id, status_label, status_tone, totals,
+    count_statuses, elapsed, health_reason, is_healthy, is_launchable, permits, posture_tag,
+    session_label, short_id, status_label, status_tone, totals,
 };
 
 /// Shared UI state, provided once by `App` and read by any component that needs
@@ -588,6 +588,9 @@ fn AgentRow(agent: Agent) -> Element {
                     if agent.isolated {
                         span { class: "tag", title: "Runs in an isolated git worktree", "wt" }
                     }
+                    if let Some((label, title)) = posture_tag(agent.permission_posture) {
+                        span { class: "tag tag-warn", title: "{title}", "{label}" }
+                    }
                     span { class: "pill tone-{tone}",
                         span { class: "glyph tone-{tone}" }
                         "{status_label(agent.status)}"
@@ -986,7 +989,11 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
     let mut tools = use_signal(String::new);
     let mut worktree = use_signal(|| true);
     let mut interactive = use_signal(|| false);
+    let mut unattended = use_signal(|| false);
     let mut advanced = use_signal(|| false);
+    // #238: turning the permission gate off is an admin-scope decision
+    // (ADR-0010). Hidden below that scope, like the other privileged controls.
+    let may_go_unattended = permits(&ui.session.read(), Scope::Admin);
     let mut error = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
 
@@ -1041,6 +1048,13 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
             interactive: interactive(),
             frontmatter_path: None,
             provider_ref: non_empty(provider_ref()),
+            // The control is admin-only, and the server re-checks the scope —
+            // this signal can only be true for a session that may set it.
+            permission_posture: if unattended() {
+                PermissionPosture::Unattended
+            } else {
+                PermissionPosture::Supervised
+            },
         };
         busy.set(true);
         error.set(None);
@@ -1142,6 +1156,18 @@ fn LaunchModal(workspace: String, snapshot: FleetSnapshot) -> Element {
                         onchange: move |e| interactive.set(e.checked()),
                     }
                     span { "Interactive — the agent will wait for your input" }
+                }
+                if may_go_unattended {
+                    label { class: "check",
+                        input {
+                            r#type: "checkbox",
+                            checked: unattended(),
+                            onchange: move |e| unattended.set(e.checked()),
+                        }
+                        span {
+                            "Unattended — run every tool without asking for permission"
+                        }
+                    }
                 }
 
                 button {

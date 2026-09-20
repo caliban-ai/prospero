@@ -10,7 +10,8 @@
 use serde::{Deserialize, Serialize};
 
 pub use prospero_types::{
-    Agent, AgentId, AgentStatus, FleetSnapshot, Readiness, Workspace, WorkspaceHealth,
+    Agent, AgentId, AgentStatus, FleetSnapshot, PermissionPosture, Readiness, Workspace,
+    WorkspaceHealth,
 };
 
 /// Desired state for one agent — the provider-agnostic spec `ensure_agent` takes.

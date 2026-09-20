@@ -106,14 +106,32 @@ applies:
   "interactive": false,
   "tool_allowlist": ["read", "edit"],
   "frontmatter_path": "/path/to/agent-template.md",
-  "provider_ref": "planner"
+  "provider_ref": "planner",
+  "permission_posture": "supervised"
 }
 ```
 
 Only `prompt` is required. `isolation` defaults to a git worktree; only the exact
 string `"shared"` opts out. `provider_ref` picks a named provider under k8s and is
-ignored by the local backend, which uses the workspace's stored config. The
-response is `201`:
+ignored by the local backend, which uses the workspace's stored config.
+
+`permission_posture` is `"supervised"` (the default, and what an absent field
+means) or `"unattended"`. Supervised keeps the agent's permission gate: a tool
+call that needs approval is refused unless a human answers it. Unattended turns
+the gate off, so every tool runs without asking — it needs an **`admin`** token,
+and a request with a lesser scope is refused with `403` and
+`{"error": "unattended requires admin scope"}`. Each granted unattended spawn is
+recorded in the audit log with the token's name.
+
+Under k8s the field is written to the `CalibanTask` as `spec.task.permissionPosture`
+and is a *request*: the operator admits `unattended` only when the Workspace sets
+`spec.agentPolicy.allowUnattended: true`, and otherwise fails the task with
+`PostureNotPermitted` before any sandbox starts. prospero runs the agent with the
+posture the operator admitted (`status.permissionPosture`), so a cluster whose
+operator predates that field (caliban-operator ≤ v0.5.0) runs every session
+supervised. It needs caliban ≥ v0.14.0 in the sandbox.
+
+The response is `201`:
 
 ```json
 { "agent_id": "…", "workspace": "myproj", "isolated": true, "created": true }

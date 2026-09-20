@@ -8,7 +8,8 @@
 //! browser.
 
 use prospero_types::{
-    Agent, AgentStatus, FleetSnapshot, Scope, SessionInfo, Workspace, WorkspaceHealth,
+    Agent, AgentStatus, FleetSnapshot, PermissionPosture, Scope, SessionInfo, Workspace,
+    WorkspaceHealth,
 };
 
 /// How a set of agents is distributed across lifecycle states.
@@ -308,6 +309,20 @@ pub enum SessionState {
 
 /// Whether the current session may perform an action needing `need`. The
 /// server enforces scopes; this only hides controls that would 403.
+/// The fleet-list tag for an agent's permission posture (#238), as
+/// `(label, tooltip)` — `None` for the ordinary supervised posture, which would
+/// otherwise tag every row and bury the one that matters.
+#[must_use]
+pub fn posture_tag(posture: PermissionPosture) -> Option<(&'static str, &'static str)> {
+    match posture {
+        PermissionPosture::Supervised => None,
+        PermissionPosture::Unattended => Some((
+            "bypass",
+            "Unattended: runs every tool without asking for permission",
+        )),
+    }
+}
+
 pub fn permits(state: &SessionState, need: Scope) -> bool {
     match state {
         SessionState::SignedIn(SessionInfo::Disabled) => true,
@@ -338,6 +353,20 @@ mod tests {
             scope,
             expires_at: None,
         })
+    }
+
+    /// #238: an unattended agent runs with no permission gate, so it is called
+    /// out in the fleet list. The ordinary posture gets no tag — a badge on
+    /// every row would be noise that hides the one that matters.
+    #[test]
+    fn only_an_unattended_agent_is_tagged() {
+        assert_eq!(posture_tag(PermissionPosture::Supervised), None);
+        let (label, title) = posture_tag(PermissionPosture::Unattended).expect("tagged");
+        assert_eq!(label, "bypass");
+        assert!(
+            title.to_lowercase().contains("without asking"),
+            "the tooltip must say what unattended means, got: {title}"
+        );
     }
 
     #[test]
@@ -377,6 +406,7 @@ mod tests {
             isolated: true,
             interactive: false,
             session_dir: "/s".into(),
+            permission_posture: PermissionPosture::Supervised,
         }
     }
 

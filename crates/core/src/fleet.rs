@@ -25,7 +25,8 @@ use crate::error::{CoreError, Result};
 use crate::event::{EventKind, FleetEvent};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::model::{
-    Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, Workspace, WorkspaceHealth,
+    Agent, AgentId, AgentStatus, FleetChange, FleetSnapshot, PermissionPosture, Workspace,
+    WorkspaceHealth,
 };
 use crate::ownership::{Ownership, SelfOwnsAll};
 use crate::registry::Registry;
@@ -58,6 +59,12 @@ pub struct SpawnRequest {
     /// picks the workspace's `defaultProvider`. Ignored by `LocalFleet`, whose
     /// provider comes from the repo's stored config. (#142)
     pub provider_ref: Option<String>,
+    /// How this session handles tool calls needing permission (#238). Defaults
+    /// to [`PermissionPosture::Supervised`] via [`SpawnRequest::new`].
+    /// Authorization for `Unattended` is the caller's job — the API requires an
+    /// `admin` scope (ADR-0010) and, in-cluster, the operator additionally
+    /// requires the Workspace to allow it.
+    pub permission_posture: PermissionPosture,
 }
 
 impl SpawnRequest {
@@ -72,6 +79,7 @@ impl SpawnRequest {
             interactive: false,
             frontmatter_path: None,
             provider_ref: None,
+            permission_posture: PermissionPosture::Supervised,
         }
     }
 
@@ -88,6 +96,7 @@ impl SpawnRequest {
             isolation_worktree: self.isolation_worktree,
             inherit_hooks: true,
             interactive: self.interactive,
+            permission_posture: self.permission_posture,
         }
     }
 }
@@ -1182,6 +1191,9 @@ impl FleetManager {
                 isolated: rec.spec.isolation_worktree,
                 interactive: rec.spec.interactive,
                 session_dir: rec.session_dir.clone(),
+                // caliband echoes back the spec it was spawned with, so this is
+                // the posture the agent is really running under (#238).
+                permission_posture: rec.spec.permission_posture,
             };
             match prior.get(&rec.id) {
                 // New to the snapshot. Suppress "discovered" for agents we just
@@ -1793,6 +1805,23 @@ mod tests {
         assert_eq!(
             req.into_spec().frontmatter_path,
             Some(std::path::PathBuf::from("/tpl.md"))
+        );
+    }
+
+    /// #238: the posture a caller chose has to reach caliband's `SpawnSpec`,
+    /// and a request that asks for nothing spawns supervised.
+    #[test]
+    fn spawn_request_forwards_permission_posture_to_spec() {
+        let mut req = SpawnRequest::new("p");
+        assert_eq!(
+            req.clone().into_spec().permission_posture,
+            PermissionPosture::Supervised,
+            "a plain request must spawn supervised"
+        );
+        req.permission_posture = PermissionPosture::Unattended;
+        assert_eq!(
+            req.into_spec().permission_posture,
+            PermissionPosture::Unattended
         );
     }
 

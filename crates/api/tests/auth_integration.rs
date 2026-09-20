@@ -255,6 +255,64 @@ async fn json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
 
+/// #238: choosing `unattended` turns off the permission gate for that session,
+/// so it takes more than the `operate` scope an ordinary spawn needs.
+#[tokio::test]
+async fn unattended_spawn_requires_the_admin_scope() {
+    let h = setup().await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/workspaces/repo/agents",
+            Some(&h.operate),
+            r#"{"prompt":"hi","permission_posture":"unattended"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json(resp).await["error"], "unattended requires admin scope");
+}
+
+/// The same request is accepted for an `admin` token, and a supervised spawn
+/// still needs only `operate` — the gate is on the posture, not the route.
+#[tokio::test]
+async fn supervised_spawn_stays_at_operate_and_admin_may_go_unattended() {
+    let h = setup().await;
+
+    let s = status(
+        &h.app,
+        request(
+            "POST",
+            "/api/workspaces/repo/agents",
+            Some(&h.operate),
+            r#"{"prompt":"hi"}"#,
+        ),
+    )
+    .await;
+    assert!(
+        s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+        "supervised spawn must stay at operate, got {s}"
+    );
+
+    let s = status(
+        &h.app,
+        request(
+            "POST",
+            "/api/workspaces/repo/agents",
+            Some(&h.admin),
+            r#"{"prompt":"hi","permission_posture":"unattended"}"#,
+        ),
+    )
+    .await;
+    assert!(
+        s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+        "admin must be allowed unattended, got {s}"
+    );
+}
+
 #[tokio::test]
 async fn sign_in_cookie_reads_streams_and_signs_out() {
     let h = setup().await;

@@ -25,6 +25,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::model::PermissionPosture;
+
 // ---------------------------------------------------------------------------
 // CalibanTask
 // ---------------------------------------------------------------------------
@@ -100,6 +102,19 @@ pub struct TaskSpec {
     /// (`build_calibantask`) and reads it back (`spawn_spec_from_task`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<bool>,
+    /// Requested permission posture for this session (#238). Mirrors the
+    /// operator's authoritative CRD field (caliban-operator#80); prospero
+    /// writes it in `build_calibantask`. It is a *request*: the operator admits
+    /// it only when the Workspace's `agentPolicy` allows, and reports what it
+    /// admitted in `status.permissionPosture` — which is what
+    /// `spawn_spec_from_task` reads back, never this field.
+    ///
+    /// `schemars(with = "Option<String>")` because the enum lives in
+    /// `prospero-types`, which carries no `schemars` dependency (it also builds
+    /// for wasm); the CR value is a plain string either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub permission_posture: Option<PermissionPosture>,
 }
 
 /// Sandbox isolation configuration.
@@ -140,6 +155,14 @@ pub struct CalibanTaskStatus {
     /// The operator owns `Ready`; prospero owns `AgentsSettled` (#228).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+    /// The posture the operator **admitted** this task with (#238,
+    /// caliban-operator#80) — operator-owned, and the only posture prospero
+    /// acts on. Absent means the operator never admitted one (it predates the
+    /// field, or has not reconciled yet), which `spawn_spec_from_task` reads as
+    /// supervised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub permission_posture: Option<PermissionPosture>,
 }
 
 /// A by-name reference to another object in the same namespace.
