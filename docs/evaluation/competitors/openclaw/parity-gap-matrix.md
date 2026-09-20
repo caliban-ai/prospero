@@ -98,7 +98,7 @@ ADR-0010.)
 |---|---|---|
 | Register managed workspaces/repos | ✅ | `prospero repo add <name> <path>` |
 | Discovery of running supervisors | ✅ | `prospero-core` discovery of calibands |
-| Heterogeneous worker backends | 🟡 | Prospero drives **caliban** agents (any model caliban supports); OpenClaw drives *multiple agent products* (Codex/Claude Code/OpenCode). Non-caliban backends 🔴 |
+| Heterogeneous worker backends | 🟡 | Prospero drives **caliban** agents (any model caliban supports); OpenClaw drives *multiple agent products* (Codex/Claude Code/OpenCode). Non-caliban backends 🔴 — [ADR-0011](../../../adr/0011-acp-as-a-second-drive-protocol.md) picks ACP as the second drive protocol and keeps foreign-harness lifecycle in caliband |
 | Multi-host fleets | 🔴 | no transport to remote prosperods (#1). Clustered mode (N `prosperod` replicas on Postgres with leased ownership, `crates/core/src/leased_ownership.rs`) is HA for one control plane, not multi-host aggregation; `K8sFleet` places agents across a cluster's nodes. OpenClaw spans nodes/devices |
 
 ## G. Model / provider handling

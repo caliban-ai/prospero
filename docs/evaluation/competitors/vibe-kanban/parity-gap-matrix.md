@@ -83,7 +83,7 @@ ADR-0010.
 | Capability (Vibe Kanban) | Prospero | Notes |
 |---|---|---|
 | Register repos | ✅ | `prospero workspace add <name> <root>` / `POST /api/workspaces` / dashboard `add_workspace` |
-| Heterogeneous agent CLIs (10+: Claude Code, Codex, Gemini CLI, Copilot, …) | 🟡 | Prospero drives **caliban** agents only (ADR-0003 wire coupling), across any model caliban supports. Non-caliban backends 🔴 |
+| Heterogeneous agent CLIs (10+: Claude Code, Codex, Gemini CLI, Copilot, …) | 🟡 | Prospero drives **caliban** agents only (ADR-0003 wire coupling), across any model caliban supports. Non-caliban backends 🔴 — [ADR-0011](../../../adr/0011-acp-as-a-second-drive-protocol.md) adds the ACP driver seam but keeps their lifecycle in caliband |
 | Remote access (reverse proxy / SSH / tunnel) | 🟡 | `PROSPERO_ADDR` binds any address and the container binds `0.0.0.0` (`docs/container.md`), but Prospero ships no reverse-proxy, SSH, or tunnel mechanism of its own — that's left to the operator's fronting infrastructure. Since #2, an exposed bind at least requires a token (`crates/api/src/auth/`, ADR-0010) |
 
 ## G. Model / provider handling

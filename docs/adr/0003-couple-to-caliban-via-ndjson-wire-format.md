@@ -1,6 +1,6 @@
 # ADR 0003 · Couple to caliban only through its NDJSON wire format
 
-- **Status:** accepted
+- **Status:** accepted (amended by [0011](0011-acp-as-a-second-drive-protocol.md))
 - **Date:** 2026-06-05
 - **Source:** [`docs/superpowers/specs/2026-06-05-prospero-framework-design.md`](../superpowers/specs/2026-06-05-prospero-framework-design.md) §3, §4
 
@@ -37,3 +37,15 @@ caliban crate.
 - **Revisit if:** the wire protocol churns fast enough that hand-mirroring the types becomes
   a recurring source of drift — a generated client or a shared schema crate might then earn
   its coupling cost.
+
+## Amendment (2026-09-19, [ADR 0011](0011-acp-as-a-second-drive-protocol.md))
+
+Two refinements, neither of which changes the rule that prospero couples to caliban
+through a **wire format** rather than its crates:
+
+- There is now a second drive protocol. ACP (an open, third-party protocol) may carry an
+  agent's data path instead of the NDJSON attach stream, chosen per spawn. Control —
+  spawn, list, kill, drain — stays on caliband's NDJSON wire.
+- The "revisit if" clause above has fired. The hand-mirrored control/NDJSON types are
+  replaced by caliban's published **`caliban-contract`** crate (#239): serde-only, no
+  daemon internals, so it is not the wide coupling this ADR rejected.

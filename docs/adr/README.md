@@ -70,3 +70,4 @@ supersedes the old one, and update the old one's status to
 | [0008](0008-k8s-fleet-backend.md) | `K8sFleet` — a Kubernetes `FleetProvider` backend (CalibanTask CRs; session plane over #71/#75 transport) | accepted |
 | [0009](0009-agpl-3.0-only-license.md) | License prospero under AGPL-3.0-only | accepted |
 | [0010](0010-inbound-api-authentication.md) | Inbound API authentication with scoped, declarative tokens | accepted |
+| [0011](0011-acp-as-a-second-drive-protocol.md) | ACP is a second **drive protocol**, not a second lifecycle | proposed |
