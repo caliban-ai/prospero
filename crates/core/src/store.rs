@@ -53,6 +53,12 @@ pub struct UsageRow {
     pub killed: u64,
     /// Agents that reached `crashed`.
     pub crashed: u64,
+    /// Runs prospero killed for passing their wall-clock deadline (#221).
+    ///
+    /// Counted from the `AgentTimedOut` event, not from a status: the kill it
+    /// causes is a real `killed` transition and is still counted there. This
+    /// says how many of those kills were policy rather than a person.
+    pub timed_out: u64,
 }
 
 /// The UTC day (`YYYY-MM-DD`) an RFC-3339 timestamp falls on, or `None` if the
@@ -78,6 +84,7 @@ pub(crate) fn aggregate_usage<'a>(events: impl Iterator<Item = &'a FleetEvent>) 
         let interesting = match &e.kind {
             EventKind::AgentFinished { .. } => true,
             EventKind::StatusChanged { to, .. } => to.is_terminal(),
+            EventKind::AgentTimedOut { .. } => true,
             _ => false,
         };
         if !interesting {
@@ -94,6 +101,7 @@ pub(crate) fn aggregate_usage<'a>(events: impl Iterator<Item = &'a FleetEvent>) 
                 failed: 0,
                 killed: 0,
                 crashed: 0,
+                timed_out: 0,
             });
         match &e.kind {
             EventKind::AgentFinished {
@@ -109,6 +117,7 @@ pub(crate) fn aggregate_usage<'a>(events: impl Iterator<Item = &'a FleetEvent>) 
                 AgentStatus::Crashed => row.crashed += 1,
                 _ => {}
             },
+            EventKind::AgentTimedOut { .. } => row.timed_out += 1,
             _ => {}
         }
     }

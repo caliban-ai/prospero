@@ -235,12 +235,15 @@ impl Store for PostgresStore {
                 COALESCE(SUM(CASE WHEN kind::jsonb->>'to' = 'killed' THEN 1 END), 0)::bigint \
                     AS killed, \
                 COALESCE(SUM(CASE WHEN kind::jsonb->>'to' = 'crashed' THEN 1 END), 0)::bigint \
-                    AS crashed \
+                    AS crashed, \
+                COALESCE(SUM(CASE WHEN kind::jsonb->>'kind' = 'agent_timed_out' THEN 1 END), \
+                    0)::bigint AS timed_out \
              FROM events \
              WHERE ts >= $1 AND ts < $2 AND ( \
                 kind::jsonb->>'kind' = 'agent_finished' OR ( \
                     kind::jsonb->>'kind' = 'status_changed' \
-                    AND kind::jsonb->>'to' IN ('done', 'failed', 'killed', 'crashed'))) \
+                    AND kind::jsonb->>'to' IN ('done', 'failed', 'killed', 'crashed')) \
+                OR kind::jsonb->>'kind' = 'agent_timed_out') \
              GROUP BY repo, substr(ts, 1, 10) \
              ORDER BY repo, day",
         )
@@ -262,6 +265,7 @@ impl Store for PostgresStore {
                 failed: row.try_get::<i64, _>("failed").map_err(decode)? as u64,
                 killed: row.try_get::<i64, _>("killed").map_err(decode)? as u64,
                 crashed: row.try_get::<i64, _>("crashed").map_err(decode)? as u64,
+                timed_out: row.try_get::<i64, _>("timed_out").map_err(decode)? as u64,
             });
         }
         Ok(out)

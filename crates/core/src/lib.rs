@@ -10,6 +10,7 @@ pub mod auth;
 pub mod bus;
 pub mod caliband;
 pub mod config_store;
+pub mod deadline;
 pub mod discovery;
 pub mod distributed_bus;
 pub mod error;

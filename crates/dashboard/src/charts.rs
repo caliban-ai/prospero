@@ -76,6 +76,8 @@ pub enum Measure {
     Failed,
     /// Agents that reached `crashed`.
     Crashed,
+    /// Runs killed for passing their wall-clock deadline (#221).
+    TimedOut,
 }
 
 impl Measure {
@@ -88,6 +90,7 @@ impl Measure {
             Measure::Killed => b.outcomes.killed as f64,
             Measure::Failed => b.outcomes.failed as f64,
             Measure::Crashed => b.outcomes.crashed as f64,
+            Measure::TimedOut => b.outcomes.timed_out as f64,
         }
     }
 
@@ -100,6 +103,7 @@ impl Measure {
             Measure::Killed => "Killed",
             Measure::Failed => "Failed",
             Measure::Crashed => "Crashed",
+            Measure::TimedOut => "Timed out",
         }
     }
 
@@ -112,6 +116,8 @@ impl Measure {
             Measure::Killed => "done",
             Measure::Failed => "bad",
             Measure::Crashed => "wait",
+            // Policy, not a fault of the run: the same tone as a kill.
+            Measure::TimedOut => "done",
         }
     }
 }
@@ -383,6 +389,7 @@ mod tests {
             failed: 2,
             killed: 1,
             crashed: 4,
+            timed_out: 5,
         };
         let r = report(vec![group("a", vec![bucket("2026-08-01", 0.0, 0, o)])]);
 
@@ -390,6 +397,8 @@ mod tests {
         assert_eq!(fleet_series(&r, Measure::Failed)[0].value, 2.0);
         assert_eq!(fleet_series(&r, Measure::Killed)[0].value, 1.0);
         assert_eq!(fleet_series(&r, Measure::Crashed)[0].value, 4.0);
+        // #221: timeouts are their own facet, not folded into killed.
+        assert_eq!(fleet_series(&r, Measure::TimedOut)[0].value, 5.0);
     }
 
     #[test]

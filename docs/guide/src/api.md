@@ -108,6 +108,7 @@ applies:
   "tool_allowlist": ["read", "edit"],
   "frontmatter_path": "/path/to/agent-template.md",
   "provider_ref": "planner",
+  "timeout_secs": 3600,
   "permission_posture": "supervised"
 }
 ```
@@ -115,6 +116,14 @@ applies:
 Only `prompt` is required. `isolation` defaults to a git worktree; only the exact
 string `"shared"` opts out. `provider_ref` picks a named provider under k8s and is
 ignored by the local backend, which uses the workspace's stored config.
+
+`timeout_secs` caps the agent's wall-clock life. Prospero — not the agent —
+enforces it: the deadline is written to the event log at spawn, so it survives
+the replica that set it, and any replica holding the workspace's lifecycle lease
+kills the agent once it passes. The log records an `agent_timed_out` event
+before the `killed` transition, so history says *why* the agent stopped, and
+`/api/usage` counts those runs separately as `timed_out` (they are also counted
+in `killed`, because the kill is real). Absent means no limit.
 
 `permission_posture` is `"supervised"` (the default, and what an absent field
 means) or `"unattended"`. Supervised keeps the agent's permission gate: a tool

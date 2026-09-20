@@ -63,6 +63,7 @@ Each call replaces the whole configuration. Flags you leave out are cleared.
 | `--interactive` | Wait for operator input after each run instead of finishing |
 | `--tool-allowlist <TOOL>` | Restrict the agent to these tools; repeat once per tool |
 | `--frontmatter <PATH>` | Agent-template / frontmatter markdown file |
+| `--timeout <SECONDS>` | Kill the agent after this much wall-clock time. Enforced by prosperod, so it survives a daemon restart; the log records why |
 | `--permission-posture <POSTURE>` | `supervised` (default) keeps the agent's permission gate; `unattended` runs every tool without asking. `unattended` needs an **admin** token, and in-cluster a workspace that allows it |
 
 `follow` prints output text inline, one line per tool start and finish, and

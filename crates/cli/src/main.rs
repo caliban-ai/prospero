@@ -167,6 +167,10 @@ struct SpawnArgs {
     /// Path to an agent-template / frontmatter markdown file for the agent.
     #[arg(long = "frontmatter", value_name = "PATH")]
     frontmatter: Option<String>,
+    /// Kill the agent after this many seconds of wall-clock time. Omitted, it
+    /// runs until it finishes or you stop it.
+    #[arg(long = "timeout", value_name = "SECONDS")]
+    timeout_secs: Option<u64>,
     /// How tool calls needing permission are handled: `supervised` (a human
     /// approves them; the default) or `unattended` (no permission gate — needs
     /// an admin-scope token, and in-cluster a workspace that allows it).
@@ -293,6 +297,9 @@ fn main() -> Result<()> {
             }
             if let Some(frontmatter) = a.frontmatter {
                 body["frontmatter_path"] = frontmatter.into();
+            }
+            if let Some(secs) = a.timeout_secs {
+                body["timeout_secs"] = secs.into();
             }
             if a.permission_posture != PermissionPosture::Supervised {
                 body["permission_posture"] = serde_json::to_value(a.permission_posture)?;
@@ -594,6 +601,27 @@ mod tests {
             ),
             other => panic!("expected spawn, got {other:?}"),
         }
+    }
+
+    /// #221: a wall-clock cap is opt-in and expressed in seconds.
+    #[test]
+    fn spawn_timeout_parses_and_defaults_to_none() {
+        let cli = Cli::parse_from(["prospero", "spawn", "r", "p"]);
+        match cli.command {
+            Command::Spawn(a) => assert_eq!(a.timeout_secs, None),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["prospero", "spawn", "r", "p", "--timeout", "900"]);
+        match cli.command {
+            Command::Spawn(a) => assert_eq!(a.timeout_secs, Some(900)),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["prospero", "spawn", "r", "p", "--timeout", "soon"]).is_err(),
+            "a non-numeric timeout must be rejected at parse time"
+        );
     }
 
     /// #238: the posture is a typed choice, and omitting it means supervised —
