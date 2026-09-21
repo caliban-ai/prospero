@@ -356,6 +356,7 @@ mod tests {
             agent_id: "a".into(),
             kind,
             actor: None,
+            on_behalf_of: None,
         }))
     }
 
