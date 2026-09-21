@@ -265,27 +265,39 @@ const ROUTES: &[(&str, &[Op])] = &[
             query: &[
                 Query {
                     name: "since",
-                    description: "Inclusive window start (RFC-3339).",
+                    description: "Inclusive window start (RFC-3339, any offset). \
+                                  Echoed back normalized to UTC.",
                     ty: "string",
                 },
                 Query {
                     name: "until",
-                    description: "Exclusive window end (RFC-3339).",
+                    description: "Exclusive window end (RFC-3339, any offset). \
+                                  Echoed back normalized to UTC.",
                     ty: "string",
                 },
                 Query {
                     name: "days",
                     description: "How many days back to look, resolved against the \
-                                  server's clock. Ignored when `since` is given.",
+                                  server's clock. Ignored when `since` is given. \
+                                  Bounded: a window past any real history is a 400.",
                     ty: "integer",
                 },
             ],
             request: None,
-            responses: &[Res {
-                status: "200",
-                description: "Usage report, echoing the window actually used.",
-                body: Body::Json("UsageReport"),
-            }],
+            responses: &[
+                Res {
+                    status: "200",
+                    description: "Usage report, echoing the window actually used.",
+                    body: Body::Json("UsageReport"),
+                },
+                Res {
+                    status: "400",
+                    description: "`since` or `until` is not an RFC-3339 timestamp, or \
+                                  `days` is past the server's limit (`kind`: \
+                                  `bad_request`).",
+                    body: Body::Json("ApiErrorBody"),
+                },
+            ],
         }],
     ),
     (

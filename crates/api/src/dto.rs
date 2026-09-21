@@ -85,6 +85,58 @@ pub struct UsageQuery {
     pub days: Option<i64>,
 }
 
+/// How far back `GET /api/usage` looks when neither `since` nor `days` is given.
+pub const DEFAULT_USAGE_WINDOW_DAYS: i64 = 7;
+
+/// Resolve a usage query into the `[since, until)` bounds the store is asked for.
+///
+/// The store compares event timestamps to these bounds **as strings**, so this
+/// is where the window is made safe to compare (#255):
+///
+/// - both bounds are parsed, so a value that is not a timestamp is rejected
+///   instead of selecting whatever it happens to sort between;
+/// - both are re-rendered with `to_rfc3339()`, the spelling events are stamped
+///   with. Any other spelling mis-sorts at the edge — a `Z` suffix sorts after
+///   the `.` of a fractional second, so an event half a second into the window
+///   compared as before it;
+/// - `days` is bounded before it reaches date arithmetic, which overflows (and
+///   panics) once the result leaves chrono's representable range.
+///
+/// `days` below 1 is still treated as 1, as it always has been.
+pub fn usage_window(
+    q: &UsageQuery,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(String, String), String> {
+    let until = match &q.until {
+        Some(raw) => parse_bound("until", raw)?,
+        None => now,
+    };
+    let since = match &q.since {
+        Some(raw) => parse_bound("since", raw)?,
+        None => {
+            let back = q.days.unwrap_or(DEFAULT_USAGE_WINDOW_DAYS).max(1);
+            if back > prospero_types::MAX_USAGE_WINDOW_DAYS {
+                return Err(format!(
+                    "days: at most {}, got {back}",
+                    prospero_types::MAX_USAGE_WINDOW_DAYS
+                ));
+            }
+            // Offset from the resolved end, not from `now`, so an explicit
+            // `until` plus `days` spans exactly `days`.
+            until
+                .checked_sub_signed(chrono::Duration::days(back))
+                .ok_or_else(|| format!("days: {back} reaches before any representable date"))?
+        }
+    };
+    Ok((since.to_rfc3339(), until.to_rfc3339()))
+}
+
+fn parse_bound(name: &str, raw: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| format!("{name}: {raw:?} is not an RFC-3339 timestamp ({e})"))
+}
+
 /// Fold the store's flat (workspace, day) rows into the per-workspace report.
 ///
 /// The store already did the aggregation; this only reshapes. Another adapter

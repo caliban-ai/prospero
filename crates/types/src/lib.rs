@@ -13,9 +13,9 @@ mod event;
 mod model;
 
 pub use api::{
-    AddWorkspaceBody, AgentInputBody, Capabilities, GapSignal, OutcomeCounts, RespawnedResponse,
-    SetConfigBody, SpawnBody, SpawnedResponse, UsageBucket, UsageGroup, UsageReport,
-    WorkspaceSummary,
+    AddWorkspaceBody, AgentInputBody, Capabilities, GapSignal, MAX_USAGE_WINDOW_DAYS,
+    OutcomeCounts, RespawnedResponse, SetConfigBody, SpawnBody, SpawnedResponse, UsageBucket,
+    UsageGroup, UsageReport, WorkspaceSummary,
 };
 pub use auth::{Scope, SessionInfo, SignInBody};
 pub use automation::{

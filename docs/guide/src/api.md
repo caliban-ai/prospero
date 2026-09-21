@@ -49,6 +49,7 @@ Errors come back as `{"error": "<message>", "kind": "<kind>"}`:
 | Status | `kind` | When |
 |---|---|---|
 | 400 | `provider_misconfigured`, `invalid_config` | Bad provider or workspace configuration |
+| 400 | `bad_request` | A malformed request: for example a `/api/usage` window that isn't a timestamp, or an invalid `X-Prospero-On-Behalf-Of` header |
 | 401 | `unauthorized` | Missing, invalid or expired credential (with `WWW-Authenticate: Bearer realm="prospero"`) |
 | 403 | `forbidden` | Scope too low, or a cross-origin mutation made with a session cookie |
 | 404 | `not_found` | Unknown agent or workspace |
@@ -262,7 +263,13 @@ from the event store. Query parameters, all optional:
 
 - `until`: exclusive end, RFC 3339. Defaults to now.
 - `since`: inclusive start, RFC 3339. Takes precedence over `days`.
-- `days`: window length counted back from `until`. Defaults to 7, minimum 1.
+- `days`: window length counted back from `until`. Defaults to 7, minimum 1,
+  maximum 36500 (a century).
+
+A bound that isn't an RFC 3339 timestamp, or a `days` past the maximum, is a
+`400 bad_request`. Neither is quietly answered with some other window. Any
+offset is accepted: `…T00:00:00Z` and `…T00:00:00+00:00` select exactly the
+same events, and the echoed window is normalized to UTC.
 
 The response echoes the window it used and returns one group per workspace. Each
 group has totals and a per-UTC-day `series`:

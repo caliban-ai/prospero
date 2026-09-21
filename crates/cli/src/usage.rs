@@ -1,21 +1,18 @@
 //! `prospero usage` (#223): cost, turns and outcomes per workspace.
 //!
-//! The server's `/api/usage` does not validate its window: `since` is compared
-//! as a string and `days` goes straight into date arithmetic. So this module is
-//! strict about what it sends — anything it cannot turn into a well-formed
-//! window is refused here, with a message, rather than returning a report for
-//! some other window than the one the user asked for.
+//! This module is strict about the window it sends: anything it cannot turn
+//! into a well-formed bound is refused here, with a message naming the flag.
+//! Since #255 the server validates the window too, but a daemon older than that
+//! compares `since` as a string and feeds `days` to date arithmetic unchecked —
+//! so the CLI does not rely on it, and a bad value never leaves the machine.
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use prospero_types::{OutcomeCounts, UsageGroup, UsageReport};
 
-/// Largest `--since` day count accepted.
-///
-/// The server builds the window with `chrono::Duration::days`, which panics
-/// past about 106 million days. A century is far beyond any retained history
-/// and far inside that bound.
-const MAX_DAYS: u64 = 36_500;
+/// Largest `--since` day count accepted: the server's own limit, shared through
+/// `prospero-types` so the two cannot drift.
+const MAX_DAYS: u64 = prospero_types::MAX_USAGE_WINDOW_DAYS as u64;
 
 const SINCE_FORMS: &str =
     "expected a day count like 7d or 2w, a date like 2026-09-01, or an RFC-3339 timestamp";
@@ -86,8 +83,10 @@ fn day_count(s: &str) -> Result<Option<u64>> {
 /// fractional seconds before it. Only a bound in that same spelling sorts
 /// correctly against them — a `Z` suffix sorts after the `.` of a fractional
 /// second, so an event half a second into the window would compare as before
-/// it and drop out. That `+` then has to be percent-encoded, because a bare `+`
-/// in a query string decodes to a space.
+/// it and drop out. A current server re-renders the bound itself (#255); an
+/// older one does not, so the CLI sends the safe spelling either way. That `+`
+/// then has to be percent-encoded, because a bare `+` in a query string decodes
+/// to a space.
 fn stamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Secs, false)
         .replace('+', "%2B")
@@ -454,8 +453,9 @@ mod tests {
         assert!(usage_path(Some("0d")).is_err());
     }
 
-    /// The server feeds `days` to `chrono::Duration::days`, which panics out of
-    /// range — so an enormous count must never leave the CLI.
+    /// A daemon older than #255 subtracts `days` from a `DateTime` unchecked,
+    /// which panics once the result leaves chrono's range — so an enormous
+    /// count must never leave the CLI.
     #[test]
     fn a_day_count_beyond_any_real_history_is_refused() {
         assert_eq!(usage_path(Some("36500d")).unwrap(), "/api/usage?days=36500");

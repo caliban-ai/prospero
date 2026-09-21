@@ -809,6 +809,98 @@ async fn usage_endpoint_defaults_its_window() {
     assert!(v["groups"].as_array().unwrap().is_empty(), "payload: {v}");
 }
 
+async fn get_usage(h: &Harness, uri: &str) -> axum::response::Response {
+    h.router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// #255: `days` fed `chrono::Duration::days` unbounded, which panics out of
+/// range — a single request could take down its handler. A window past any
+/// real history is a client error, and must be answered as one.
+#[tokio::test]
+async fn usage_endpoint_refuses_a_day_count_past_any_real_history() {
+    let h = setup().await;
+    let resp = get_usage(&h, "/api/usage?days=200000000").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(resp).await["kind"], "bad_request");
+
+    // The largest window that is still meaningful is still answered.
+    let at_the_limit = format!("/api/usage?days={}", prospero_types::MAX_USAGE_WINDOW_DAYS);
+    assert_eq!(get_usage(&h, &at_the_limit).await.status(), StatusCode::OK);
+}
+
+/// #255: `since`/`until` went to the store unparsed, where they were compared as
+/// strings — so a bound that was not a timestamp still produced a report, just
+/// for some window nobody asked for.
+#[tokio::test]
+async fn usage_endpoint_refuses_a_bound_that_is_not_a_timestamp() {
+    let h = setup().await;
+    for uri in [
+        "/api/usage?since=yesterday",
+        "/api/usage?until=soon",
+        "/api/usage?since=2026-13-40T00:00:00%2B00:00",
+    ] {
+        let resp = get_usage(&h, uri).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(json_body(resp).await["kind"], "bad_request", "{uri}");
+    }
+}
+
+/// #255: the store compares timestamps lexically, and stamps events with
+/// `to_rfc3339()` (`…00:00:00.5+00:00`). A `Z`-suffixed bound sorts *after* the
+/// `.` of a fractional second, so an event half a second into the window used
+/// to fall out of it. Both RFC-3339 spellings of the same instant must now
+/// select the same events.
+#[tokio::test]
+async fn usage_window_is_the_same_whichever_spelling_the_bound_uses() {
+    use prospero_core::event::EventKind;
+    let h = setup().await;
+    h.manager
+        .store()
+        .append(&FleetEvent {
+            seq: 1,
+            ts: "2026-08-01T00:00:00.5+00:00".to_string(),
+            repo: "repo".to_string(),
+            agent_id: "edge".to_string(),
+            kind: EventKind::AgentFinished {
+                outcome: "success".to_string(),
+                cost_usd: 0.5,
+                turns: 1,
+            },
+            actor: None,
+            on_behalf_of: None,
+        })
+        .await
+        .unwrap();
+
+    let until = "until=2026-08-02T00:00:00%2B00:00";
+    let with_z = get_usage(
+        &h,
+        &format!("/api/usage?since=2026-08-01T00:00:00Z&{until}"),
+    )
+    .await;
+    let with_offset = get_usage(
+        &h,
+        &format!("/api/usage?since=2026-08-01T00:00:00%2B00:00&{until}"),
+    )
+    .await;
+    assert_eq!(with_z.status(), StatusCode::OK);
+    assert_eq!(with_offset.status(), StatusCode::OK);
+    let (with_z, with_offset) = (json_body(with_z).await, json_body(with_offset).await);
+
+    assert_eq!(
+        with_z["groups"][0]["cost_usd"], 0.5,
+        "an event half a second into the window must be inside it: {with_z}"
+    );
+    assert_eq!(
+        with_z, with_offset,
+        "two spellings of one instant must give one report"
+    );
+}
+
 #[tokio::test]
 async fn sse_stream_closes_after_agent_finished() {
     let mut h = setup().await;
