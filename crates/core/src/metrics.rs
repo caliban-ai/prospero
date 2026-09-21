@@ -58,6 +58,7 @@ impl Metrics {
 /// A point-in-time snapshot of prosperod's operational counters, returned by
 /// `GET /api/metrics`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct MetricsSnapshot {
     /// Events successfully appended to the durable store.
     pub events_appended: u64,

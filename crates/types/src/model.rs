@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// One source checkout within a workspace. (The `discover_sources` filesystem
 /// logic stays in `prospero-core`; only this struct is shared.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct Source {
     /// Directory basename (unique within a workspace).
     pub name: String,
@@ -19,6 +20,7 @@ pub struct Source {
 
 /// Per-repo provider/environment configuration applied to its caliband daemon.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct RepoProviderConfig {
     /// Selected provider → `CALIBAN_PROVIDER`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,6 +44,7 @@ pub struct RepoProviderConfig {
 /// A source checkout spec for a workspace: a git remote and where to mount it.
 /// Used by the k8s config plane to build a `Workspace` CR's `sources[]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct WorkspaceSourceSpec {
     /// Source identifier (matches caliband's workspace source name).
     pub name: String,
@@ -56,6 +59,7 @@ pub struct WorkspaceSourceSpec {
 
 /// A named model provider within a workspace. Each agent binds one by name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct ProviderSpec {
     /// Provider identifier, unique within the workspace (e.g. `planner`).
     pub name: String,
@@ -76,6 +80,7 @@ pub struct ProviderSpec {
 
 /// A by-name reference to a key within an existing Secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct CredentialsRef {
     /// Name of the Secret (same namespace).
     pub secret_name: String,
@@ -85,6 +90,7 @@ pub struct CredentialsRef {
 
 /// Isolation defaults for agents launched against a workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct IsolationConfig {
     /// RuntimeClass (e.g. `gvisor`, `kata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +111,7 @@ pub struct IsolationConfig {
 /// deserializing unchanged, while k8s reads the named-provider list + Secret
 /// references it needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct WorkspaceConfig {
     /// Human-friendly dashboard label (k8s `displayName`; local ignores it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +138,7 @@ pub struct WorkspaceConfig {
 /// the dashboard's launch-modal provider picker and a "has credentials" pill,
 /// without exposing the Secret reference itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct ProviderInfo {
     /// Provider name (what an agent binds by `providerRef`).
     pub name: String,
@@ -156,6 +164,7 @@ pub struct ProviderInfo {
 /// Reconciliation status of a workspace, surfaced for the dashboard's status
 /// pill + failure tooltip. Backend-neutral (local workspaces report `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct WorkspaceStatusInfo {
     /// Lifecycle phase (`Pending` / `Reconciling` / `Ready` / `Failed`).
     pub phase: String,
@@ -169,6 +178,7 @@ pub struct WorkspaceStatusInfo {
 /// `FleetAdmin::list_workspaces` and merged into `GET /api/workspaces` so a
 /// configured-but-agentless workspace is still visible with its status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct WorkspaceInfo {
     /// Workspace object name (agents bind it via `workspaceRef`).
     pub name: String,
@@ -195,6 +205,7 @@ pub struct WorkspaceInfo {
 /// accept writes. The workspace-health counts are an informational summary
 /// (per-workspace reachability is already surfaced in `/api/workspaces` and `/api/fleet`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct Readiness {
     /// Overall ready signal — currently equivalent to `store_writable`.
     pub ready: bool,
@@ -218,6 +229,7 @@ pub struct Readiness {
 /// caliban worker, which only honors and audits what it is handed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum PermissionPosture {
     /// The normal gate: a tool call needing approval is surfaced to a human, and
     /// denied when none is attached. The default, and fail-closed.
@@ -232,6 +244,7 @@ pub enum PermissionPosture {
 /// so the same value round-trips through both protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum AgentStatus {
     /// Registered, not yet executing.
     Spawning,
@@ -267,6 +280,7 @@ impl AgentStatus {
 /// Connectivity of a managed workspace's caliband daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum WorkspaceHealth {
     /// The control socket responded to the last poll.
     Healthy,
@@ -279,6 +293,7 @@ pub enum WorkspaceHealth {
 
 /// Prospero's view of a single agent (projected from a caliban `AgentRecord`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct Agent {
     /// Opaque caliban agent id.
     pub id: String,
@@ -317,6 +332,7 @@ pub struct Agent {
 /// A managed workspace (root + its source checkouts) and the agents running
 /// under its single caliband.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct Workspace {
     /// Registry key (operator-chosen short name).
     pub name: String,
@@ -338,6 +354,7 @@ pub struct Workspace {
 
 /// A point-in-time view of the whole fleet on one host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct FleetSnapshot {
     /// Host identity (single host in the first stab).
     pub host: String,
@@ -359,6 +376,7 @@ impl FleetSnapshot {
 
 /// Stable identifier for a running agent (caliband's agent id).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct AgentId(pub String);
 
 impl AgentId {

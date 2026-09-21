@@ -141,7 +141,11 @@ pub fn required_access(method: &Method, route: &str) -> Access {
     use Access::{Open, Requires};
     use Scope::{Admin, Operate, Read};
     match (method.as_str(), route) {
-        (_, "/healthz" | "/readyz" | "/" | "/assets/{*path}" | "/api/session") => Open,
+        // #222: the OpenAPI document describes the API's shape, not its data,
+        // and a client needs it to know how to authenticate in the first place.
+        // It is the same information the published guide already carries.
+        (_, "/healthz" | "/readyz" | "/" | "/assets/{*path}" | "/api/session"
+            | "/api/openapi.json") => Open,
         // #220: a webhook trigger authenticates with an HMAC signature over the
         // request body, checked against the one automation's own key. That
         // signature *is* the credential, and it authorizes firing exactly that

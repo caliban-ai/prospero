@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// requirement is met when `principal.scope >= required`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum Scope {
     /// Every GET (fleet, usage, events, SSE, metrics).
     Read,
@@ -41,6 +42,7 @@ impl Scope {
 /// `GET /api/session` / `POST /api/session` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "auth", rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum SessionInfo {
     /// No tokens configured: the dashboard skips sign-in and shows every control.
     Disabled,
@@ -58,6 +60,7 @@ pub enum SessionInfo {
 
 /// `POST /api/session` body.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct SignInBody {
     /// The raw `pspo_…` token pasted by the operator.
     pub token: String,

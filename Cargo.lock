@@ -2017,6 +2017,7 @@ dependencies = [
 name = "prospero-types"
 version = "0.8.1"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
 ]

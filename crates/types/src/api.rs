@@ -29,6 +29,7 @@ use crate::model::{
 /// admin/registry controls on it, so it never offers operations the active
 /// backend can't serve. (#99)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct Capabilities {
     /// Whether the workspace admin/config plane (add / remove / set-config) is
     /// available. `true` for the local backend (registry) and, as of #142, for
@@ -45,6 +46,7 @@ pub struct Capabilities {
 
 /// Body for `POST /api/workspaces`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct AddWorkspaceBody {
     /// Operator-chosen short name.
     pub name: String,
@@ -60,10 +62,12 @@ pub struct AddWorkspaceBody {
 
 /// Body for `PUT /api/workspaces/{name}/config`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct SetConfigBody(pub WorkspaceConfig);
 
 /// Body for `POST /api/workspaces/{repo}/agents`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct SpawnBody {
     /// Initial prompt / task.
     pub prompt: String,
@@ -116,6 +120,7 @@ impl SpawnBody {
 
 /// Response for a successful spawn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct SpawnedResponse {
     /// New agent id.
     pub agent_id: String,
@@ -144,6 +149,7 @@ fn default_created() -> bool {
 
 /// Body for `POST /api/agents/{id}/input`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct AgentInputBody {
     /// Message text to inject into the interactive agent.
     pub text: String,
@@ -151,6 +157,7 @@ pub struct AgentInputBody {
 
 /// Response for `POST /api/agents/{id}/respawn`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct RespawnedResponse {
     /// The new agent id.
     pub agent_id: String,
@@ -163,6 +170,7 @@ pub struct RespawnedResponse {
 /// signal is still sent so a client can say "some output was missed" rather
 /// than silently rendering a discontinuous timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct GapSignal {
     /// How many events were dropped.
     pub skipped: u64,
@@ -176,6 +184,7 @@ pub struct GapSignal {
 /// and skipped for the local backend, so local responses are byte-for-byte
 /// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct WorkspaceSummary {
     /// Registry name.
     pub name: String,
@@ -221,6 +230,7 @@ pub struct WorkspaceSummary {
 /// which carries caliban's open-ended result subtype ("EndOfTurn",
 /// "max_turns") and cannot be charted as a fixed set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct OutcomeCounts {
     /// Finished successfully.
     pub done: u64,
@@ -245,6 +255,7 @@ impl OutcomeCounts {
 
 /// One day's usage within a workspace — the unit the fleet charts plot.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct UsageBucket {
     /// UTC day, `YYYY-MM-DD`.
     pub day: String,
@@ -263,6 +274,7 @@ pub struct UsageBucket {
 /// a workspace may show outcomes against zero spend. Charts should not treat
 /// that as missing data.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct UsageGroup {
     /// Workspace name.
     pub workspace: String,
@@ -281,6 +293,7 @@ pub struct UsageGroup {
 /// The window is echoed back so a client rendering an axis does not have to
 /// re-derive the defaults the server applied.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct UsageReport {
     /// Inclusive window start (RFC-3339).
     pub since: String,

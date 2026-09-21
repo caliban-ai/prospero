@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# JSON Schema derives, used to build the OpenAPI document (#222). Off by
+# default: the wasm dashboard shares these types and needs only serde, so it
+# should not carry a schema generator it never calls. `prospero-api` turns it
+# on; nothing else does.
+openapi = ["dep:schemars"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json.workspace = true
+schemars = { workspace = true, optional = true }

@@ -185,6 +185,30 @@ async fn probes_and_dashboard_shell_are_open() {
     }
 }
 
+/// #222: a client needs the spec *before* it has a credential — it is how the
+/// client learns how to authenticate. The document describes the API's shape
+/// and carries no fleet data, so serving it open costs nothing the published
+/// guide does not already give away.
+#[tokio::test]
+async fn the_openapi_document_is_served_without_a_credential() {
+    let h = setup().await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(request("GET", "/api/openapi.json", None, ""))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(doc["openapi"], "3.1.0");
+    assert!(
+        doc["paths"]["/api/fleet"]["get"].is_object(),
+        "the served document should describe the fleet route"
+    );
+}
+
 #[tokio::test]
 async fn unauthorized_and_forbidden_bodies_follow_the_spec() {
     let h = setup().await;

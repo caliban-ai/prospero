@@ -11,6 +11,8 @@ testkit = ["dep:tempfile", "dep:rcgen"]
 # Kubernetes FleetProvider backend (K8sFleet, CalibanTask CR mirror). Pulls
 # `kube`/`k8s-openapi`; `LocalFleet`-only builds stay free of them.
 k8s = ["dep:kube", "dep:k8s-openapi", "dep:schemars"]
+# JSON Schema derives for the core-owned types the REST API returns (#222).
+openapi = ["prospero-types/openapi", "dep:schemars"]
 
 [dependencies]
 prospero-types.workspace = true

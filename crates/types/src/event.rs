@@ -12,6 +12,7 @@ use crate::model::{AgentStatus, WorkspaceHealth};
 /// Which textual stream a chunk of output came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum OutputStream {
     /// Assistant-visible text.
     Stdout,
@@ -22,6 +23,7 @@ pub enum OutputStream {
 /// The semantic payload of a fleet event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum EventKind {
     /// Prospero asked caliband to spawn this agent.
     AgentSpawned,
@@ -152,6 +154,7 @@ pub fn stream_key_for(repo: &str, agent_id: &str) -> String {
 
 /// A normalized, sequenced fleet event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct FleetEvent {
     /// Monotonic sequence number assigned by the `FleetManager`.
     pub seq: u64,
