@@ -9,6 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 prospero-core.workspace = true
+# #223: `prospero usage` renders the typed report the server serializes, so
+# the table cannot drift from the wire shape.
+prospero-types.workspace = true
+# #223: normalizing `--since` into the UTC form the server compares against.
+chrono.workspace = true
 clap.workspace = true
 ureq.workspace = true
 serde.workspace = true
