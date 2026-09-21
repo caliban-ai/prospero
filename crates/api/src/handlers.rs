@@ -17,9 +17,6 @@ use crate::dto::{
 };
 use crate::error::ApiError;
 
-/// How far back `GET /api/usage` looks when the caller names no `since`.
-const DEFAULT_USAGE_WINDOW_DAYS: i64 = 7;
-
 /// `GET /api/fleet` — the whole fleet snapshot.
 pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
     Json(st.fleet.snapshot().await)
@@ -30,26 +27,16 @@ pub async fn get_fleet(State(st): State<AppState>) -> Json<FleetSnapshot> {
 ///
 /// The store does the aggregation; this only resolves the window and reshapes
 /// the rows. Bounds are compared lexically against the stored RFC-3339
-/// timestamps — the same assumption retention already makes — so the defaults
-/// are emitted with `to_rfc3339()` to match the format events are written in.
+/// timestamps — the same assumption retention already makes — so
+/// [`crate::dto::usage_window`] validates them and re-renders *every* bound,
+/// not just the defaults, in the format events are written in (#255). A bound
+/// it cannot resolve is a 400, never a report for some other window.
 pub async fn get_usage(
     State(st): State<AppState>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsageReport>, ApiError> {
-    let now = chrono::Utc::now();
-    let until = q.until.unwrap_or_else(|| now.to_rfc3339());
-    // An explicit `since` wins; otherwise fall back to `days`, then the default.
-    // `days` is clamped to at least 1 so `?days=0` yields an empty-but-valid
-    // window rather than one that ends before it starts.
-    let since = q.since.unwrap_or_else(|| {
-        let back = q.days.unwrap_or(DEFAULT_USAGE_WINDOW_DAYS).max(1);
-        // Offset from the resolved end, not from `now`, so an explicit `until`
-        // plus `days` spans exactly `days`.
-        let end = chrono::DateTime::parse_from_rfc3339(&until)
-            .map(|t| t.with_timezone(&chrono::Utc))
-            .unwrap_or(now);
-        (end - chrono::Duration::days(back)).to_rfc3339()
-    });
+    let (since, until) =
+        crate::dto::usage_window(&q, chrono::Utc::now()).map_err(ApiError::BadRequest)?;
 
     let rows = st.store.usage(&since, &until).await?;
     Ok(Json(crate::dto::usage_report(rows, &since, &until)))

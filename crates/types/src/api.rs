@@ -288,6 +288,14 @@ pub struct UsageGroup {
     pub series: Vec<UsageBucket>,
 }
 
+/// The widest `GET /api/usage?days=` window the server answers (#255).
+///
+/// The server builds the window with `chrono::Duration::days`, which panics
+/// past about 106 million days. A century is far beyond any retained history
+/// and far inside that bound. Shared here so the server's limit and the CLI's
+/// `--since` limit are one number, not two that can drift.
+pub const MAX_USAGE_WINDOW_DAYS: i64 = 36_500;
+
 /// `GET /api/usage` — aggregated spend and outcomes per workspace.
 ///
 /// The window is echoed back so a client rendering an axis does not have to
