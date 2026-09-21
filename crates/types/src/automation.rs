@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// What starts an automation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum Trigger {
     /// A cron schedule, evaluated in UTC. Standard 5-field expressions work;
     /// the 6-field (seconds-first) form is accepted too.
@@ -27,6 +28,7 @@ pub enum Trigger {
 /// Mirrors the fields of a manual spawn, so an automation can do nothing a
 /// person with `operate` could not do by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct SpawnTemplate {
     /// The agent's task. For webhook triggers this may contain
     /// `{{ dotted.path }}` placeholders filled from the request payload.
@@ -84,6 +86,7 @@ impl Default for SpawnTemplate {
 
 /// A configured automation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct Automation {
     /// Operator-chosen id (the registry key, unique across the fleet).
     pub id: String,
@@ -107,6 +110,7 @@ pub struct Automation {
 /// What caused a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub enum RunSource {
     /// A cron tick came due.
     Schedule,
@@ -118,6 +122,7 @@ pub enum RunSource {
 
 /// One recorded firing of an automation, successful or not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct AutomationRun {
     /// The automation that fired.
     pub automation_id: String,
@@ -137,6 +142,7 @@ pub struct AutomationRun {
 
 /// Body for `POST /api/automations`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct CreateAutomationBody {
     /// Operator-chosen id.
     pub id: String,
@@ -153,6 +159,7 @@ pub struct CreateAutomationBody {
 
 /// Response to `POST /api/automations`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct CreatedAutomationResponse {
     /// The stored automation.
     pub automation: Automation,
@@ -165,6 +172,7 @@ pub struct CreatedAutomationResponse {
 
 /// Body for `PUT /api/automations/{id}/enabled`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct SetEnabledBody {
     /// Whether the automation should fire.
     pub enabled: bool,
@@ -172,6 +180,7 @@ pub struct SetEnabledBody {
 
 /// Response to a fire request (`run now`, or an accepted webhook).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(schemars::JsonSchema))]
 pub struct FiredResponse {
     /// The recorded run.
     pub run: AutomationRun,

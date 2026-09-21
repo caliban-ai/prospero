@@ -6,6 +6,35 @@ and responses are JSON. The request and response types live in the
 `prospero-types` crate, which the WASM dashboard also uses, so these shapes are
 the ones the server actually serializes.
 
+## The OpenAPI document
+
+Everything this page describes in prose is also published as an
+[OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0.html) document at
+`GET /api/openapi.json`, so a client can generate its request and response types
+instead of hand-writing them:
+
+```sh
+curl -s http://127.0.0.1:7777/api/openapi.json | jq .
+```
+
+The route is open — you need the document to work out how to authenticate, and
+it describes the API's shape rather than any fleet data. Each operation records
+the scope it requires in an `x-prospero-scope` field, so the table below and the
+document never disagree about who may call what.
+
+For code generation in CI, where no daemon is running, the same bytes come from
+the repository:
+
+```sh
+cargo run -p prospero-api --example openapi > openapi.json
+```
+
+The schemas are derived from the same `prospero-types` structs the server
+serializes, so they cannot drift from the wire. Where a type's read shape
+differs from its write shape — a field with a serde default is optional when
+sent but always present when returned — the request form is published under a
+`…Request` name, and the request body points at that one.
+
 ## Authentication
 
 When `prosperod` runs with a tokens file, every route except the open ones
@@ -37,6 +66,7 @@ Errors come back as `{"error": "<message>", "kind": "<kind>"}`:
 | GET | `/healthz` | open | Liveness: always `200 ok` while the process is up |
 | GET | `/readyz` | open | Readiness: `200` when the event store is writable, else `503` |
 | GET / POST / DELETE | `/api/session` | open | Dashboard sign-in, whoami, sign-out |
+| GET | `/api/openapi.json` | open | This API as an OpenAPI 3.1 document |
 | GET | `/api/capabilities` | read | What the active backend supports |
 | GET | `/api/metrics` | read | Operational counters |
 | GET | `/api/fleet` | read | Fleet snapshot: every workspace and its agents |

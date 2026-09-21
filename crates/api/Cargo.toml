@@ -13,8 +13,9 @@ k8s = ["prospero-core/k8s"]
 [dependencies]
 rmcp.workspace = true
 schemars.workspace = true
-prospero-core.workspace = true
-prospero-types.workspace = true
+# #222: the OpenAPI document is built from these crates' JSON Schema derives.
+prospero-core = { workspace = true, features = ["openapi"] }
+prospero-types = { workspace = true, features = ["openapi"] }
 axum.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

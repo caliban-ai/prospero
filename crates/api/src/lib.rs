@@ -12,6 +12,7 @@ pub mod dto;
 pub mod error;
 pub mod handlers;
 pub mod mcp;
+pub mod openapi;
 pub mod sse;
 
 use std::sync::Arc;
@@ -87,6 +88,10 @@ pub fn router_with_auth(
                 .post(auth::handlers::post_session)
                 .delete(auth::handlers::delete_session),
         )
+        // #222: the machine-readable description of everything below. Open,
+        // like the guide it mirrors: it describes the shape of the API, never
+        // any fleet data, and a client needs it before it has a credential.
+        .route("/api/openapi.json", get(openapi::get_openapi))
         .route("/api/metrics", get(handlers::get_metrics))
         .route("/api/capabilities", get(handlers::get_capabilities))
         // Fleet + workspaces.
