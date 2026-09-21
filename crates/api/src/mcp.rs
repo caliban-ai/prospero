@@ -475,6 +475,7 @@ mod tests {
                         chunk: format!("chunk {seq}"),
                     },
                     actor: None,
+                    on_behalf_of: None,
                 })
                 .await
                 .unwrap();

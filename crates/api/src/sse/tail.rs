@@ -141,6 +141,7 @@ mod tests {
                 chunk: format!("c{seq}"),
             },
             actor: None,
+            on_behalf_of: None,
         }
     }
 
@@ -156,6 +157,7 @@ mod tests {
                 turns: 1,
             },
             actor: None,
+            on_behalf_of: None,
         }
     }
 

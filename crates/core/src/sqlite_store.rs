@@ -27,6 +27,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (\
     agent_id   TEXT NOT NULL,\
     kind       TEXT NOT NULL,\
     actor      TEXT,\
+    on_behalf_of TEXT,\
     UNIQUE(stream_key, seq)\
 )";
 
@@ -56,19 +57,22 @@ impl SqliteStore {
             .execute(&pool)
             .await
             .map_err(|e| CoreError::Store(format!("initializing sqlite schema: {e}")))?;
-        // #2: databases created before `actor` existed lack the column. SQLite
+        // #2 / #251: databases created before a column existed lack it. SQLite
         // has no `ADD COLUMN IF NOT EXISTS`, so probe the table first.
-        let has_actor: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = 'actor'",
-        )
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| CoreError::Store(format!("inspecting sqlite schema: {e}")))?;
-        if !has_actor {
-            sqlx::query("ALTER TABLE events ADD COLUMN actor TEXT")
-                .execute(&pool)
-                .await
-                .map_err(|e| CoreError::Store(format!("adding actor column: {e}")))?;
+        for column in ["actor", "on_behalf_of"] {
+            let present: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = ?",
+            )
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| CoreError::Store(format!("inspecting sqlite schema: {e}")))?;
+            if !present {
+                sqlx::query(&format!("ALTER TABLE events ADD COLUMN {column} TEXT"))
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| CoreError::Store(format!("adding {column} column: {e}")))?;
+            }
         }
         Ok(Self { pool })
     }
@@ -79,8 +83,8 @@ impl Store for SqliteStore {
     async fn append(&self, event: &FleetEvent) -> Result<()> {
         let kind = serde_json::to_string(&event.kind)?;
         sqlx::query(
-            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind, actor) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind, actor, on_behalf_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.stream_key())
         .bind(event.seq as i64)
@@ -89,6 +93,7 @@ impl Store for SqliteStore {
         .bind(&event.agent_id)
         .bind(kind)
         .bind(&event.actor)
+        .bind(&event.on_behalf_of)
         .execute(&self.pool)
         .await
         .map_err(map_append_error)?;
@@ -97,7 +102,7 @@ impl Store for SqliteStore {
 
     async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         let rows = sqlx::query(
-            "SELECT seq, ts, repo, agent_id, kind, actor FROM events \
+            "SELECT seq, ts, repo, agent_id, kind, actor, on_behalf_of FROM events \
              WHERE stream_key = ? AND seq >= ? ORDER BY seq",
         )
         .bind(stream_key)
@@ -115,6 +120,7 @@ impl Store for SqliteStore {
             let agent_id: String = row.try_get("agent_id").map_err(decode)?;
             let kind_json: String = row.try_get("kind").map_err(decode)?;
             let actor: Option<String> = row.try_get("actor").map_err(decode)?;
+            let on_behalf_of: Option<String> = row.try_get("on_behalf_of").map_err(decode)?;
             events.push(FleetEvent {
                 seq: seq as u64,
                 ts,
@@ -122,6 +128,7 @@ impl Store for SqliteStore {
                 agent_id,
                 kind: serde_json::from_str(&kind_json)?,
                 actor,
+                on_behalf_of,
             });
         }
         Ok(events)
@@ -135,7 +142,7 @@ impl Store for SqliteStore {
         limit: usize,
     ) -> Result<Vec<crate::store::CursoredEvent>> {
         let rows = sqlx::query(
-            "SELECT global_ordinal, seq, ts, repo, agent_id, kind, actor FROM events \
+            "SELECT global_ordinal, seq, ts, repo, agent_id, kind, actor, on_behalf_of FROM events \
              WHERE global_ordinal > ? ORDER BY global_ordinal LIMIT ?",
         )
         .bind(after_cursor as i64)
@@ -154,6 +161,7 @@ impl Store for SqliteStore {
             let agent_id: String = row.try_get("agent_id").map_err(decode)?;
             let kind_json: String = row.try_get("kind").map_err(decode)?;
             let actor: Option<String> = row.try_get("actor").map_err(decode)?;
+            let on_behalf_of: Option<String> = row.try_get("on_behalf_of").map_err(decode)?;
             out.push(crate::store::CursoredEvent {
                 cursor: cursor as u64,
                 event: FleetEvent {
@@ -163,6 +171,7 @@ impl Store for SqliteStore {
                     agent_id,
                     kind: serde_json::from_str(&kind_json)?,
                     actor,
+                    on_behalf_of,
                 },
             });
         }
@@ -285,6 +294,7 @@ mod tests {
             agent_id: agent.into(),
             kind: crate::event::EventKind::AgentSpawned,
             actor: None,
+            on_behalf_of: None,
         }
     }
 

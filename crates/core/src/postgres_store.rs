@@ -21,6 +21,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (\
     agent_id   TEXT NOT NULL,\
     kind       TEXT NOT NULL,\
     actor      TEXT,\
+    on_behalf_of TEXT,\
     UNIQUE(stream_key, seq)\
 )";
 
@@ -38,21 +39,24 @@ impl PostgresStore {
         // lock even when the column already exists (the common case on every
         // boot after the first), so probe first and only run the ALTER when
         // it's actually missing. Mirrors SqliteStore::open's probe-then-ALTER.
-        let has_actor: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_name = 'events' AND column_name = 'actor' \
-             AND table_schema = current_schema())",
-        )
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| CoreError::Store(format!("inspecting postgres schema: {e}")))?;
-        if !has_actor {
-            crate::pg::ensure_schema(
-                &pool,
-                "ALTER TABLE events ADD COLUMN IF NOT EXISTS actor TEXT",
-                "events.actor column",
+        for column in ["actor", "on_behalf_of"] {
+            let present: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'events' AND column_name = $1 \
+                 AND table_schema = current_schema())",
             )
-            .await?;
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| CoreError::Store(format!("inspecting postgres schema: {e}")))?;
+            if !present {
+                crate::pg::ensure_schema(
+                    &pool,
+                    &format!("ALTER TABLE events ADD COLUMN IF NOT EXISTS {column} TEXT"),
+                    "events column",
+                )
+                .await?;
+            }
         }
         Ok(Self { pool })
     }
@@ -73,8 +77,8 @@ impl Store for PostgresStore {
     async fn append(&self, event: &FleetEvent) -> Result<()> {
         let kind = serde_json::to_string(&event.kind)?;
         sqlx::query(
-            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind, actor) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO events (stream_key, seq, ts, repo, agent_id, kind, actor, on_behalf_of) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(event.stream_key())
         .bind(event.seq as i64)
@@ -83,6 +87,7 @@ impl Store for PostgresStore {
         .bind(&event.agent_id)
         .bind(kind)
         .bind(&event.actor)
+        .bind(&event.on_behalf_of)
         .execute(&self.pool)
         .await
         .map_err(map_append_error)?;
@@ -91,7 +96,7 @@ impl Store for PostgresStore {
 
     async fn replay(&self, stream_key: &str, from_seq: u64) -> Result<Vec<FleetEvent>> {
         let rows = sqlx::query(
-            "SELECT seq, ts, repo, agent_id, kind, actor FROM events \
+            "SELECT seq, ts, repo, agent_id, kind, actor, on_behalf_of FROM events \
              WHERE stream_key = $1 AND seq >= $2 ORDER BY seq",
         )
         .bind(stream_key)
@@ -109,6 +114,7 @@ impl Store for PostgresStore {
             let agent_id: String = row.try_get("agent_id").map_err(decode)?;
             let kind_json: String = row.try_get("kind").map_err(decode)?;
             let actor: Option<String> = row.try_get("actor").map_err(decode)?;
+            let on_behalf_of: Option<String> = row.try_get("on_behalf_of").map_err(decode)?;
             events.push(FleetEvent {
                 seq: seq as u64,
                 ts,
@@ -116,6 +122,7 @@ impl Store for PostgresStore {
                 agent_id,
                 kind: serde_json::from_str(&kind_json)?,
                 actor,
+                on_behalf_of,
             });
         }
         Ok(events)
@@ -129,7 +136,7 @@ impl Store for PostgresStore {
         limit: usize,
     ) -> Result<Vec<crate::store::CursoredEvent>> {
         let rows = sqlx::query(
-            "SELECT global_ordinal, seq, ts, repo, agent_id, kind, actor FROM events \
+            "SELECT global_ordinal, seq, ts, repo, agent_id, kind, actor, on_behalf_of FROM events \
              WHERE global_ordinal > $1 ORDER BY global_ordinal LIMIT $2",
         )
         .bind(after_cursor as i64)
@@ -148,6 +155,7 @@ impl Store for PostgresStore {
             let agent_id: String = row.try_get("agent_id").map_err(decode)?;
             let kind_json: String = row.try_get("kind").map_err(decode)?;
             let actor: Option<String> = row.try_get("actor").map_err(decode)?;
+            let on_behalf_of: Option<String> = row.try_get("on_behalf_of").map_err(decode)?;
             out.push(crate::store::CursoredEvent {
                 cursor: cursor as u64,
                 event: FleetEvent {
@@ -157,6 +165,7 @@ impl Store for PostgresStore {
                     agent_id,
                     kind: serde_json::from_str(&kind_json)?,
                     actor,
+                    on_behalf_of,
                 },
             });
         }

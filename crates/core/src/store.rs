@@ -363,6 +363,7 @@ mod tests {
             repo: "r".into(),
             agent_id: agent.into(),
             actor: None,
+            on_behalf_of: None,
             kind: EventKind::Output {
                 stream: OutputStream::Stdout,
                 chunk: chunk.into(),

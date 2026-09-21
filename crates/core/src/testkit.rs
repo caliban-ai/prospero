@@ -672,6 +672,7 @@ pub async fn store_conformance(store: &dyn crate::store::Store) {
                 chunk: chunk.into(),
             },
             actor: None,
+            on_behalf_of: None,
         }
     }
 
@@ -701,19 +702,38 @@ pub async fn store_conformance(store: &dyn crate::store::Store) {
         agent_id: "actor-agent".into(),
         kind: EventKind::AgentSpawned,
         actor: Some("alice".into()),
+        on_behalf_of: None,
     };
     let unattributed = FleetEvent {
         seq: 2,
         actor: None,
+        on_behalf_of: None,
         kind: EventKind::AgentGone,
+        ..attributed.clone()
+    };
+    // #251: a client acting for someone else — both identities must survive,
+    // because the whole point is telling one token's spawns apart by person.
+    let delegated = FleetEvent {
+        seq: 3,
+        actor: Some("ariel".into()),
+        on_behalf_of: Some("discord:U123".into()),
+        kind: EventKind::AgentSpawned,
         ..attributed.clone()
     };
     store.append(&attributed).await.unwrap();
     store.append(&unattributed).await.unwrap();
+    store.append(&delegated).await.unwrap();
     let back = store.replay(&attributed.stream_key(), 0).await.unwrap();
-    assert_eq!(back.len(), 2);
+    assert_eq!(back.len(), 3);
     assert_eq!(back[0].actor.as_deref(), Some("alice"));
+    assert_eq!(back[0].on_behalf_of, None);
     assert_eq!(back[1].actor, None);
+    assert_eq!(back[2].actor.as_deref(), Some("ariel"));
+    assert_eq!(
+        back[2].on_behalf_of.as_deref(),
+        Some("discord:U123"),
+        "the asserted subject must survive a round trip, not just the token"
+    );
 }
 
 /// Retention contract: `prune(before_ts)` deletes events with `ts < before_ts`
@@ -730,6 +750,7 @@ pub async fn store_prune_conformance(store: &dyn crate::store::Store) {
             agent_id: "a".into(),
             kind: EventKind::AgentSpawned,
             actor: None,
+            on_behalf_of: None,
         }
     }
 
@@ -783,6 +804,7 @@ pub async fn store_fleet_replay_conformance(store: &dyn crate::store::Store) {
                 chunk: chunk.into(),
             },
             actor: None,
+            on_behalf_of: None,
         }
     }
 
@@ -885,6 +907,7 @@ pub async fn store_usage_conformance(store: &dyn crate::store::Store) {
             agent_id: agent.into(),
             kind,
             actor: None,
+            on_behalf_of: None,
         }
     }
 

@@ -194,6 +194,7 @@ mod tests {
                 chunk: format!("line {seq}"),
             },
             actor: None,
+            on_behalf_of: None,
         }
     }
 
@@ -209,6 +210,7 @@ mod tests {
                 cost_usd: 0.12,
             },
             actor: None,
+            on_behalf_of: None,
         }
     }
 

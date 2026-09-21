@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow};
 pub struct DaemonClient {
     base: String,
     token: Option<String>,
+    /// Who this client says it is acting for (#251), sent on every request.
+    on_behalf_of: Option<String>,
 }
 
 impl DaemonClient {
@@ -21,17 +23,35 @@ impl DaemonClient {
         while base.ends_with('/') {
             base.pop();
         }
-        Self { base, token }
+        Self {
+            base,
+            token,
+            on_behalf_of: None,
+        }
+    }
+
+    /// Name the person this client is acting for. Sent as
+    /// `X-Prospero-On-Behalf-Of`; prosperod records it beside the token's own
+    /// actor without verifying it.
+    #[must_use]
+    pub fn on_behalf_of(mut self, who: Option<String>) -> Self {
+        self.on_behalf_of = who;
+        self
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
 
-    /// Attach `Authorization: Bearer` when a token is configured.
+    /// Attach `Authorization: Bearer` when a token is configured, and the
+    /// asserted subject when one was named.
     fn authed(&self, request: ureq::Request) -> ureq::Request {
-        match &self.token {
+        let request = match &self.token {
             Some(token) => request.set("Authorization", &format!("Bearer {token}")),
+            None => request,
+        };
+        match &self.on_behalf_of {
+            Some(who) => request.set("X-Prospero-On-Behalf-Of", who),
             None => request,
         }
     }
