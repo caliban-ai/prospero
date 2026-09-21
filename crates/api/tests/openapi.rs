@@ -1,17 +1,15 @@
 //! The published OpenAPI document must describe the API this server serves.
 //!
 //! A spec is only worth publishing if it cannot quietly fall behind the router.
-//! Two hand-written lists compared against each other would never fail, so the
-//! coverage tests here derive one side from the server itself: they read
-//! `lib.rs`, which *is* the route table, and extract both the paths it registers
-//! and the verbs it answers on each. Adding a route — or a verb to an existing
-//! route — therefore fails the build until the spec describes it.
-//!
-//! This is deliberately literal rather than clever. axum's `Router` cannot be
-//! enumerated at runtime, and the alternative (probing a live router for 405s)
-//! needs a whole fleet harness to prove the same thing about the same file.
+//! The coverage tests here take one side from the server itself — the paths and
+//! verbs `lib.rs` registers (see `common`) — so adding a route, or a verb to an
+//! existing route, fails the build until the spec describes it.
+
+mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use common::{VERBS, registered};
 
 /// Surfaces the spec deliberately leaves out, each for a reason that is not
 /// "nobody got round to it".
@@ -23,92 +21,6 @@ const NOT_DOCUMENTED: &[&str] = &[
     // through it. Describing it as REST would misrepresent it.
     "/mcp",
 ];
-
-/// HTTP verbs axum's method routers expose, as they appear in source.
-const VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
-
-/// Every path `router_with_auth` registers and the verbs it serves on each,
-/// scraped from the router's own source.
-fn registered() -> BTreeMap<String, BTreeSet<String>> {
-    let src = include_str!("../src/lib.rs");
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-
-    for call in [".route(", ".nest_service("] {
-        let mut rest = src;
-        while let Some(at) = rest.find(call) {
-            let after = &rest[at + call.len()..];
-            let span = balanced_span(after);
-            let path = first_literal(span);
-            out.entry(path).or_default().extend(verbs_in(span));
-            rest = after;
-        }
-    }
-
-    // If the scraper ever stops matching, it must fail loudly rather than
-    // silently reporting that everything is covered.
-    assert!(
-        out.len() >= 25,
-        "scraped only {} routes from lib.rs — the scraper is broken, not the spec",
-        out.len()
-    );
-    let verbs: usize = out.values().map(BTreeSet::len).sum();
-    assert!(
-        verbs >= 30,
-        "scraped only {verbs} verbs from lib.rs — the scraper is broken, not the spec"
-    );
-    out
-}
-
-/// The text of a call's arguments, from just after its `(` to the matching `)`.
-fn balanced_span(after_open: &str) -> &str {
-    let mut depth = 1usize;
-    for (i, ch) in after_open.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &after_open[..i];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced route call");
-}
-
-/// The first string literal in a call's arguments — the path template.
-fn first_literal(span: &str) -> String {
-    let open = span.find('"').expect("route call without a path literal");
-    let rest = &span[open + 1..];
-    let end = rest.find('"').expect("unterminated route literal");
-    rest[..end].to_string()
-}
-
-/// The method-router verbs invoked within a route call.
-fn verbs_in(span: &str) -> BTreeSet<String> {
-    let bytes = span.as_bytes();
-    let mut found = BTreeSet::new();
-
-    for verb in VERBS {
-        let needle = format!("{verb}(");
-        let mut from = 0;
-        while let Some(at) = span[from..].find(&needle) {
-            let start = from + at;
-            // Reject a match inside a longer identifier, so the handler name in
-            // `get(handlers::get_metrics)` is not read as a second verb.
-            let preceded_by_ident = start > 0 && {
-                let prev = bytes[start - 1];
-                prev.is_ascii_alphanumeric() || prev == b'_'
-            };
-            if !preceded_by_ident {
-                found.insert((*verb).to_string());
-            }
-            from = start + needle.len();
-        }
-    }
-    found
-}
 
 /// The paths the document describes, and the verbs documented on each.
 fn documented(doc: &serde_json::Value) -> BTreeMap<String, BTreeSet<String>> {

@@ -71,6 +71,48 @@ short markers for `init`, `status` and `finished`. A `[gap]` line means the
 stream fell behind and recovered the dropped events from history. A
 `[persist-gap]` line means an event could not be written to durable storage.
 
+## Automations
+
+An automation spawns an agent on a cron schedule or a signed webhook. See
+[Automations](./api.md#automations) in the API guide for how triggers,
+signing and run history work.
+
+| Command | Purpose | Scope |
+|---|---|---|
+| `prospero automation add <id> <workspace> <task> [flags]` | Create an automation | admin |
+| `prospero automation ls` | List automations: trigger, workspace, last firing | read |
+| `prospero automation run <id>` | Fire one now, whatever its trigger | operate |
+| `prospero automation runs <id> [--limit N]` | Recent runs, newest first (default 20) | read |
+| `prospero automation disable <id>` | Stop it firing, without deleting it | admin |
+| `prospero automation enable <id>` | Let a disabled automation fire again | admin |
+| `prospero automation rm <id>` | Delete it and its run history | admin |
+
+`add` needs exactly one trigger:
+
+| Flag | Meaning |
+|---|---|
+| `--schedule <CRON>` | 5-field cron, in UTC, for example `"0 3 * * *"` |
+| `--webhook` | Fire on a signed `POST`. Prints the signing key |
+| `--label <TEXT>` | Label for the agents it spawns |
+| `--model <MODEL>` | Model override |
+| `--timeout-secs <SECONDS>` | Kill each spawned agent after this long |
+| `--shared-tree` | Run in the workspace's working tree instead of an isolated worktree |
+| `--disabled` | Create it without letting it fire yet |
+
+With `--webhook`, `add` prints the trigger URL and the signing key.
+**The key is shown once and can't be recovered.** Store it before you do
+anything else. With `--webhook`, the task can use `{{ dotted.path }}`
+placeholders filled from the request payload.
+
+Automations created with the CLI always run in the `supervised` permission
+posture. To create an `unattended` one, send `permission_posture` in the
+template through the API.
+
+```sh
+prospero automation add nightly myproj "Sweep the logs" --schedule "0 3 * * *"
+prospero automation add deploy-check myproj "Review the push to {{ ref }}" --webhook
+```
+
 ## Usage
 
 `prospero usage` reports cost, turns and outcomes per workspace over a window.
