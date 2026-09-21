@@ -162,6 +162,7 @@ mod tests {
                 deadline: deadline.into(),
             },
             actor: None,
+            on_behalf_of: None,
         };
         let events = vec![
             ev(1, "2026-09-20T00:00:10+00:00"),
@@ -172,6 +173,7 @@ mod tests {
                 agent_id: "a".into(),
                 kind: EventKind::AgentSpawned,
                 actor: None,
+                on_behalf_of: None,
             },
             ev(3, "2026-09-20T00:00:30+00:00"),
         ];

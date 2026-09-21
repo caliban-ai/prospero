@@ -43,3 +43,36 @@ were already open keep flowing until they reconnect.
 Every mutation logs `target=prospero_audit actor=<token name>`. On the local
 fleet, `AgentSpawned` and `AgentGone` events from spawn and remove also carry
 `actor`.
+
+## Acting for someone else
+
+A client that serves many people — a chat bridge, an MCP front end, a bot —
+holds **one** token, so `actor` alone cannot tell one person's agents from
+another's. Such a client may name the person it is acting for:
+
+```
+X-Prospero-On-Behalf-Of: discord:U123
+```
+
+The value is recorded on the events that request emits, as `on_behalf_of`,
+beside the token's own `actor`. Both appear in the audit line too:
+
+```
+target=prospero_audit actor=ariel asserted_on_behalf_of=discord:U123
+```
+
+**Prosperod does not verify this value.** It cannot: the credential it
+authenticated is the token, and it has no way to check that the person named
+really asked for anything. The header is the client's *assertion*, and it is
+stored as one. The token remains the authenticated identity and is always
+recorded, so a false claim is still attributable to the credential that made
+it — which is why the header needs no extra permission, and why you should
+trust `on_behalf_of` exactly as far as you trust the token beside it.
+
+It applies to any request, not just spawns, so kills and respawns carry it too.
+Send nothing and behaviour is unchanged; a daemon predating this simply ignores
+the header. Values are at most 128 characters and may not contain control
+characters — a malformed one is a `400` rather than a silent drop, so a client
+never believes it recorded an attribution it did not.
+
+- CLI: `prospero --on-behalf-of <who> spawn …`

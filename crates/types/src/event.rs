@@ -168,6 +168,16 @@ pub struct FleetEvent {
     /// events and when auth is disabled. Additive and optional on the wire (#2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// Who the requesting client said it was acting **for** (#251).
+    ///
+    /// A multi-user front end (Ariel, an MCP host, a bot) holds one token and
+    /// serves many people, so `actor` alone cannot tell their spawns apart.
+    /// This is the client's own assertion: prosperod cannot authenticate
+    /// someone else's user and does not try. `actor` remains the authenticated
+    /// identity, and both are recorded, so a reader can always see which
+    /// credential made the claim. Additive and optional on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
 }
 
 impl FleetEvent {
@@ -256,6 +266,7 @@ mod tests {
                 chunk: "hi".into(),
             },
             actor: None,
+            on_behalf_of: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: FleetEvent = serde_json::from_str(&s).unwrap();
@@ -281,6 +292,7 @@ mod tests {
             agent_id: "".into(),
             kind: EventKind::AgentGone,
             actor: None,
+            on_behalf_of: None,
         };
         assert_eq!(e.stream_key(), "repo:prospero");
     }
@@ -294,6 +306,7 @@ mod tests {
             agent_id: "a".into(),
             kind: EventKind::AgentSpawned,
             actor: None,
+            on_behalf_of: None,
         };
         let v = serde_json::to_value(&e).unwrap();
         assert!(v.get("actor").is_none(), "None must not serialize: {v}");
@@ -309,5 +322,39 @@ mod tests {
         e.actor = Some("alice".into());
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["actor"], "alice");
+    }
+
+    /// #251: `on_behalf_of` is additive. A payload written before it existed
+    /// still reads, and an event without one still serializes without it —
+    /// which is what lets an older daemon and a newer client interoperate.
+    #[test]
+    fn on_behalf_of_is_optional_and_omitted_when_none() {
+        let mut e = FleetEvent {
+            seq: 1,
+            ts: "2026-09-20T00:00:00Z".into(),
+            repo: "r".into(),
+            agent_id: "a".into(),
+            kind: EventKind::AgentSpawned,
+            actor: Some("ariel".into()),
+            on_behalf_of: None,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(
+            v.get("on_behalf_of").is_none(),
+            "None must not serialize: {v}"
+        );
+
+        let old = serde_json::json!({
+            "seq": 1, "ts": "t", "repo": "r", "agent_id": "a",
+            "kind": {"kind": "agent_spawned"}, "actor": "ariel"
+        });
+        let back: FleetEvent = serde_json::from_value(old).unwrap();
+        assert_eq!(back.actor.as_deref(), Some("ariel"));
+        assert_eq!(back.on_behalf_of, None);
+
+        e.on_behalf_of = Some("discord:U123".into());
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["on_behalf_of"], "discord:U123");
+        assert_eq!(v["actor"], "ariel", "both identities travel together");
     }
 }

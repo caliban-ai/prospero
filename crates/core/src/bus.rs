@@ -15,6 +15,12 @@ use crate::event::{FleetEvent, stream_key_for};
 
 /// One item from a per-stream live subscription (transport-agnostic).
 #[derive(Debug, Clone, PartialEq)]
+// `Event` is far larger than `Lagged`, which the lint flags because every
+// message costs the larger size. Boxing the payload is the usual fix and is
+// the wrong trade here: it would add an allocation to the path *every* agent's
+// output flows through, to save a handful of bytes on `Lagged` — which only
+// `InProcessBus` emits, and only when a subscriber falls behind.
+#[allow(clippy::large_enum_variant)]
 pub enum BusEvent {
     /// A live event on the subscribed stream.
     Event(FleetEvent),
@@ -120,6 +126,7 @@ mod tests {
             agent_id: agent.into(),
             kind: EventKind::AgentSpawned,
             actor: None,
+            on_behalf_of: None,
         }
     }
 

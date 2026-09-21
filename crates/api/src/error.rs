@@ -20,6 +20,9 @@ pub enum ApiError {
     Forbidden(String),
     /// Resource absent (e.g. `POST /api/session` with auth disabled) → 404.
     NotFound(String),
+    /// The request itself was malformed — today, an unusable
+    /// `X-Prospero-On-Behalf-Of` header (#251) → 400.
+    BadRequest(String),
 }
 
 impl ApiError {
@@ -62,6 +65,7 @@ impl IntoResponse for ApiError {
             ),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
             ApiError::Core(e) => {
                 let (status, kind) = match &e {
                     CoreError::AgentNotFound(_)

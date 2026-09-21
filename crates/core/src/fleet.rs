@@ -302,6 +302,7 @@ impl Emitter {
             agent_id: agent_id.to_string(),
             kind,
             actor: crate::actor::current(),
+            on_behalf_of: crate::actor::current_subject(),
         }
     }
 
@@ -2123,6 +2124,7 @@ mod tests {
                     deadline: "2026-09-20T00:00:00+00:00".into(),
                 },
                 actor: None,
+                on_behalf_of: None,
             })
             .await
             .unwrap();
@@ -2401,6 +2403,7 @@ mod tests {
             repo: "r".into(),
             agent_id: agent.into(),
             actor: None,
+            on_behalf_of: None,
             kind: EventKind::Output {
                 stream: OutputStream::Stdout,
                 chunk: chunk.into(),
@@ -2632,6 +2635,7 @@ mod tests {
                 agent_id: "a".into(),
                 kind: EventKind::AgentSpawned,
                 actor: None,
+                on_behalf_of: None,
             })
             .await
             .unwrap();
@@ -2643,6 +2647,7 @@ mod tests {
                 agent_id: "a".into(),
                 kind: EventKind::AgentGone,
                 actor: None,
+                on_behalf_of: None,
             })
             .await
             .unwrap();

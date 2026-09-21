@@ -246,6 +246,101 @@ async fn spawn_over_http_records_the_token_name_as_actor() {
     assert_eq!(spawned.actor.as_deref(), Some("ops"));
 }
 
+/// #251: a client that serves many people (Ariel holds one `operate` token for
+/// a whole Discord) can say who a spawn is for. Both identities are recorded —
+/// the token prosperod authenticated, and the person the token claimed.
+#[tokio::test]
+async fn a_spawn_can_name_the_person_it_is_for_beside_the_token() {
+    let h = setup().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/workspaces/repo/agents")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", h.operate))
+        .header("x-prospero-on-behalf-of", "discord:U123")
+        .body(Body::from(r#"{"prompt":"p"}"#.to_string()))
+        .unwrap();
+    let resp = h.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let spawned = spawned_event(&h, resp).await;
+    assert_eq!(
+        spawned.actor.as_deref(),
+        Some("ops"),
+        "the authenticated token must still be recorded, unchanged"
+    );
+    assert_eq!(spawned.on_behalf_of.as_deref(), Some("discord:U123"));
+}
+
+/// A client that sends nothing must behave exactly as it did before #251.
+#[tokio::test]
+async fn a_spawn_without_the_header_records_no_subject() {
+    let h = setup().await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/workspaces/repo/agents",
+            Some(&h.operate),
+            r#"{"prompt":"p"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let spawned = spawned_event(&h, resp).await;
+    assert_eq!(spawned.actor.as_deref(), Some("ops"));
+    assert_eq!(spawned.on_behalf_of, None);
+}
+
+/// The value reaches the event log and the audit log. A newline cannot even be
+/// put into an HTTP header — that protection belongs to the transport — but
+/// blank, whitespace, tab and over-long values all can be, and prosperod
+/// refuses them rather than quietly dropping an attribution the caller
+/// believed it had set.
+#[tokio::test]
+async fn an_unusable_on_behalf_of_is_refused_and_spawns_nothing() {
+    let h = setup().await;
+    let over_long = "x".repeat(200);
+    // An interior tab, not a leading one: surrounding whitespace is trimmed
+    // (harmless), but a control character *inside* the value is refused.
+    for bad in ["", "   ", "alice\tbob", over_long.as_str()] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/workspaces/repo/agents")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {}", h.operate))
+            .header("x-prospero-on-behalf-of", bad)
+            .body(Body::from(r#"{"prompt":"p"}"#.to_string()))
+            .unwrap();
+        let status = h.app.clone().oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "on-behalf-of {bad:?} should be refused"
+        );
+    }
+}
+
+/// Resolve the `AgentSpawned` event for the agent a spawn response names.
+async fn spawned_event(
+    h: &Harness,
+    resp: axum::response::Response,
+) -> prospero_core::event::FleetEvent {
+    let v: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = v["agent_id"].as_str().unwrap();
+    let key = prospero_core::event::stream_key_for("repo", id);
+    h.manager
+        .store()
+        .replay(&key, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| matches!(e.kind, prospero_core::EventKind::AgentSpawned))
+        .expect("the spawn must have been recorded")
+}
+
 fn cookie_from(resp: &axum::response::Response) -> String {
     let set = resp
         .headers()

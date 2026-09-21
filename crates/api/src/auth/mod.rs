@@ -197,6 +197,25 @@ pub fn required_access(method: &Method, route: &str) -> Access {
     }
 }
 
+/// Header by which a client says which person it is acting for (#251).
+pub const ON_BEHALF_OF_HEADER: &str = "x-prospero-on-behalf-of";
+
+/// Read and validate the claimed subject from a request's headers.
+///
+/// `Ok(None)` means the client asserted nothing, which is the overwhelmingly
+/// common case and must behave exactly as before. `Err` is a client mistake
+/// worth a `400`: silently dropping a malformed value would leave the caller
+/// believing its audit trail records something it does not.
+pub(crate) fn subject_header(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(raw) = headers.get(ON_BEHALF_OF_HEADER) else {
+        return Ok(None);
+    };
+    let text = raw
+        .to_str()
+        .map_err(|_| "on-behalf-of must be valid UTF-8 text".to_string())?;
+    prospero_core::actor::validate_subject(text).map(|s| Some(s.to_string()))
+}
+
 /// The `Authorization: Bearer` token, if present.
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -235,8 +254,18 @@ pub async fn middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // Resolve the claimed subject before anything else: it is orthogonal to
+    // authentication (it applies with auth disabled and on open routes), and a
+    // malformed one is the client's mistake either way.
+    let subject = match subject_header(req.headers()) {
+        Ok(subject) => subject,
+        Err(why) => {
+            tracing::debug!(target: "prospero_auth", %why, "rejected: bad on-behalf-of header");
+            return ApiError::BadRequest(why).into_response();
+        }
+    };
     if !auth.is_enabled() {
-        return next.run(req).await;
+        return prospero_core::actor::scope_with_subject(None, subject, next.run(req)).await;
     }
     let route = req
         .extensions()
@@ -244,7 +273,9 @@ pub async fn middleware(
         .map(|m| m.as_str().to_owned())
         .unwrap_or_default();
     let need = match required_access(req.method(), &route) {
-        Access::Open => return next.run(req).await,
+        Access::Open => {
+            return prospero_core::actor::scope_with_subject(None, subject, next.run(req)).await;
+        }
         Access::Requires(scope) => scope,
     };
     let Some(principal) = resolve_principal(&auth, req.headers()) else {
@@ -266,14 +297,18 @@ pub async fn middleware(
         return ApiError::Forbidden("cross-origin request".into()).into_response();
     }
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        // The audit line carries both identities, and names the claimed one as
+        // claimed: the token is what prosperod authenticated, the subject is
+        // only what that token asserted.
         tracing::info!(
             target: "prospero_audit", actor = %principal.token_name,
+            asserted_on_behalf_of = subject.as_deref().unwrap_or("-"),
             method = %req.method(), %route, "api mutation"
         );
     }
     let actor = principal.token_name.clone();
     req.extensions_mut().insert(principal);
-    prospero_core::actor::scope(Some(actor), next.run(req)).await
+    prospero_core::actor::scope_with_subject(Some(actor), subject, next.run(req)).await
 }
 
 #[cfg(test)]

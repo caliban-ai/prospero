@@ -265,6 +265,7 @@ mod tests {
             agent_id: agent.into(),
             kind: EventKind::AgentSpawned,
             actor: None,
+            on_behalf_of: None,
         }
     }
 

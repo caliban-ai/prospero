@@ -26,6 +26,13 @@ struct Cli {
     #[arg(long, env = "PROSPERO_TOKEN_FILE", global = true)]
     token_file: Option<std::path::PathBuf>,
 
+    /// Name the person this command is being run for, for a wrapper that
+    /// serves several people over one token (#251). Recorded beside the token
+    /// on the events the request emits. **Asserted, not verified** —
+    /// prosperod cannot authenticate someone else's user.
+    #[arg(long = "on-behalf-of", env = "PROSPERO_ON_BEHALF_OF", global = true)]
+    on_behalf_of: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -310,7 +317,7 @@ fn main() -> Result<()> {
     }
 
     let token = resolve_token(cli.token.clone(), cli.token_file.as_deref())?;
-    let client = DaemonClient::new(&cli.addr, token);
+    let client = DaemonClient::new(&cli.addr, token).on_behalf_of(cli.on_behalf_of.clone());
 
     match cli.command {
         Command::Workspace(WorkspaceCmd::Add { name, root }) => {

@@ -589,6 +589,7 @@ async fn events_endpoint_exposes_tool_and_cost_shapes_for_the_timeline() {
         agent_id: "agent001".to_string(),
         kind,
         actor: None,
+        on_behalf_of: None,
     };
     store
         .append(&ev(
@@ -674,6 +675,7 @@ async fn usage_endpoint_aggregates_cost_and_outcomes_by_workspace() {
         agent_id: agent.to_string(),
         kind,
         actor: None,
+        on_behalf_of: None,
     };
 
     store
@@ -1568,6 +1570,7 @@ fn out_event(seq: u64, agent: &str, chunk: &str) -> FleetEvent {
             chunk: chunk.into(),
         },
         actor: None,
+        on_behalf_of: None,
     }
 }
 
