@@ -122,6 +122,94 @@ async fn cli_drives_the_full_stack() {
         "follow should show streamed events: {out}"
     );
 
+    // --- `prospero usage` (#223) ---
+    //
+    // Seed one known finish into the real store so the numbers are exact
+    // rather than whatever the fake happens to report. `follow` above only
+    // returns once the spawned agent's stream has ended, so nothing else is
+    // writing usage while these assertions run.
+    let seeded = |seq, kind| prospero_core::FleetEvent {
+        seq,
+        ts: chrono::Utc::now().to_rfc3339(),
+        repo: "repo".into(),
+        agent_id: "usage-seed".into(),
+        kind,
+        actor: None,
+        on_behalf_of: None,
+    };
+    let store = manager.store();
+    store
+        .append(&seeded(
+            1,
+            prospero_core::EventKind::AgentFinished {
+                outcome: "EndOfTurn".into(),
+                cost_usd: 0.5,
+                turns: 3,
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&seeded(
+            2,
+            prospero_core::EventKind::StatusChanged {
+                from: prospero_core::AgentStatus::Running,
+                to: prospero_core::AgentStatus::Done,
+            },
+        ))
+        .await
+        .unwrap();
+
+    // `--json` is the server's own report for the same window. An explicit
+    // `--since` pins the start; `until` defaults to "now" on each request, so
+    // it is the one field that legitimately differs between the two reads.
+    let (ok, out) = run_cli(&base, &["usage", "--since", "2000-01-01", "--json"]);
+    assert!(ok, "usage --json failed: {out}");
+    let from_cli: serde_json::Value = serde_json::from_str(&out).expect("usage --json is JSON");
+    let direct_url = format!("{base}/api/usage?since=2000-01-01T00:00:00%2B00:00");
+    let direct: serde_json::Value =
+        tokio::task::spawn_blocking(move || ureq::get(&direct_url).call().unwrap().into_json())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(from_cli["since"], direct["since"], "same window start");
+    assert_eq!(
+        from_cli["groups"], direct["groups"],
+        "`usage --json` must be the server's report"
+    );
+    let repo_group = direct["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["workspace"] == "repo")
+        .expect("the seeded finish should appear under `repo`");
+
+    // The table shows the same numbers the report does.
+    let (ok, out) = run_cli(&base, &["usage", "--since", "2000-01-01"]);
+    assert!(ok, "usage failed: {out}");
+    let row = out
+        .lines()
+        .find(|l| l.starts_with("repo"))
+        .unwrap_or_else(|| panic!("usage table should have a repo row:\n{out}"));
+    let cost = format!("${:.4}", repo_group["cost_usd"].as_f64().unwrap());
+    assert!(row.contains(&cost), "row should show {cost}: {row}");
+
+    let (ok, out) = run_cli(&base, &["usage", "--workspace", "nope"]);
+    assert!(ok, "usage --workspace failed: {out}");
+    assert!(
+        out.contains("no usage recorded for workspace 'nope'"),
+        "a filter matching nothing should say so: {out}"
+    );
+
+    // A window the CLI cannot turn into a real bound is refused, not sent —
+    // the server would compare it as a string and answer for some other window.
+    let (ok, out) = run_cli(&base, &["usage", "--since", "yesterday"]);
+    assert!(!ok, "a bad --since must fail: {out}");
+    assert!(
+        out.contains("--since"),
+        "the error should name the flag: {out}"
+    );
+
     // --tool-allowlist reaches caliband as the spawned spec's allowlist.
     let (ok, out) = run_cli(
         &base,

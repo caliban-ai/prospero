@@ -71,6 +71,38 @@ short markers for `init`, `status` and `finished`. A `[gap]` line means the
 stream fell behind and recovered the dropped events from history. A
 `[persist-gap]` line means an event could not be written to durable storage.
 
+## Usage
+
+`prospero usage` reports cost, turns and outcomes per workspace over a window.
+It reads `GET /api/usage`, the same report the dashboard draws, so the
+numbers match what the dashboard shows for the same window. Needs **read**.
+
+```text
+$ prospero usage --since 2w
+usage 2026-09-06 20:50 UTC → 2026-09-20 20:50 UTC
+
+WORKSPACE        COST    TURNS    DONE  FAILED  KILLED  CRASHED
+alpha         $1.2500       40       3       1       0        0
+beta          $0.5000        2       1       1       0        0
+TOTAL         $1.7500       42       4       2       0        0
+```
+
+| Flag | Meaning |
+|---|---|
+| `--since <WHEN>` | How far back to look. A day count (`7d`, `2w`), a date (`2026-09-01`, from UTC midnight) or an RFC-3339 timestamp. Defaults to the last 7 days |
+| `--workspace <NAME>` | Only this workspace |
+| `--json` | Print the server's report as JSON instead of the table |
+
+Usage is recorded per UTC day, so `--since` looks back in whole days. It
+refuses `24h` rather than implying a precision the report doesn't have. A day
+count is resolved against the daemon's clock, the way the dashboard does it,
+so a skewed laptop clock can't clip the window.
+
+A workspace with no activity in the window doesn't appear in the report, so
+`--workspace` can't tell an idle workspace from a misspelled one. Either way it
+says that no usage was recorded. `killed` includes runs stopped by their
+`--timeout`, and a note under the table says how many.
+
 ## Tokens
 
 | Command | Purpose |

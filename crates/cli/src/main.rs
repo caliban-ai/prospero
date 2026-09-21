@@ -4,6 +4,7 @@
 //! for spawns; `--shared-tree` opts out.
 
 mod client;
+mod usage;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -63,6 +64,8 @@ enum Command {
     /// Manage automations: scheduled and webhook-triggered spawns.
     #[command(subcommand)]
     Automation(AutomationCmd),
+    /// Cost, turns and outcomes per workspace over a window.
+    Usage(UsageArgs),
     /// Manage API tokens (offline).
     #[command(subcommand)]
     Token(TokenCmd),
@@ -284,6 +287,21 @@ struct FollowArgs {
 }
 
 #[derive(Debug, Args)]
+struct UsageArgs {
+    /// How far back to look: a day count (`7d`, `2w`), a date (`2026-09-01`,
+    /// from UTC midnight) or an RFC-3339 timestamp. Defaults to the server's
+    /// window (the last 7 days).
+    #[arg(long)]
+    since: Option<String>,
+    /// Only this workspace.
+    #[arg(long)]
+    workspace: Option<String>,
+    /// Print the server's report as JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct AgentRef {
     /// Agent id.
     id: String,
@@ -469,6 +487,20 @@ fn main() -> Result<()> {
                 a.workspace,
                 if isolated { "worktree" } else { "shared tree" }
             );
+        }
+        Command::Usage(a) => {
+            let path = usage::usage_path(a.since.as_deref())?;
+            let mut report = client.get_json(&path)?;
+            if let Some(w) = &a.workspace {
+                report = usage::only_workspace(report, w);
+            }
+            if a.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let typed: prospero_types::UsageReport = serde_json::from_value(report)
+                    .context("the server's usage report did not match this CLI's version")?;
+                print!("{}", usage::render(&typed, a.workspace.as_deref()));
+            }
         }
         Command::Ls => {
             let fleet = client.get_json("/api/fleet")?;
@@ -743,6 +775,37 @@ mod tests {
             .is_err(),
             "--schedule and --webhook must conflict"
         );
+    }
+
+    #[test]
+    fn usage_defaults_to_the_servers_window_every_workspace_and_a_table() {
+        let cli = Cli::parse_from(["prospero", "usage"]);
+        match cli.command {
+            Command::Usage(a) => {
+                assert_eq!(a.since, None);
+                assert_eq!(a.workspace, None);
+                assert!(!a.json);
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from([
+            "prospero",
+            "usage",
+            "--since",
+            "2w",
+            "--workspace",
+            "repo",
+            "--json",
+        ]);
+        match cli.command {
+            Command::Usage(a) => {
+                assert_eq!(a.since.as_deref(), Some("2w"));
+                assert_eq!(a.workspace.as_deref(), Some("repo"));
+                assert!(a.json);
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
     }
 
     #[test]
