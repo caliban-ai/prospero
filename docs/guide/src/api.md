@@ -88,6 +88,13 @@ Errors come back as `{"error": "<message>", "kind": "<kind>"}`:
 | POST | `/api/agents/{id}/respawn` | operate | Replace an agent with a fresh one using the same spec |
 | POST | `/api/agents/{id}/input` | operate | Send a user message to an interactive agent (`202`) |
 | POST | `/api/agents/{id}/end-input` | operate | Signal end-of-input to an interactive agent (`202`) |
+| GET | `/api/automations` | read | Every automation. Never includes a webhook signing key |
+| POST | `/api/automations` | admin | Create an automation (`201`). A webhook's signing key is returned once, here |
+| DELETE | `/api/automations/{id}` | admin | Delete an automation and its run history |
+| PUT | `/api/automations/{id}/enabled` | admin | Enable or disable an automation without deleting it |
+| GET | `/api/automations/{id}/runs?limit=N` | read | Recent runs, newest first (default 50) |
+| POST | `/api/automations/{id}/run` | operate | Fire an automation now, whatever its trigger |
+| POST | `/api/automations/{id}/trigger` | open (signed) | Fire a webhook automation. The HMAC signature is the credential; see [Automations](#automations) |
 
 `HEAD` is accepted wherever `GET` is.
 
@@ -284,6 +291,76 @@ group has totals and a per-UTC-day `series`:
   }]
 }
 ```
+
+### Automations
+
+An automation spawns an agent on a trigger: a **cron schedule**, or a **signed
+webhook**. Automations are stored in the shared config store, so they need one.
+The local backend always has one. Under k8s, prosperod needs `--database-url`;
+without it, every automation route returns `405 method_not_allowed`.
+
+`POST /api/automations` takes:
+
+```json
+{
+  "id": "nightly-sweep",
+  "workspace": "myproj",
+  "trigger": { "kind": "cron", "schedule": "0 3 * * *" },
+  "template": { "task": "Sweep the logs and file anything new", "timeout_secs": 1800 },
+  "enabled": true
+}
+```
+
+`template` is the spawn each firing makes. `task` is required. The optional
+fields are `label`, `model`, `tool_allowlist`, `frontmatter_path`,
+`provider_ref`, `timeout_secs`, `isolation_worktree` (default `true`) and
+`permission_posture` (default `supervised`). An automation's runs are never
+interactive: nobody is there to answer. Creating an automation needs
+**admin**, because it can choose `unattended` for runs that nobody watches.
+
+**Schedules** are 5-field cron in UTC. prosperod checks them every
+`--automation-interval-ms` (default 30 s), so a firing can land up to one
+interval after its tick. If prosperod was down across several ticks, it fires
+once for the most recent tick when it comes back, rather than catching up
+every missed one. With several replicas, each tick fires exactly once: the
+replicas race to claim it in the config store, and only one wins.
+
+**Webhooks.** Create one with `"trigger": { "kind": "webhook" }`. The `201`
+response carries a `webhook_secret`. **This is the only time the key is
+returned.** It never appears in a listing, so store it when you create the
+automation. To fire it:
+
+```sh
+body='{"ref":"main","pusher":{"name":"ada"}}'
+sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$KEY" -hex | sed 's/^.* //')
+curl -X POST "$PROSPEROD/api/automations/deploy-check/trigger" \
+  -H "X-Prospero-Signature: sha256=$sig" -d "$body"
+```
+
+The signature is HMAC-SHA256 over the **raw request body**, exactly as sent,
+because re-encoding parsed JSON changes the bytes. The route takes no token:
+the signature is the credential, and it authorizes firing that one automation
+only. A missing or wrong signature is a `401`, as is triggering an automation
+that has no webhook (it has no key to sign with). A disabled automation is a
+`409`.
+
+A webhook's `task` can use `{{ dotted.path }}` placeholders, filled from the
+JSON payload: `"Review the push to {{ ref }} by {{ pusher.name }}"`. The
+payload only fills slots the automation's author placed. It is data, not
+instruction. Each value is cut at 4096 characters. If a placeholder's path is
+missing or `null`, the run is recorded as failed and no agent is spawned on a
+half-formed prompt.
+
+**Runs.** Every firing, whether schedule, webhook or manual (`POST …/run`), is
+recorded:
+
+```json
+{ "automation_id": "nightly-sweep", "fired_at": "2026-09-20T03:00:00Z",
+  "source": "schedule", "agent_id": "…" }
+```
+
+A failed firing has `error` in place of `agent_id`. The last 200 runs are kept
+for each automation. `GET …/runs` returns 50 by default.
 
 ## Events
 
