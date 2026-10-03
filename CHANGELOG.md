@@ -212,6 +212,16 @@ and, under Kubernetes, only when `--database-url` is set.
   checks it against the paths and verbs `lib.rs` registers — so a route can no
   longer ship undocumented. (#256) (#258)
 
+### Internal
+
+- `async-trait` bumped to 0.1.92. Up to 0.1.89 the macro put `#[must_use]` on
+  the method it desugars an `async fn` into, and since that method returns a
+  future — already `#[must_use]` — clippy 1.99 reports `double_must_use` on
+  macro-generated code, failing the lint gate for all seven `#[async_trait]`
+  traits in `prospero-core`. Nothing in the repo changed to cause it: CI resolves
+  `stable` at run time, so the build broke when stable moved from 1.97 to 1.99.
+  The upstream bump is the fix rather than an `allow`.
+
 ## [0.8.1] - 2026-09-16
 
 ### Fixed
