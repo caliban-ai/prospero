@@ -9,6 +9,209 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-03
+
+This release is about letting other programs drive and watch the fleet. One SSE
+connection now carries every agent's events with a resumable cursor, `/mcp`
+serves the fleet to agentic tools, and `GET /api/openapi.json` describes the
+whole REST surface so a client can generate its types instead of hand-writing
+them from prose. Spawns no longer have to be manual: an automation fires one on
+a cron schedule or a signed webhook. In Kubernetes, a per-session permission
+posture makes in-cluster agents usable at last, and when the operator refuses a
+task prospero reports the reason instead of leaving an unexplained dead agent.
+
+```admonish info
+**Companion versions.** The permission posture needs caliban v0.14.0 (for
+`SpawnSpec.permission_posture`) and caliban-operator v0.6.0 (which admits or
+refuses it and supplies the refusal reason). Automations need an event and
+config store shared by every replica, so they are enabled for the local backend
+and, under Kubernetes, only when `--database-url` is set.
+```
+
+### Added
+
+- **Fleet-wide event stream.** `GET /api/fleet/stream` carries every stream's
+  events on one connection, so watching a fleet no longer needs an SSE
+  connection per agent — and a client can finally learn about an agent it has
+  not seen yet. Each event's SSE `id:` is a fleet cursor: the store's durable
+  insertion order, the only total order a fleet has (per-agent `seq` cannot
+  order two agents, since both start at 1). `?from=<cursor>` resumes exclusively
+  after it, `?from=now` skips history, and an absent `from` replays from the
+  start. Every event is read from the durable store rather than the in-process
+  bus, so delivery is exactly-once across replicas and a slow client is never
+  skipped past. Two new `Store` methods (`replay_fleet`, `latest_fleet_cursor`)
+  are held to identical semantics across JSONL, SQLite and Postgres by a shared
+  conformance battery. Requires `read`. The dashboard's 5-second poll is gone,
+  replaced by the stream plus a 30-second reconcile so a dropped `EventSource`
+  cannot freeze the screen. (#219) (#247)
+
+- **The fleet over MCP.** `/mcp` serves the fleet over the Model Context
+  Protocol (streamable HTTP, `rmcp` — the same crate caliban drives its own
+  adapter with, so both speak an identical protocol version to a client). Nine
+  tools: list workspaces and agents, spawn, status, events, send and end input,
+  kill, respawn. It is a thin adapter over the same `FleetProvider` seam the
+  REST handlers already use, so both the local and Kubernetes backends work
+  through it and a tool cannot do what the HTTP API cannot. Two choices follow
+  from the consumer being a model rather than a person: history is capped (100
+  default, 500 max) and returns `truncated` + `next_from`, and a bad agent id is
+  a *tool* error naming the id rather than a protocol error, so the model can
+  correct itself instead of the session failing. Requires `operate`; workspace
+  administration is deliberately not exposed. (#218) (#249)
+
+- **Automations — scheduled and webhook-triggered spawns.** An automation is a
+  stored spawn template plus what fires it: a 5-field UTC cron schedule, or a
+  signed inbound webhook whose payload fills the template's
+  `{{ dotted.path }}` placeholders. Every firing is recorded, successful or not,
+  in a bounded per-automation history. Exactly-once across replicas is a
+  compare-and-set on the claimed tick rather than the lifecycle lease: a lease
+  makes a double fire unlikely but cannot rule it out, because ownership can
+  change hands between checking and spawning. The webhook signing key is
+  returned once at creation and lives only on core's own stored type, so no
+  response, listing or dashboard view can carry it; signatures are verified in
+  constant time over the raw request bytes, and an absent or malformed header is
+  a rejection. (#220) (#250)
+
+- **An OpenAPI 3.1 document at `GET /api/openapi.json`.** Clients — ariel first
+  — had to hand-write every request and response type from the prose guide. The
+  document is open like the guide it mirrors: it describes the API's shape,
+  carries no fleet data, and a client needs it before it has a credential.
+  Schemas come from the same `prospero-types` structs the handlers serialize, via
+  schemars, behind an off-by-default `openapi` feature so the wasm dashboard —
+  which shares those types — does not carry a schema generator it never calls.
+  Requests and responses are generated under their own contracts, because a type
+  is described differently when it is read than when it is written: a serde
+  default makes a field optional to a reader and says nothing to a writer, so
+  one schema per type would misdescribe one direction. Each operation records
+  its required scope in `x-prospero-scope`. The spec cannot quietly fall behind
+  the router — a test reads `lib.rs` for the paths and verbs it registers, so a
+  new route, a new verb, or a documented route that is not served all fail the
+  build. (#222) (#253)
+
+- **Per-session permission posture.** In-cluster agents were unusable: no human
+  is attached to a pod, so caliban's non-interactive gate denied every
+  Bash/Write/Edit and the refusal reached nobody. `permission_posture`
+  (`supervised` | `unattended`, defaulting to `supervised` everywhere,
+  fail-closed) is now carried on the spawn body, the CLI
+  (`--permission-posture`) and the `CalibanTask`. `unattended` requires an
+  `admin` scope — a per-field rule the route scope table cannot express — and
+  each grant is audited with the token name. Under Kubernetes what prospero
+  sends caliband is the posture the operator *admitted*
+  (`status.permissionPosture`), not the one requested, so an operator predating
+  the field cannot be used to bypass the Workspace's `agentPolicy`. Every agent
+  reports the posture it runs under, and unattended agents carry a `bypass` tag
+  in the dashboard. Also wires `spec.isolation.worktrees` through to
+  `SpawnSpec.isolation_worktree`. (#238, #226) (#240)
+
+- **Per-spawn wall-clock limit.** `timeout_secs` on a spawn
+  (`prospero spawn --timeout <SECONDS>`) caps an agent's wall-clock life. The
+  deadline is a log entry, not a timer — a timer dies with the replica that set
+  it — so prospero writes `DeadlineSet` to the shared event log, and a replica
+  that never spawned the agent reads it back the first time it polls.
+  Enforcement runs under the lifecycle lease so one replica acts on an expiry
+  rather than all of them racing to kill the same agent, and an `AgentTimedOut`
+  event is emitted *before* the kill, so history says why the agent stopped
+  instead of leaving a bare `killed` that reads like an operator did it.
+  `/api/usage` counts it as `timed_out` alongside `killed`, and the dashboard
+  gains the facet. Deliberately no `AgentStatus::TimedOut`: that enum is matched
+  exhaustively by clients and mirrors caliban's own lifecycle vocabulary, which
+  has no such state, so the distinct outcome is the event. (#221) (#248)
+
+- **Attribution to a person, not just a token.** `FleetEvent.actor` is the token
+  name, which is right for attributing a request to a credential and useless for
+  a client acting on behalf of other people — ariel holds one `operate` token
+  and serves a whole Discord, so every agent it spawned read `actor: "ariel"`
+  whoever asked for it. A request may now carry `X-Prospero-On-Behalf-Of`, and
+  the events it emits record it as `on_behalf_of` beside the unchanged `actor`. A
+  header rather than a spawn-body field, so it covers kill and respawn too and an
+  older daemon ignores it for free. The value is the client's assertion, not a
+  fact prosperod checked: the token remains the authenticated identity and is
+  always recorded, so a false claim stays attributable to the credential that
+  made it, and the audit line names it `asserted_on_behalf_of`. Validated rather
+  than sanitized, and bounded — it reaches the event log and the structured logs,
+  where a control character could forge what reads as a separate record — and a
+  malformed value is a 400 rather than a silent drop. Both SQL stores gain the
+  column. (#251) (#252)
+
+- **`prospero usage`.** `GET /api/usage` was rendered only by the dashboard. The
+  CLI now prints the same report as a table — one row per workspace, a total when
+  there is more than one, the window stated up front — or, with `--json`, the
+  server's own report.
+
+  ```
+  prospero usage [--since <7d|2w|YYYY-MM-DD|RFC-3339>] [--workspace <name>] [--json]
+  ```
+
+  `7d` / `2w` are resolved on the server's clock, as the dashboard does, so a
+  drifted client clock cannot clip the window; a date is its UTC midnight and a
+  timestamp is converted to UTC. An hour-level window such as `24h` is refused
+  with a reason, because usage is bucketed per UTC day and an hour would promise
+  a precision the report lacks. `--workspace` filters client-side on the raw
+  JSON, so `--json` keeps fields a newer server adds and both output modes show
+  the same rows. (#223) (#254)
+
+### Fixed
+
+- **`GET /api/usage` validates and normalizes its window.** Three bugs, each
+  reproduced by a test that failed first. A large `days` panicked the handler —
+  `?days=200000000` was enough, chrono overflowing on the subtraction rather
+  than inside `Duration::days` as the ticket guessed. `since` and `until` were
+  never parsed, so `?since=yesterday` returned 200 and a report for whatever
+  window that string happens to sort between, because the store compares
+  timestamps lexically on a TEXT column. And for that same reason the *spelling*
+  of a correct bound mattered: events are stamped `…00:00:00.5+00:00`, and a `Z`
+  bound sorts after the `.` of a fractional second, so an event half a second
+  into the window fell out of it — the handler already normalized its own
+  defaults but never client-supplied bounds. Both bounds are now parsed (400
+  `bad_request` on failure) and re-rendered, and `days` is checked against a
+  shared cap. (#255) (#257)
+
+- **One `Drained` agent no longer drops every agent on its caliband.** `wire.rs`
+  hand-mirrored caliband's control-plane types, and the mirror had already
+  drifted into a live bug: caliban's `AgentStatus` gained `Drained` that the
+  mirror never learned, and with no catch-all a single drained agent failed
+  deserialization of the entire `Listed` reply, dropping every agent on that
+  caliband from the poll. Those types are now re-exported from caliban's
+  published `caliban-contract` crate (pinned `=0.14.0`) — serde-only, so not the
+  wide coupling ADR-0003 rejected, and exactly what its own "revisit if" clause
+  asked for once the mirror became a drift source. `Drained` maps to `Done`:
+  terminal, not a failure. (#239) (#245)
+
+- **The operator's failure reason reaches the agent.** caliban-operator v0.6.0
+  refuses an `unattended` task whose Workspace does not allow it — phase
+  `Failed`, `Ready=False`, reason `PostureNotPermitted` — and creates no pod, so
+  there is no sandbox, no caliband and no agent-side error anywhere: the
+  operator's condition is the only account of what happened. prospero mapped the
+  phase to `failed` and dropped the rest, leaving an unexplained dead agent and
+  someone waiting for a sandbox that was never coming. `Agent` gains optional
+  `reason` and `detail`, omitted when unset, filled from the operator's `Ready`
+  condition and only when it is not `True`. Local agents never carry them, since
+  caliband reports their state directly with no admission step above it.
+  (#241) (#246)
+
+- **Tool results show in the dashboard inspector.** caliban has carried each tool
+  call's result on `ToolCallEnd` since caliban#391, but prospero's normalizer
+  read only `tool_use_id` and `is_error`, so the inspector still said the result
+  "needs a caliban-side change". `EventKind::ToolFinished` gains `result` and
+  `truncated`, both defaulted and skipped when empty, so events stored before
+  this change still deserialize. The normalizer takes caliban's bounded display
+  preview and applies its own 8,192-character cap, matching caliban's, so one
+  call cannot put an unbounded body into the event stores or SSE. (#236) (#237)
+
+### Documentation
+
+- **ADR-0011 — ACP is a second *drive protocol*, not a second lifecycle**
+  (status: proposed). Records an `AgentDriver` seam for an agent's data path with
+  caliband keeping every lifecycle, the protocol chosen per spawn and defaulting
+  to NDJSON, and the decision not to make prosperod a process supervisor. Amends
+  ADR-0003. (#217) (#244)
+
+- **Automations documented**, across both the API and CLI guides: the create
+  body and template defaults, cron semantics, webhook signing with a worked
+  `openssl` example, placeholder rules, and run history. The guide's routes table
+  now carries the same build-breaking guard as the OpenAPI document — a test
+  checks it against the paths and verbs `lib.rs` registers — so a route can no
+  longer ship undocumented. (#256) (#258)
+
 ## [0.8.1] - 2026-09-16
 
 ### Fixed
@@ -648,7 +851,8 @@ part of the P0 Kubernetes deployment (epic
 
 - Repository relicensed to **AGPL-3.0-only**, matching its sibling projects.
 
-[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/caliban-ai/prospero/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/caliban-ai/prospero/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/caliban-ai/prospero/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/caliban-ai/prospero/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/caliban-ai/prospero/compare/v0.6.0...v0.7.0
