@@ -96,6 +96,40 @@ to the in-cluster service account, then the ambient kubeconfig; pass
 events, which the dashboard shows as a collapsible segment. It is off by default
 because of the volume and privacy cost.
 
+Automations are stored in the shared config store, and the per-tick claim in that
+store is what keeps two replicas from firing the same schedule. There is no
+sqlite config store under `k8s`, so automations here need
+`PROSPERO_DATABASE_URL`; without it the automation routes answer
+`405 method_not_allowed` rather than firing once per pod.
+
+### Reporting agent lifecycle back to the operator
+
+The operator stays infrastructure-only and never becomes a caliband client, so it
+cannot tell "agent running" from "agent finished, pod still up". prosperod closes
+that loop: after each poll in which a pod's caliband answers, it server-side
+applies one `AgentsSettled` condition to the task's status under field manager
+`prospero` — `True`/`Succeeded` when every agent finished, `True`/`Failed` if any
+ended failed or crashed, otherwise `False`/`AgentsActive` (an idle interactive
+task is deliberately not settled). caliban-operator turns that into a terminal
+`Completed` or `Failed` phase, so a finished task leaves `Running`.
+
+This needs three things in the cluster:
+
+- RBAC `get` and `patch` on `calibantasks/status`. The
+  [prospero Helm chart](https://github.com/caliban-ai/helm-charts) grants it with
+  the `k8s` fleet backend selected. Without it prosperod logs a warning on every
+  poll and carries on — reporting is best-effort and never takes the observation
+  loop down.
+- caliban-operator **≥ v0.5.0**, which is the version that acts on the condition.
+- a `CalibanTask` CRD whose condition schema accepts it (caliban-crds ≥ v0.2.4,
+  for the conditions map-list).
+
+The apply carries only that one condition and never forces, so `phase`,
+`calibandEndpoint`, `sandboxRef`, `resolvedWorkspace` and the operator's own
+conditions stay owned by caliban-operator. Tasks whose caliband did not answer
+this pass are skipped rather than flipped on a transient error, and the write
+runs under the observer lease so clustered replicas don't race.
+
 Under `k8s`, prosperod serves `K8sFleet` over the shared event store and bus. It
 runs **no** local `FleetManager` and no poll loop; those are `local`-only
 machinery. When clustered, per-agent session-plane leases keep two replicas from
