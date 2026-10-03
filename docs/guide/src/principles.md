@@ -68,6 +68,15 @@ the ADR(s) it derives from; on supersession, keep this page in sync.
    ([ADR 0004](./adr/0004-hybrid-live-and-durable-observability.md),
    [ADR 0008](./adr/0008-k8s-fleet-backend.md))
 
+9. **Authorize declaratively, fail closed, attribute everything.** Every
+   non-probe request carries a named token with one hierarchical scope
+   (`read` < `operate` < `admin`), checked by middleware against a per-route
+   scope table that defaults an unlisted route to `admin`. Tokens are declared
+   as hashes in a file, never stored in a database, so revocation is a file (or
+   Secret) change rather than shared cross-replica state — and every mutation is
+   attributed to the token's name.
+   ([ADR 0010](./adr/0010-inbound-api-authentication.md))
+
 ## Inviolable invariants
 
 These hold across every backend and topology; a change that breaks one is a
@@ -93,6 +102,15 @@ design change, not a refactor.
 - **The fake is a faithful double.** The control plane is testable end-to-end
   against an in-process fake caliban, so backends are correct by construction,
   not by hope. ([ADR 0007](./adr/0007-fake-caliban-test-harness.md))
+- **Authorization fails closed.** A route absent from the scope table requires
+  `admin`; with tokens configured every request outside the small open set
+  (probes, the dashboard shell, sign-in) needs a credential, loopback included;
+  and serving unauthenticated beyond loopback must be asked for explicitly.
+  ([ADR 0010](./adr/0010-inbound-api-authentication.md))
+- **Authenticated identity and asserted identity never merge.** `actor` is the
+  token prosperod authenticated. `on_behalf_of` is what the client *said*, is
+  never verified, and is always recorded beside the credential that claimed it.
+  ([ADR 0010](./adr/0010-inbound-api-authentication.md))
 
 ## Scale-out roadmap
 
