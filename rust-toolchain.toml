@@ -1,0 +1,18 @@
+# The toolchain this repo builds with, pinned so a new stable release cannot break
+# a build whose code never changed (#261). CI installs a toolchain with
+# `dtolnay/rust-toolchain@stable`, but rustup honours this file when cargo runs, so
+# this is the version that actually compiles — in CI and on a contributor's machine
+# alike. Upgrading is a reviewable commit here, not something that happens between
+# runs: stable moving 1.97 -> 1.99 is what broke #259.
+#
+# `targets` matters as much as `channel`. ci.yml passes `targets:` to the action,
+# which applies to the toolchain the *action* installs, not the one this file
+# selects; without wasm32 listed here the `prospero-types builds for wasm32` and
+# `dashboard wasm build` jobs fail with "can't find crate for `core`".
+# crates/dashboard is a separate cargo workspace, but rustup walks up, so this
+# file governs it too.
+[toolchain]
+channel    = "1.99.0"
+components = ["rustfmt", "clippy"]
+targets    = ["wasm32-unknown-unknown"]
+profile    = "minimal"
