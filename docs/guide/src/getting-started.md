@@ -111,7 +111,9 @@ offers:
 - launching, killing, respawning and removing agents, and replying to
   interactive agents;
 - registering, configuring and removing workspaces;
-- a live stream and timeline for each agent, with a tool-call inspector;
+- a live stream and timeline for each agent, with a tool-call inspector that
+  shows a call's input *and* its result, and a collapsible "Thinking" segment
+  when the daemon is streaming model reasoning (`PROSPERO_INCLUDE_THINKING`);
 - a System, Light or Dark theme setting.
 
 Controls the active backend can't serve are hidden (`GET /api/capabilities`).

@@ -11,7 +11,10 @@ It has three parts:
 - **`prospero`**, an operator CLI. It is a thin HTTP client over that API.
 - **The dashboard**, a Rust → WASM app served by `prosperod` at `/`.
 
-The CLI, the dashboard and any other client all use the same public API.
+The CLI, the dashboard and any other client all use the same public API. That API
+is published as an [OpenAPI 3.1 document](./api.md#the-openapi-document), and
+`prosperod` also exposes the fleet as an [MCP server](./api.md#mcp) at `/mcp`, so
+an agentic client can drive it with tools instead of hand-written HTTP calls.
 
 ## How it works
 
@@ -29,11 +32,17 @@ other clients ┘                                └─ k8s backend:   CalibanTa
   isolated git worktree by default. Sharing the working tree is an explicit
   opt-out.
 - **Manage.** List, kill, respawn and remove agents, and send input to interactive
-  agents.
+  agents. A spawn may carry a wall-clock timeout that Prospero — not the agent —
+  enforces, and a permission posture that decides whether tool calls needing
+  approval wait for a human.
 - **Observe.** Prospero turns caliban's stream output into a stable `FleetEvent`
-  type. Events go out live over SSE and are also written to a durable store
-  (sqlite standalone, Postgres clustered), so an agent's history survives after
-  it finishes.
+  type. Events go out live over SSE — per agent, or as one
+  [fleet-wide stream](./api.md#the-fleet-stream) — and are also written to a
+  durable store (sqlite standalone, Postgres clustered), so an agent's history
+  survives after it finishes. `/api/usage` aggregates that history into cost,
+  turns and outcomes per workspace.
+- **Automate.** An [automation](./api.md#automations) spawns an agent on a cron
+  schedule or a signed webhook, so recurring work needs nobody at a keyboard.
 
 Prospero talks to caliban only through its wire format. It depends on no caliban
 crate ([ADR 0003](./adr/0003-couple-to-caliban-via-ndjson-wire-format.md)).
@@ -45,16 +54,24 @@ crate ([ADR 0003](./adr/0003-couple-to-caliban-via-ndjson-wire-format.md)).
 | [caliban](https://github.com/caliban-ai/caliban) | The agent harness, plus `caliband`, the supervisor Prospero drives on the local backend. |
 | **prospero** | This project: the fleet control plane. |
 | [gonzalo](https://github.com/caliban-ai/gonzalo) | A shareable persistence layer for caliban. |
-| [ariel](https://github.com/caliban-ai/ariel) | A chat bridge for the fleet: Discord first, then Slack and Teams. |
-| caliban-operator | Reconciles `CalibanTask` resources into caliband pods for Prospero's k8s backend ([ADR 0008](./adr/0008-k8s-fleet-backend.md)). |
+| [ariel](https://github.com/caliban-ai/ariel) | A chat bridge for the fleet: Discord today, Slack and Teams planned. |
+| [caliban-operator](https://github.com/caliban-ai/caliban-operator) | Reconciles `CalibanTask` and `Workspace` resources into caliband pods for Prospero's k8s backend ([ADR 0008](./adr/0008-k8s-fleet-backend.md)). |
 
 **Ariel** is a separate service that brings fleet notifications, commands and
 conversation into chat. It uses Prospero only through the public HTTP + SSE API
 described in this guide, typically with an `operate`-scoped
 [API token](./api-auth.md). It does not depend on any Prospero crate. Ariel keeps
-its own identity, channel configuration and audit data in gonzalo. It is in early
-implementation, tracked in
-[prospero#67](https://github.com/caliban-ai/prospero/issues/67).
+its own identity, channel configuration and audit data in gonzalo.
+
+Ariel is released and running: the current release ships `/ariel status`,
+`/ariel spawn`, `/ariel kill` and `/ariel respawn` for driving the fleet from
+Discord, plus `/ariel channel`, `/ariel configure` and `/ariel invite` for
+channel administration and onboarding, with every command authorized against the
+person's role and the channel's ceiling and audited in gonzalo. It is distributed
+as the container image `ghcr.io/caliban-ai/ariel` rather than on crates.io, and
+it can reach a prosperod over `https` through an ingress as well as in-cluster.
+See [Ariel's guide](https://caliban-ai.github.io/ariel/) and its
+[releases](https://github.com/caliban-ai/ariel/releases) for the current state.
 
 ## Where to go next
 
