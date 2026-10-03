@@ -121,7 +121,7 @@ only the fields it uses:
 | `sources` | k8s | `[{name, repo, ref?, path}]` git checkouts |
 | `providers` | k8s | `[{name, kind, base_url?, model?, credentials_ref?: {secret_name, key}}]` |
 | `default_provider` | k8s | Provider bound when a spawn names none |
-| `isolation` | k8s | `{runtime_class?, worktrees?}` |
+| `isolation` | k8s | `{runtime_class?, worktrees?}`. `runtime_class` is a Kubernetes RuntimeClass (`gvisor`, `kata`) the operator puts on the agent's pod. `worktrees` is stored but does not reach an API-spawned agent — see [Spawning](#spawning) |
 
 On the local backend, `POST` returns `201` and `PUT` returns `204`. Both apply
 immediately; setting the config restarts the workspace's caliband. Under k8s the
@@ -152,9 +152,28 @@ applies:
 }
 ```
 
-Only `prompt` is required. `isolation` defaults to a git worktree; only the exact
-string `"shared"` opts out. `provider_ref` picks a named provider under k8s and is
+Only `prompt` is required. `provider_ref` picks a named provider under k8s and is
 ignored by the local backend, which uses the workspace's stored config.
+
+`isolation` is honoured by the **local backend**, where it defaults to a git
+worktree and only the exact string `"shared"` opts out — an unrecognized value
+isolates rather than silently dropping isolation.
+
+**Under k8s, a spawn runs in the workspace's shared checkout.** The spawn's
+`isolation` is deliberately not written to the `CalibanTask` — per-run isolation
+is not a field the frozen CRD has, and isolation defaults are meant to live on
+the `Workspace`. prospero reads the worktree strategy back from the task's
+`spec.isolation.worktrees` and isolates only on the exact value `"per-source"`,
+but nothing populates that field for a task prospero created: prospero leaves it
+unset, and caliban-operator's only `Workspace`-to-task isolation fallback is
+`runtime_class`, which it applies straight to the pod. So an agent spawned
+through the API gets the shared checkout whatever the request or the workspace
+config says, and `--shared-tree` makes no difference there.
+
+Worktree isolation by default
+([ADR 0005](./adr/0005-worktree-isolation-by-default-for-spawns.md)) is
+therefore a local-backend property today: parallel agents on one k8s workspace
+share a tree and can step on each other.
 
 `timeout_secs` caps the agent's wall-clock life. Prospero — not the agent —
 enforces it: the deadline is written to the event log at spawn, so it survives

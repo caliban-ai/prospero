@@ -107,7 +107,7 @@ Open <http://127.0.0.1:7878/>. The dashboard uses the same API as the CLI and
 offers:
 
 - the fleet overview, with spend, turns and outcome charts over a 24h, 7d or 30d
-  window;
+  window, and a `bypass` tag on any agent running unattended;
 - launching, killing, respawning and removing agents, and replying to
   interactive agents;
 - registering, configuring and removing workspaces;

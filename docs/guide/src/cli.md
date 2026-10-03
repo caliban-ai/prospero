@@ -60,7 +60,7 @@ Each call replaces the whole configuration. Flags you leave out are cleared.
 |---|---|
 | `--label <TEXT>` | Human-readable label |
 | `--model <MODEL>` | Model override |
-| `--shared-tree` | Run in the workspace's working tree instead of an isolated git worktree |
+| `--shared-tree` | Run in the workspace's working tree instead of an isolated git worktree. Local backend only — under k8s every spawn uses the shared checkout regardless, see [Spawning](./api.md#spawning) |
 | `--interactive` | Wait for operator input after each run instead of finishing |
 | `--tool-allowlist <TOOL>` | Restrict the agent to these tools; repeat once per tool |
 | `--frontmatter <PATH>` | Agent-template / frontmatter markdown file |

@@ -94,6 +94,11 @@ design change, not a refactor.
   skip-and-log. ([ADR 0003](./adr/0003-couple-to-caliban-via-ndjson-wire-format.md))
 - **Isolation is the default, opt-out is explicit.** No spawn shares the working
   tree unless a caller says so. ([ADR 0005](./adr/0005-worktree-isolation-by-default-for-spawns.md))
+  Held by the local backend. Under k8s per-run isolation is not a `CalibanTask`
+  field and nothing populates the workspace-level one for an API-spawned task,
+  so agents there share the checkout — see
+  [Spawning](./api.md#spawning). The invariant stands as the decision; the k8s
+  backend does not yet meet it.
 - **Backends are interchangeable behind the trait.** Local and K8s implement the
   same `FleetProvider` verbs and emit to the same observability plane; the API
   request path is backend-agnostic.
