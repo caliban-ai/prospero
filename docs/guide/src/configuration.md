@@ -12,6 +12,7 @@ environment variable. Run `prosperod --help` for the authoritative list.
 | `--host` | `PROSPERO_HOST` | `local` | Host identity reported in fleet snapshots |
 | `--fleet-backend` | `PROSPERO_FLEET` | `local` | `local` (caliband over Unix sockets) or `k8s` |
 | `--poll-interval-ms` | — | `2000` | How often the local backend polls each caliband |
+| `--automation-interval-ms` | — | `30000` | How often due [automation](./api.md#automations) schedules are checked. Cron resolves to whole minutes, so this bounds only how *late* a firing can be |
 | `--no-autostart` | — | off | Don't start caliband for a workspace that has none running |
 | `--caliband-bin` | — | `caliband` | caliband binary used for autostart |
 | `--default-env KEY=VALUE` | — | — | Env var applied under every workspace's config (repeatable) |
@@ -52,6 +53,13 @@ Where history and configuration live depends on whether a Postgres URL is set:
 | Stream ownership | this process owns every stream | per-stream leases, so replicas fail over without double-writing |
 
 The schema is created on startup; there is no separate migration step.
+
+[Automations](./api.md#automations) live in the same config store, and the store
+is what arbitrates which replica fires a given tick. The local backend always
+has one — sqlite standalone, Postgres clustered. The **k8s** backend has no
+sqlite config store, so automations there need `--database-url`; without it the
+automation routes answer `405 method_not_allowed` rather than firing once per
+pod.
 
 Clustered-only flags:
 

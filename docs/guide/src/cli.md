@@ -11,6 +11,7 @@
 | `--addr <URL>` | `PROSPERO_ADDR` | `http://127.0.0.1:7878` | Base URL of `prosperod` |
 | `--token <TOKEN>` | `PROSPERO_TOKEN` | — | API token for an authenticated daemon |
 | `--token-file <PATH>` | `PROSPERO_TOKEN_FILE` | — | File containing the token (trailing whitespace trimmed); wins over `--token` |
+| `--on-behalf-of <WHO>` | `PROSPERO_ON_BEHALF_OF` | — | Name the person this command is run for, recorded beside the token on the events it causes. Asserted, not verified; at most 128 characters and no control characters. See [Acting for someone else](./api-auth.md#acting-for-someone-else) |
 
 ```admonish note
 The CLI and `prosperod` both read `PROSPERO_ADDR`, but they expect different
@@ -75,7 +76,8 @@ stream fell behind and recovered the dropped events from history. A
 
 An automation spawns an agent on a cron schedule or a signed webhook. See
 [Automations](./api.md#automations) in the API guide for how triggers,
-signing and run history work.
+signing and run history work. The dashboard does not show automations, so these
+commands and the API are how you manage them.
 
 | Command | Purpose | Scope |
 |---|---|---|

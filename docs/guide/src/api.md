@@ -52,8 +52,8 @@ Errors come back as `{"error": "<message>", "kind": "<kind>"}`:
 | 400 | `bad_request` | A malformed request: for example a `/api/usage` window that isn't a timestamp, or an invalid `X-Prospero-On-Behalf-Of` header |
 | 401 | `unauthorized` | Missing, invalid or expired credential (with `WWW-Authenticate: Bearer realm="prospero"`) |
 | 403 | `forbidden` | Scope too low, or a cross-origin mutation made with a session cookie |
-| 404 | `not_found` | Unknown agent or workspace |
-| 405 | `method_not_allowed` | The active fleet backend has no workspace admin plane wired |
+| 404 | `not_found` | Unknown agent, workspace or automation |
+| 405 | `method_not_allowed` | The active fleet backend has no workspace admin plane wired, or automations have no config store |
 | 409 | `invalid_state`, `conflict` | For example, registering a workspace name that already exists |
 | 502 | `protocol` | caliband answered with something unexpected |
 | 503 | `unreachable` | caliband (or the fleet backend) could not be reached |
@@ -180,6 +180,13 @@ posture the operator admitted (`status.permissionPosture`), so a cluster whose
 operator predates that field (caliban-operator ≤ v0.5.0) runs every session
 supervised. It needs caliban ≥ v0.14.0 in the sandbox.
 
+Each agent in `/api/fleet` and `/api/agents/{id}` reports its own
+`permission_posture` — the posture it is **actually** running under, not the one
+the spawn asked for. Under k8s that is the operator's `status.permissionPosture`;
+a task whose status does not carry one (an operator predating the field) reads
+back as `supervised`, which is also how an absent field deserializes from an
+older prosperod's snapshot.
+
 The response is `201`:
 
 ```json
@@ -286,11 +293,16 @@ group has totals and a per-UTC-day `series`:
   "since": "…", "until": "…",
   "groups": [{
     "workspace": "myproj", "cost_usd": 1.75, "turns": 6,
-    "outcomes": { "done": 2, "failed": 0, "killed": 1, "crashed": 0 },
+    "outcomes": { "done": 2, "failed": 0, "killed": 1, "crashed": 0, "timed_out": 1 },
     "series": [{ "day": "2026-09-01", "cost_usd": 0.75, "turns": 4, "outcomes": { "…": 0 } }]
   }]
 }
 ```
+
+`outcomes` always carries all five keys. `timed_out` is a breakdown *of*
+`killed`, not a fifth terminal state: those runs are counted in both, so summing
+`done + failed + killed + crashed` gives the total and adding `timed_out` would
+double-count.
 
 ### Automations
 
@@ -373,14 +385,20 @@ Every observation becomes a `FleetEvent`:
   "repo": "myproj",
   "agent_id": "…",
   "kind": { "kind": "tool_started", "id": "tu_1", "name": "Read", "input": {} },
-  "actor": "alice"
+  "actor": "alice",
+  "on_behalf_of": "discord:U123"
 }
 ```
 
 `seq` increases monotonically within an agent's stream. `repo` holds the owning
 workspace name; the field keeps its original name for wire compatibility.
 `actor` appears only on events a token-authenticated request caused directly,
-which today means local-fleet spawn and remove.
+which today means local-fleet spawn and remove. `on_behalf_of` is the person the
+client said it was acting for, from the `X-Prospero-On-Behalf-Of` header; it
+appears beside `actor` on the same events and is the client's unverified
+assertion, not an authenticated identity — see
+[Acting for someone else](./api-auth.md#acting-for-someone-else). Both fields are
+omitted entirely when absent.
 
 | `kind` | Fields | Meaning |
 |---|---|---|
@@ -392,6 +410,8 @@ which today means local-fleet spawn and remove.
 | `tool_started` | `id`, `name`, `input` | A tool call began |
 | `tool_finished` | `id`, `name`, `ok`, `result`?, `truncated`? | A tool call ended. Pair it with its start by `id`; `name` is usually empty. `result` is what the tool returned as text, capped at 8,192 characters; `truncated: true` means it is only the start of a longer result. Both are omitted when absent (events recorded before results were captured, or no result sent) |
 | `agent_finished` | `outcome`, `cost_usd`, `turns` | Terminal accounting |
+| `deadline_set` | `deadline` | The spawn carried `timeout_secs`; this is the RFC-3339 instant it implies, recorded at spawn so it outlives the replica that set it |
+| `agent_timed_out` | `deadline` | The agent passed that deadline and prospero killed it. Emitted *before* the `status_changed` to `killed`, so history says why |
 | `agent_gone` | — | The agent left caliband's registry |
 | `repo_health` | `state` | A workspace's caliband became `healthy` or `unreachable` |
 | `store_persist_failed` | `lost_seq`, `detail` | Event `lost_seq` went out live but is missing from durable history |
