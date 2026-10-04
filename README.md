@@ -37,7 +37,11 @@ custom resources instead of local calibands (ADR 0008).
   codebase runs in isolated git worktrees by default; pass `--shared-tree` to opt
   out.
 - **Manage.** List, kill, respawn and remove agents fleet-wide, and send input to
-  interactive agents.
+  interactive agents. A spawn may carry a wall-clock timeout prosperod enforces
+  and a permission posture for tool calls needing approval.
+- **Automate.** An automation spawns an agent on a cron schedule or a signed
+  webhook, claimed per tick in the shared config store so clustered replicas
+  fire it exactly once.
 - **Observe.** Prospero uses a hybrid model. It polls each caliband for live
   status and attaches to per-agent streams while they're active, converting
   caliban's stream-json into a stable `FleetEvent` type. Events go out live over
@@ -54,11 +58,17 @@ client and does not depend on the caliban crates.
   `caliband` supervisor that Prospero drives.
 - [gonzalo](https://github.com/caliban-ai/gonzalo) is a shareable persistence
   layer for caliban.
-- [ariel](https://github.com/caliban-ai/ariel) is a chat bridge for the fleet:
-  Discord first, then Slack and Teams. It uses Prospero only through the public
-  HTTP + SSE API (no crate dependency) and keeps identity, channel config and
-  audit data in gonzalo. It is in early implementation; tracking issue:
-  [#67](https://github.com/caliban-ai/prospero/issues/67).
+- [ariel](https://github.com/caliban-ai/ariel) is the chat bridge for the fleet:
+  Discord today, Slack and Teams planned. It uses Prospero only through the
+  public HTTP + SSE API (no crate dependency) and keeps identity, channel config
+  and audit data in gonzalo. It is
+  [released](https://github.com/caliban-ai/ariel/releases) and shipped as the
+  container image `ghcr.io/caliban-ai/ariel`: `/ariel status`, `spawn`, `kill`
+  and `respawn` drive the fleet from chat, with role- and channel-scoped
+  authorization audited in gonzalo.
+- [caliban-operator](https://github.com/caliban-ai/caliban-operator) reconciles
+  the `CalibanTask` and `Workspace` resources Prospero's k8s backend writes into
+  sandboxed caliband pods (ADR 0008).
 
 ## Crates
 
@@ -185,8 +195,17 @@ Pre-1.0; see [`CHANGELOG.md`](CHANGELOG.md). Shipped so far:
 - standalone (sqlite) and clustered (Postgres, leased stream ownership)
   topologies;
 - age-based event retention;
-- scoped API tokens;
-- the WASM dashboard.
+- scoped API tokens, plus an asserted `X-Prospero-On-Behalf-Of` attribution for
+  clients that serve many people over one token;
+- the WASM dashboard;
+- an OpenAPI 3.1 document at `GET /api/openapi.json`, generated from the same
+  types the server serializes;
+- an MCP server at `/mcp`, so an agentic client can drive the fleet with tools;
+- a fleet-wide SSE stream (`GET /api/fleet/stream`) alongside the per-agent one;
+- automations: scheduled and signed-webhook spawns;
+- per-spawn wall-clock timeouts and per-session permission postures;
+- usage reporting (`GET /api/usage`, `prospero usage`): cost, turns and outcomes
+  per workspace per day.
 
 Not yet covered: automated tests against a real caliban binary and a live model.
 The suite runs against the in-process fake.

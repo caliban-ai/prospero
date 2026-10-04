@@ -33,3 +33,4 @@
   - [ADR 0008 · `K8sFleet` — a Kubernetes `FleetProvider` backend](./adr/0008-k8s-fleet-backend.md)
   - [ADR 0009 · License prospero under AGPL-3.0-only](./adr/0009-agpl-3.0-only-license.md)
   - [ADR 0010 · Inbound API authentication with scoped, declarative tokens](./adr/0010-inbound-api-authentication.md)
+  - [ADR 0011 · ACP is a second **drive protocol**, not a second lifecycle](./adr/0011-acp-as-a-second-drive-protocol.md)

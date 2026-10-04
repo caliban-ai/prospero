@@ -68,6 +68,15 @@ the ADR(s) it derives from; on supersession, keep this page in sync.
    ([ADR 0004](./adr/0004-hybrid-live-and-durable-observability.md),
    [ADR 0008](./adr/0008-k8s-fleet-backend.md))
 
+9. **Authorize declaratively, fail closed, attribute everything.** Every
+   non-probe request carries a named token with one hierarchical scope
+   (`read` < `operate` < `admin`), checked by middleware against a per-route
+   scope table that defaults an unlisted route to `admin`. Tokens are declared
+   as hashes in a file, never stored in a database, so revocation is a file (or
+   Secret) change rather than shared cross-replica state — and every mutation is
+   attributed to the token's name.
+   ([ADR 0010](./adr/0010-inbound-api-authentication.md))
+
 ## Inviolable invariants
 
 These hold across every backend and topology; a change that breaks one is a
@@ -85,6 +94,11 @@ design change, not a refactor.
   skip-and-log. ([ADR 0003](./adr/0003-couple-to-caliban-via-ndjson-wire-format.md))
 - **Isolation is the default, opt-out is explicit.** No spawn shares the working
   tree unless a caller says so. ([ADR 0005](./adr/0005-worktree-isolation-by-default-for-spawns.md))
+  Held by the local backend. Under k8s per-run isolation is not a `CalibanTask`
+  field and nothing populates the workspace-level one for an API-spawned task,
+  so agents there share the checkout — see
+  [Spawning](./api.md#spawning). The invariant stands as the decision; the k8s
+  backend does not yet meet it.
 - **Backends are interchangeable behind the trait.** Local and K8s implement the
   same `FleetProvider` verbs and emit to the same observability plane; the API
   request path is backend-agnostic.
@@ -93,6 +107,15 @@ design change, not a refactor.
 - **The fake is a faithful double.** The control plane is testable end-to-end
   against an in-process fake caliban, so backends are correct by construction,
   not by hope. ([ADR 0007](./adr/0007-fake-caliban-test-harness.md))
+- **Authorization fails closed.** A route absent from the scope table requires
+  `admin`; with tokens configured every request outside the small open set
+  (probes, the dashboard shell, sign-in) needs a credential, loopback included;
+  and serving unauthenticated beyond loopback must be asked for explicitly.
+  ([ADR 0010](./adr/0010-inbound-api-authentication.md))
+- **Authenticated identity and asserted identity never merge.** `actor` is the
+  token prosperod authenticated. `on_behalf_of` is what the client *said*, is
+  never verified, and is always recorded beside the credential that claimed it.
+  ([ADR 0010](./adr/0010-inbound-api-authentication.md))
 
 ## Scale-out roadmap
 

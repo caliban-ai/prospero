@@ -6,11 +6,14 @@ prosperod authenticates requests with **named API tokens** (ADR-0010).
 
 | Scope | Allows |
 |---|---|
-| `read` | every GET: fleet, usage, workspaces, agent events and streams, metrics |
-| `operate` | `read` + spawn, kill, respawn, input, end-input, remove agent |
-| `admin` | `operate` + add/remove workspace, set workspace config, and spawn with `permission_posture: "unattended"` |
+| `read` | every GET: fleet, usage, workspaces, agent events and streams, metrics, automations and their runs |
+| `operate` | `read` + spawn, kill, respawn, input, end-input, remove agent; firing an automation by hand; the whole [MCP endpoint](./api.md#mcp) |
+| `admin` | `operate` + add/remove workspace, set workspace config, create/delete/enable/disable an automation, and spawn with `permission_posture: "unattended"` |
 
-`/healthz`, `/readyz`, the dashboard shell and `/api/session` are always open.
+`/healthz`, `/readyz`, the dashboard shell, `/api/session` and
+`/api/openapi.json` are always open. So is an automation's
+[webhook trigger](./api.md#automations) — its HMAC signature is the credential
+instead of a token.
 
 ## Creating tokens
 
