@@ -22,7 +22,7 @@ prospero-types = { path = "crates/types" }
 # of caliband's control-plane wire types. Serde-only — no daemon internals — so
 # it is not the wide coupling ADR-0003 rejected. Pinned exactly, as the crate's
 # own description asks, because it *is* the wire contract.
-caliban-contract = "=0.14.0"
+caliban-contract = "=0.15.0"
 
 # MCP server surface (#218). Same crate caliban drives its own MCP adapter
 # with, so the two speak an identical protocol version to any client.

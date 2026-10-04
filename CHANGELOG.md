@@ -20,6 +20,17 @@ the patch version for fixes.
   in `ci.yml` applies to the toolchain the action installs rather than the one this
   file selects. (#261)
 
+- `caliban-contract` pinned to `=0.15.0`, matching caliban 0.15.0 and moving in
+  lockstep with caliban-operator so the two downstream consumers of the contract
+  do not disagree about its version
+  (caliban-ai/caliban-operator#95). Nothing prospero compiles against changed:
+  `launch.rs` is the only file that differs between the two contract versions, and
+  prospero imports only from `caliban_contract::wire`. Note for anyone else
+  downstream — the field `CalibandLaunch.router_config` kept its type but changed
+  meaning, from inline config JSON to a filesystem path (caliban ADR 0060), so a
+  caller passing JSON still compiles and silently has it read as a path. prospero
+  never sets it.
+
 ## [0.9.0] - 2026-10-03
 
 This release is about letting other programs drive and watch the fleet. One SSE
