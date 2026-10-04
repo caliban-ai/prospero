@@ -9,6 +9,17 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Internal
+
+- The Rust toolchain is pinned in `rust-toolchain.toml` (1.99.0), so a new stable
+  release can no longer break a build whose code never changed — which is what
+  happened to v0.9.0. CI still installs its toolchain with
+  `dtolnay/rust-toolchain@stable`; rustup honours this file when cargo runs, so the
+  version lives in exactly one place and upgrading it is a reviewable commit. The
+  file also lists the `wasm32-unknown-unknown` target, because the `targets:` input
+  in `ci.yml` applies to the toolchain the action installs rather than the one this
+  file selects. (#261)
+
 ## [0.9.0] - 2026-10-03
 
 This release is about letting other programs drive and watch the fleet. One SSE
