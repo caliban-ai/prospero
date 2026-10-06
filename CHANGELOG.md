@@ -11,6 +11,15 @@ the patch version for fixes.
 
 ### Internal
 
+- The docs site is rebuilt when `CHANGELOG.md` changes. `sync-changelog.sh`
+  ingests it into the guide, but `docs.yml` was not triggered by it, so a
+  changelog-only commit rebuilt nothing and the published changelog silently fell
+  behind the repository — entries appeared only when some later commit happened to
+  touch a path that did trigger a build. The same guard that covers `ci.yml`'s
+  path filter now also fails the build when a path a `sync-*.sh` script reads is
+  missing from either of `docs.yml`'s triggers, since the next ingest would
+  otherwise repeat this. (#270)
+
 - CI no longer skips the cargo gate on a docs change that is compiled into a
   test. `ci.yml` skips every cargo step when a diff touches only `docs/`, `*.md`
   or `LICENSE`, but `crates/api/tests/guide.rs` `include_str!`s

@@ -1,11 +1,18 @@
 name: docs
 
 on:
+  # Every path a docs/guide/sync-*.sh script reads must be listed here, or
+  # editing that file publishes nothing: the guide ingests it, so it is a source
+  # of the site even though it lives outside docs/guide/. CHANGELOG.md was
+  # ingested but untriggered, so changelog entries reached GitHub and not the
+  # site (#270). crates/api/tests/ci_filter.rs fails the build if an ingested
+  # path is missing from either trigger.
   push:
     branches: [main]
     paths:
       - "docs/guide/**"
       - "docs/adr/**"
+      - "CHANGELOG.md"
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -14,6 +21,7 @@ on:
     paths:
       - "docs/guide/**"
       - "docs/adr/**"
+      - "CHANGELOG.md"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
