@@ -9,7 +9,30 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- The published guide no longer ships dead links. An ADR is written to live in
+  `docs/adr/`, where `README.md` and `../superpowers/specs/<spec>.md` both resolve;
+  copied into the book they did not, because `README.md` and `template.md` are
+  deliberately not chapters and nothing ingests `docs/superpowers/`. mdBook
+  rewrote both to pages it never built, so three links in ADR 0001 and the
+  `Source:` link of seven ADRs (0002–0007 and 0010) served 404s. `sync-adrs.sh`
+  now rewrites links that leave the book to absolute repository URLs, resolving
+  each target from the ADR's original location rather than its copied one, and
+  fails the build if a target does not exist — a link rewritten to a missing file
+  is still a dead link. (#268)
+
 ### Internal
+
+- The guide's links are checked after every docs build, by
+  `docs/guide/check-links.sh`. mdBook validates no links whatsoever: it rewrote
+  every one of the dead links above and emitted zero warnings, so "the guide builds
+  clean" was never evidence that it was navigable. The check resolves relative
+  hrefs against the built output and absolute links back into this repository
+  against the working tree — the latter because the rewrite above converts checked
+  relative links into unchecked absolute ones, and a check that skipped them would
+  bless exactly the mistake the rewrite can make. Third-party URLs are not
+  fetched, so the docs build does not depend on anyone else's uptime. (#268)
 
 - The docs site is rebuilt when `CHANGELOG.md` changes. `sync-changelog.sh`
   ingests it into the guide, but `docs.yml` was not triggered by it, so a
