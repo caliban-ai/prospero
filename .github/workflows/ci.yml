@@ -58,21 +58,44 @@ jobs:
 
       # Skip the cargo steps on docs-only PRs (the job still succeeds, so a
       # required check always reports).
+      #
+      # A doc that is compiled into a test is code for this purpose: editing it
+      # can fail the build, so skipping cargo would hide exactly the breakage
+      # (#264). `docs/guide/src/api.md` is include_str!'d by
+      # crates/api/tests/guide.rs, which is the route-coverage test #256 added to
+      # stop the guide drifting from the router — so a docs-only edit to the
+      # routes table was the one change most likely to fail that test, and the one
+      # CI would not run it for. TEST_INPUT_DOCS lists these docs, and
+      # crates/api/tests/ci_filter.rs fails the build if the list drifts from the
+      # real `include_str!` set in either direction.
       - name: Detect non-docs changes
         id: changes
         run: |
+          TEST_INPUT_DOCS='docs/guide/src/api.md'
+
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git diff --name-only \
-               "${{ github.event.pull_request.base.sha }}" \
-               "${{ github.event.pull_request.head.sha }}" \
-             | grep -vqE '^(docs/|.*\.md$|LICENSE$)'; then
+
+          changed=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+
+          if printf '%s\n' "$changed" | grep -vqE '^(docs/|.*\.md$|LICENSE$)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          for doc in $TEST_INPUT_DOCS; do
+            if printf '%s\n' "$changed" | grep -qxF "$doc"; then
+              echo "::notice::$doc is compiled into a test; running the cargo gate on an otherwise docs-only change"
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "code=false" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.code == 'true'
