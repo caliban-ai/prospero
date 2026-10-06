@@ -83,6 +83,14 @@ jobs:
             echo "</ul>"
           } > docs/guide/book/api/index.html
 
+      # After the rustdoc assembly, so links into /api are verified too rather
+      # than skipped. mdBook validates no links at all and builds dead ones with
+      # zero warnings (#268), so this is the only thing standing between a broken
+      # link and the published site. External URLs are deliberately not fetched —
+      # the docs build must not depend on a third party being up.
+      - name: Check the guide's links resolve
+        run: ./docs/guide/check-links.sh
+
       - name: Upload Pages artifact
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v3
