@@ -11,6 +11,12 @@
 //! this test proves that declaration is complete: add another `include_str!` of a
 //! doc and the build fails until `TEST_INPUT_DOCS` lists it. That ordering
 //! matters — a list nothing checks is a list that goes stale.
+//!
+//! The same invariant applies to `docs.yml` and is checked here too (#270): the
+//! guide ingests files from outside `docs/guide/`, so every path a `sync-*.sh`
+//! script reads must appear in the workflow's trigger paths, or editing that file
+//! publishes nothing. `CHANGELOG.md` was ingested but untriggered, so changelog
+//! entries reached GitHub and not the site.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -154,5 +160,142 @@ fn ci_declares_no_doc_that_is_not_a_test_input() {
         stale.is_empty(),
         "ci.yml's TEST_INPUT_DOCS lists docs that no test includes any more; drop \
          them so docs-only PRs still skip the gate: {stale:?}"
+    );
+}
+
+/// The repo-relative paths the guide's `sync-*.sh` scripts read.
+///
+/// Each script assigns its source to a shell variable, e.g. `SRC="CHANGELOG.md"`
+/// and `ADR_SRC="docs/adr"`. Rather than hard-code them — which is the staleness
+/// this test exists to prevent — take every quoted assignment whose value names a
+/// path that exists, and drop the ones under `docs/guide/src`, which are the
+/// destinations the scripts write to.
+fn guide_ingest_sources() -> BTreeSet<String> {
+    let root = repo_root();
+    let mut out = BTreeSet::new();
+
+    let Ok(entries) = fs::read_dir(root.join("docs/guide")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "sh") {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                // `VAR="value"` — take the value.
+                let Some((lhs, rest)) = line.split_once("=\"") else {
+                    continue;
+                };
+                if lhs.contains(' ') || lhs.is_empty() {
+                    continue;
+                }
+                let Some((value, _)) = rest.split_once('"') else {
+                    continue;
+                };
+
+                // A source is something that exists and is not a destination.
+                // An empty value must be rejected explicitly: `sync-adrs.sh` has
+                // `entries=""` as an accumulator, and `root.join("")` is the repo
+                // root, which of course exists.
+                if value.is_empty()
+                    || value.starts_with("docs/guide/src")
+                    || !root.join(value).exists()
+                {
+                    continue;
+                }
+                out.insert(value.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// The trigger paths of `docs.yml`, as `(trigger name, paths)`.
+///
+/// Parsed textually, like `declared_in_ci` above: the workflow is the artefact
+/// under test, so reading it as text keeps the test honest about what is written
+/// there rather than what a parser infers.
+fn docs_trigger_paths() -> Vec<(String, Vec<String>)> {
+    let text = fs::read_to_string(repo_root().join(".github/workflows/docs.yml"))
+        .expect("docs.yml should exist");
+
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut trigger = String::new();
+    let mut collecting = false;
+
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+
+        // `  push:` / `  pull_request:` sit at one indent inside `on:`.
+        if indent == 2 && trimmed.ends_with(':') && !trimmed.starts_with('-') {
+            trigger = trimmed.trim_end_matches(':').to_owned();
+            collecting = false;
+            continue;
+        }
+        if trimmed == "paths:" {
+            collecting = true;
+            out.push((trigger.clone(), Vec::new()));
+            continue;
+        }
+        if collecting {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let item = item.trim().trim_matches('"').trim_matches('\'');
+                if let Some((_, paths)) = out.last_mut() {
+                    paths.push(item.to_owned());
+                }
+            } else {
+                collecting = false;
+            }
+        }
+    }
+    out
+}
+
+/// Would a change to `source` match `pattern` as GitHub evaluates a paths filter?
+///
+/// Only the two forms the workflow actually uses are handled — an exact path and a
+/// `dir/**` prefix — so an unrecognised pattern reads as "no match" rather than
+/// being waved through.
+fn pattern_covers(pattern: &str, source: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        // A directory source is covered when the glob is rooted at or above it.
+        return source == prefix || source.starts_with(&format!("{prefix}/"));
+    }
+    pattern == source
+}
+
+#[test]
+fn docs_workflow_triggers_on_everything_the_guide_ingests() {
+    let sources = guide_ingest_sources();
+    assert!(
+        sources.contains("CHANGELOG.md") && sources.contains("docs/adr"),
+        "expected to discover CHANGELOG.md and docs/adr as ingest sources; the \
+         sync-script scan is probably broken, found: {sources:?}"
+    );
+
+    let triggers = docs_trigger_paths();
+    assert!(
+        triggers.len() >= 2,
+        "expected docs.yml to filter paths on both push and pull_request, parsed: \
+         {triggers:?}"
+    );
+
+    let mut gaps = Vec::new();
+    for (trigger, paths) in &triggers {
+        for source in &sources {
+            if !paths.iter().any(|p| pattern_covers(p, source)) {
+                gaps.push(format!("{trigger} does not trigger on {source}"));
+            }
+        }
+    }
+    assert!(
+        gaps.is_empty(),
+        "the guide ingests these paths but docs.yml is not triggered by them, so \
+         editing one publishes nothing (#270): {gaps:?}"
     );
 }
