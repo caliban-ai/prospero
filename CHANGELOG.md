@@ -11,6 +11,18 @@ the patch version for fixes.
 
 ### Internal
 
+- CI no longer skips the cargo gate on a docs change that is compiled into a
+  test. `ci.yml` skips every cargo step when a diff touches only `docs/`, `*.md`
+  or `LICENSE`, but `crates/api/tests/guide.rs` `include_str!`s
+  `docs/guide/src/api.md` — so an edit to the guide's routes table was the single
+  change most likely to fail the route-coverage test added in #256, and the one
+  change CI would not run it for. The workflow now declares those paths in
+  `TEST_INPUT_DOCS` and treats them as code; a genuinely docs-only change still
+  skips the gate. The declaration is held to the source by
+  `crates/api/tests/ci_filter.rs`, which fails the build both when a new doc test
+  input is missing from the list and when a stale entry no longer matches, so the
+  filter cannot quietly go out of date. (#264)
+
 - The Rust toolchain is pinned in `rust-toolchain.toml` (1.99.0), so a new stable
   release can no longer break a build whose code never changed — which is what
   happened to v0.9.0. CI still installs its toolchain with
